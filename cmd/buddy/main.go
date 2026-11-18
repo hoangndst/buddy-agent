@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -18,16 +17,17 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/config"
 	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/tools"
-	"github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 )
 
 var (
-	stepStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	stepStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
 	thoughtStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("246")).Italic(true)
-	toolStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
-	resultStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	doneStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
-	errStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
+	toolStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+	resultStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	doneStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
+	errStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
 )
 
 func main() {
@@ -40,11 +40,16 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Initialize LLM Client
-	clientConfig := openai.DefaultConfig(cfg.APIKey)
-	clientConfig.BaseURL = cfg.BaseURL
-	clientConfig.HTTPClient = &http.Client{Timeout: 120 * time.Second}
-	client := openai.NewClientWithConfig(clientConfig)
+	// Initialize LLM Client with official openai-go SDK
+	opts := []option.RequestOption{
+		option.WithAPIKey(cfg.APIKey),
+		option.WithRequestTimeout(120 * time.Second),
+	}
+	if cfg.BaseURL != "" {
+		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
+	}
+	client := openai.NewClient(opts...)
+	clientAdapter := agent.NewClientAdapter(&client)
 
 	// Initialize Memory & Tools
 	memMgr := memory.NewManager(cfg.WorkspaceDir)
@@ -79,7 +84,7 @@ func main() {
 		}
 	}
 
-	engine := agent.NewEngine(client, cfg.Model, cfg.MaxSteps, reg, memMgr, eventHandler)
+	engine := agent.NewEngine(clientAdapter, cfg.Model, cfg.MaxSteps, reg, memMgr, eventHandler)
 
 	// If argument provided, run once
 	if len(os.Args) > 1 {

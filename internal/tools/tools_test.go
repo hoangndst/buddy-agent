@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -11,6 +12,19 @@ import (
 
 	"github.com/hoangndst/buddy-agent/internal/memory"
 )
+
+type dummyTool struct {
+	name        string
+	description string
+	params      any
+}
+
+func (d *dummyTool) Name() string        { return d.name }
+func (d *dummyTool) Description() string { return d.description }
+func (d *dummyTool) Parameters() any     { return d.params }
+func (d *dummyTool) Execute(_ context.Context, _ json.RawMessage) (string, error) {
+	return "ok", nil
+}
 
 func TestRegistryAndDispatch(t *testing.T) {
 	reg := NewRegistry(500)
@@ -36,6 +50,77 @@ func TestRegistryAndDispatch(t *testing.T) {
 	missingOut := reg.Dispatch(ctx, "unknown_tool", json.RawMessage(`{}`))
 	if !strings.Contains(missingOut, "not registered") {
 		t.Errorf("expected not registered error, got: %s", missingOut)
+	}
+}
+
+func TestDeterministicToolOrderingAndSerialization(t *testing.T) {
+	reg := NewRegistry(1000)
+	reg.Register(&dummyTool{name: "zebra", description: "zebra tool"})
+	reg.Register(&dummyTool{name: "alpha", description: "alpha tool"})
+	reg.Register(&dummyTool{name: "beta", description: "beta tool"})
+
+	toolsList := reg.OpenAITools()
+	if len(toolsList) != 3 {
+		t.Fatalf("expected 3 tools, got %d", len(toolsList))
+	}
+
+	if toolsList[0].Function.Name != "alpha" ||
+		toolsList[1].Function.Name != "beta" ||
+		toolsList[2].Function.Name != "zebra" {
+		t.Errorf("tools are not sorted alphabetically: %s, %s, %s",
+			toolsList[0].Function.Name, toolsList[1].Function.Name, toolsList[2].Function.Name)
+	}
+
+	// Verify byte-for-byte serialization idempotency
+	firstJSON, err := json.Marshal(toolsList)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		repeatTools := reg.OpenAITools()
+		repeatJSON, err := json.Marshal(repeatTools)
+		if err != nil {
+			t.Fatalf("repeat marshal failed: %v", err)
+		}
+		if !bytes.Equal(firstJSON, repeatJSON) {
+			t.Fatalf("iteration %d produced divergent tool JSON bytes", i)
+		}
+	}
+}
+
+func TestCanonicalizeParameters(t *testing.T) {
+	// 1. Nil parameter
+	nilParams := CanonicalizeParameters(nil)
+	if nilParams["type"] != "object" || nilParams["properties"] == nil {
+		t.Errorf("expected default object schema for nil input, got: %v", nilParams)
+	}
+
+	// 2. Struct parameter
+	type customSchema struct {
+		Type       string                 `json:"type"`
+		Properties map[string]interface{} `json:"properties"`
+	}
+	s := customSchema{
+		Type: "object",
+		Properties: map[string]interface{}{
+			"query": map[string]string{"type": "string"},
+		},
+	}
+	structParams := CanonicalizeParameters(s)
+	if structParams["type"] != "object" {
+		t.Errorf("expected type object, got: %v", structParams["type"])
+	}
+
+	// 3. Map without type
+	rawMap := map[string]any{
+		"properties": map[string]any{
+			"count": map[string]any{"type": "integer"},
+		},
+	}
+	mapParams := CanonicalizeParameters(rawMap)
+	if mapParams["type"] != "object" {
+		t.Errorf("expected type to default to object, got: %v", mapParams["type"])
 	}
 }
 

@@ -8,7 +8,7 @@ import (
 
 	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/tools"
-	"github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go"
 )
 
 // Engine orchestrates the ReAct loop: prompting, tool execution, and memory feedback.
@@ -58,15 +58,9 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		return "", fmt.Errorf("failed to load system prompt: %w", err)
 	}
 
-	messages := []openai.ChatCompletionMessage{
-		{
-			Role:    openai.ChatMessageRoleSystem,
-			Content: systemPrompt,
-		},
-		{
-			Role:    openai.ChatMessageRoleUser,
-			Content: task,
-		},
+	messages := []openai.ChatCompletionMessageParamUnion{
+		openai.SystemMessage(systemPrompt),
+		openai.UserMessage(task),
 	}
 
 	// 2. Main ReAct execution loop
@@ -79,13 +73,13 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 
 		e.eventHandler(Event{Type: EventStepStart, Step: step})
 
-		req := openai.ChatCompletionRequest{
+		params := openai.ChatCompletionNewParams{
 			Model:    e.model,
 			Messages: messages,
 			Tools:    e.registry.OpenAITools(),
 		}
 
-		resp, err := e.client.CreateChatCompletion(ctx, req)
+		resp, err := e.client.CreateChatCompletion(ctx, params)
 		if err != nil {
 			e.eventHandler(Event{Type: EventError, Step: step, Error: err})
 			return "", fmt.Errorf("step %d LLM call failed: %w", step, err)
@@ -98,7 +92,7 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		}
 
 		choice := resp.Choices[0]
-		messages = append(messages, choice.Message)
+		messages = append(messages, choice.Message.ToParam())
 
 		// Emit thought if model generated reasoning or explanation
 		if choice.Message.Content != "" {
@@ -137,11 +131,7 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 				ToolResult: result,
 			})
 
-			messages = append(messages, openai.ChatCompletionMessage{
-				Role:       openai.ChatMessageRoleTool,
-				Content:    result,
-				ToolCallID: tc.ID,
-			})
+			messages = append(messages, openai.ToolMessage(result, tc.ID))
 		}
 	}
 

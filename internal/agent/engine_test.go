@@ -2,22 +2,27 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/tools"
-	"github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go"
 )
 
 type mockChatClient struct {
-	responses []openai.ChatCompletionResponse
+	responses []*openai.ChatCompletion
+	err       error
 	calls     int
 }
 
-func (m *mockChatClient) CreateChatCompletion(_ context.Context, _ openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+func (m *mockChatClient) CreateChatCompletion(_ context.Context, _ openai.ChatCompletionNewParams) (*openai.ChatCompletion, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
 	if m.calls >= len(m.responses) {
-		return openai.ChatCompletionResponse{}, nil
+		return &openai.ChatCompletion{}, nil
 	}
 	resp := m.responses[m.calls]
 	m.calls++
@@ -32,19 +37,18 @@ func TestEngineExecutionFlow(t *testing.T) {
 	memMgr := memory.NewManager(tempDir)
 
 	mockClient := &mockChatClient{
-		responses: []openai.ChatCompletionResponse{
+		responses: []*openai.ChatCompletion{
 			// Step 1: Model invokes tool
 			{
 				Choices: []openai.ChatCompletionChoice{
 					{
 						Message: openai.ChatCompletionMessage{
-							Role:    openai.ChatMessageRoleAssistant,
+							Role:    "assistant",
 							Content: "Let me check the environment.",
-							ToolCalls: []openai.ToolCall{
+							ToolCalls: []openai.ChatCompletionMessageToolCall{
 								{
-									ID:   "call_123",
-									Type: openai.ToolTypeFunction,
-									Function: openai.FunctionCall{
+									ID: "call_123",
+									Function: openai.ChatCompletionMessageToolCallFunction{
 										Name:      "bash",
 										Arguments: `{"command": "echo test_output"}`,
 									},
@@ -59,7 +63,7 @@ func TestEngineExecutionFlow(t *testing.T) {
 				Choices: []openai.ChatCompletionChoice{
 					{
 						Message: openai.ChatCompletionMessage{
-							Role:    openai.ChatMessageRoleAssistant,
+							Role:    "assistant",
 							Content: "Task complete: found test_output.",
 						},
 					},
@@ -103,5 +107,75 @@ func TestEngineExecutionFlow(t *testing.T) {
 
 	if !hasThought || !hasToolCall || !hasToolResult || !hasFinished {
 		t.Errorf("missing expected events in trace: %+v", events)
+	}
+}
+
+func TestEngineErrorAndBudgetExhaustion(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	memMgr := memory.NewManager(tempDir)
+
+	// 1. Empty task error
+	engine := NewEngine(&mockChatClient{}, "test-model", 5, reg, memMgr, nil)
+	_, err := engine.Run(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error on empty task")
+	}
+
+	// 2. Client error propagation
+	failClient := &mockChatClient{err: errors.New("network timeout")}
+	failEngine := NewEngine(failClient, "test-model", 2, reg, memMgr, nil)
+	_, err = failEngine.Run(context.Background(), "do something")
+	if err == nil || !errors.Is(err, failClient.err) && err.Error() == "" {
+		t.Fatalf("expected error from client, got %v", err)
+	}
+
+	// 3. Step budget exhaustion
+	loopClient := &mockChatClient{
+		responses: []*openai.ChatCompletion{
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Still working...",
+							ToolCalls: []openai.ChatCompletionMessageToolCall{
+								{
+									ID: "call_loop",
+									Function: openai.ChatCompletionMessageToolCallFunction{
+										Name:      "nonexistent_tool",
+										Arguments: `{}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Still working again...",
+							ToolCalls: []openai.ChatCompletionMessageToolCall{
+								{
+									ID: "call_loop_2",
+									Function: openai.ChatCompletionMessageToolCallFunction{
+										Name:      "nonexistent_tool",
+										Arguments: `{}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	loopEngine := NewEngine(loopClient, "test-model", 2, reg, memMgr, nil)
+	_, err = loopEngine.Run(context.Background(), "infinite loop task")
+	if err == nil {
+		t.Fatal("expected budget exhaustion error")
 	}
 }

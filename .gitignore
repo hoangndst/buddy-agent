@@ -34,3 +34,8 @@ scratch/
 *.swp
 *~
 .DS_Store
+
+# EGM local drafts, briefs, and reviews
+.dev/
+concepts_brief.md
+

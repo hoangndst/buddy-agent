@@ -4,12 +4,27 @@ package agent
 import (
 	"context"
 
-	"github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go"
 )
 
 // ChatClient abstracts the OpenAI-compatible completion client for testability.
 type ChatClient interface {
-	CreateChatCompletion(ctx context.Context, request openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error)
+	CreateChatCompletion(ctx context.Context, params openai.ChatCompletionNewParams) (*openai.ChatCompletion, error)
+}
+
+// ClientAdapter adapts an openai.Client to the ChatClient interface.
+type ClientAdapter struct {
+	client *openai.Client
+}
+
+// NewClientAdapter wraps an openai.Client.
+func NewClientAdapter(client *openai.Client) *ClientAdapter {
+	return &ClientAdapter{client: client}
+}
+
+// CreateChatCompletion executes a completion request using the official SDK.
+func (a *ClientAdapter) CreateChatCompletion(ctx context.Context, params openai.ChatCompletionNewParams) (*openai.ChatCompletion, error) {
+	return a.client.Chat.Completions.New(ctx, params)
 }
 
 // EventType distinguishes agent execution events.
