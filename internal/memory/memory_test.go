@@ -1,0 +1,57 @@
+package memory
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestMemoryManager(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir)
+
+	// Test 1: Fallback when SOUL.md does not exist
+	prompt, err := mgr.LoadSystemPrompt()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(prompt, "Buddy") {
+		t.Errorf("expected prompt to contain 'Buddy', got: %s", prompt)
+	}
+
+	// Test 2: Create SOUL.md, USER.md, MEMORY.md
+	if err := os.WriteFile(filepath.Join(tempDir, "SOUL.md"), []byte("Core Persona Text"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "USER.md"), []byte("User Profile Info"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.AppendMemory("Key architecture note"); err != nil {
+		t.Fatalf("failed to append memory: %v", err)
+	}
+
+	// Test 3: Save and load skill
+	if err := mgr.SaveSkill("git-workflow", "Always use conventional commits."); err != nil {
+		t.Fatalf("failed to save skill: %v", err)
+	}
+
+	prompt, err = mgr.LoadSystemPrompt()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(prompt, "Core Persona Text") {
+		t.Errorf("missing SOUL content in prompt")
+	}
+	if !strings.Contains(prompt, "User Profile Info") {
+		t.Errorf("missing USER content in prompt")
+	}
+	if !strings.Contains(prompt, "Key architecture note") {
+		t.Errorf("missing MEMORY content in prompt")
+	}
+	if !strings.Contains(prompt, "git-workflow") {
+		t.Errorf("missing skill in prompt")
+	}
+}
