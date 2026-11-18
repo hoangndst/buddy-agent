@@ -1,0 +1,36 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+dist/
+buddy-agent
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.txt
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+secrets/
+
+# Agent local state & memory
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+trajectories/
+scratch/
+
+# IDE and Editor
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
