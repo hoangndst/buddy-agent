@@ -179,3 +179,65 @@ func TestEngineErrorAndBudgetExhaustion(t *testing.T) {
 		t.Fatal("expected budget exhaustion error")
 	}
 }
+
+
+func TestEngineContextCompactionAndExhaustion(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	reg.Register(tools.NewWriteFileTool(tempDir))
+	memMgr := memory.NewManager(tempDir)
+
+	// 1. Test safe halt on context exhaustion
+	exhaustClient := &mockChatClient{
+		responses: []*openai.ChatCompletion{
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Running heavy task",
+							ToolCalls: []openai.ChatCompletionMessageToolCall{
+								{
+									ID: "call_exhaust",
+									Function: openai.ChatCompletionMessageToolCallFunction{
+										Name:      "write_file",
+										Arguments: `{"path": "test.txt", "content": "hello"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+				Usage: openai.CompletionUsage{PromptTokens: 20},
+			},
+		},
+	}
+
+	var events []Event
+	exhaustEngine := NewEngine(
+		exhaustClient,
+		"test-model",
+		5,
+		reg,
+		memMgr,
+		func(e Event) { events = append(events, e) },
+		WithMaxContextTokens(15), // Ceiling lower than prompt tokens (20) triggers safe halt
+		WithWorkingTailSize(2),
+	)
+
+	_, err := exhaustEngine.Run(context.Background(), "Trigger context exhaustion")
+	if err == nil {
+		t.Fatal("expected context exhaustion error")
+	}
+
+	hasExhaustEvent := false
+	for _, ev := range events {
+		if ev.Type == EventContextExhausted {
+			hasExhaustEvent = true
+			break
+		}
+	}
+	if !hasExhaustEvent {
+		t.Errorf("expected EventContextExhausted in events, got: %+v", events)
+	}
+}

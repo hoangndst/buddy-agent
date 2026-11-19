@@ -6,7 +6,7 @@ This directory contains approved technical design documents for `buddy-agent`, f
 | :---: | :--- | :---: | :---: | :--- |
 | **01** | *(Implemented in PR #1)* | Approved | 2026-11-18 | Core ReAct engine, official `openai-go` SDK, streaming accumulator, canonical schema sorting, and CI. |
 | **02** | [`02_subprocess_safety.md`](02_subprocess_safety.md) | Approved | 2026-11-19 | Subprocess process group isolation (`Setpgid`), escalated dual-phase termination (`SIGTERM` -> 1.5s -> `SIGKILL`), descendant liveness probing, and memory-bounded dual-stream line-aware truncation. |
-| **03** | `03_context_compaction.md` | Staged | — | Context compaction pipeline, token estimation, and dual-fidelity episodic anchoring. |
+| **03** | [`03_context_compaction.md`](03_context_compaction.md) | Approved | 2026-11-19 | Three-partition context memory, atomic turn block eviction, zero-CGO dual token accounting, two-stage compaction (micro-pruning & distillation), and safe halt fallback. |
 | **04** | `04_model_context_protocol.md` | Staged | — | MCP integration (`modelcontextprotocol/go-sdk`) and supervised stdio process lifecycle. |
 | **05** | `05_sqlite_state_persistence.md` | Staged | — | Pure Go SQLite episodic trajectory store and crash-recovery audit logger. |
 | **06** | `06_subagent_orchestration.md` | Staged | — | Bounded subagent delegation (depth=1) and execution budgets. |

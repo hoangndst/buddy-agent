@@ -32,12 +32,16 @@ type EventType string
 
 // Supported agent event types.
 const (
-	EventStepStart  EventType = "step_start"
-	EventThought    EventType = "thought"
-	EventToolCall   EventType = "tool_call"
-	EventToolResult EventType = "tool_result"
-	EventFinished   EventType = "finished"
-	EventError      EventType = "error"
+	EventStepStart        EventType = "step_start"
+	EventThought          EventType = "thought"
+	EventToolCall         EventType = "tool_call"
+	EventToolResult       EventType = "tool_result"
+	EventFinished         EventType = "finished"
+	EventError            EventType = "error"
+	EventCompactionStart  EventType = "compaction_start"
+	EventCompactionDone   EventType = "compaction_done"
+	EventMicroPruning     EventType = "micro_pruning"
+	EventContextExhausted EventType = "context_exhausted"
 )
 
 // Event conveys real-time execution telemetry to listeners.
