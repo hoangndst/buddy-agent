@@ -267,3 +267,33 @@ func TestReadFileLongLines(t *testing.T) {
 		t.Errorf("expected output to contain file content")
 	}
 }
+
+func TestBashTool_ExecutionAndOptions(t *testing.T) {
+	tempDir := t.TempDir()
+	bash := NewBashTool(tempDir, 5*time.Second, WithMaxOutputBytes(8000))
+
+	if bash.maxOutputBytes != 8000 {
+		t.Errorf("expected maxOutputBytes 8000, got %d", bash.maxOutputBytes)
+	}
+
+	ctx := context.Background()
+
+	// Empty command error
+	_, err := bash.Execute(ctx, json.RawMessage(`{"command": ""}`))
+	if err == nil {
+		t.Errorf("expected error on empty command")
+	}
+
+	// Normal command execution
+	res, err := bash.Execute(ctx, json.RawMessage(`{"command": "echo 'running bash tool'"}`))
+	if err != nil {
+		t.Fatalf("unexpected bash execution error: %v", err)
+	}
+	if !strings.Contains(res, "running bash tool") {
+		t.Errorf("expected output to contain command message, got: %s", res)
+	}
+	if !strings.Contains(res, "Exit Code: 0") {
+		t.Errorf("expected output to contain Exit Code: 0, got: %s", res)
+	}
+}
+
