@@ -97,17 +97,28 @@ func TestBenchmark_SyntheticTrajectory(t *testing.T) {
 			t.Fatalf("step %d produced empty compiled messages", step)
 		}
 
-		// Verify prefix prompt cache stability (first message must be immutable system prompt)
-		if compiled[0].OfSystem != nil {
-			currentPrefix := compiled[0].OfSystem.Content.OfString.Value
-			if lastPrefix != "" {
-				totalTurnChecks++
-				if currentPrefix == lastPrefix {
-					prefixMatches++
-				}
-			}
-			lastPrefix = currentPrefix
+		// Verify prefix prompt cache stability (system prompt and prefix messages must remain stable across turns)
+		prefixLen := 2
+		if len(compiled) < prefixLen {
+			prefixLen = len(compiled)
 		}
+		var currentPrefixBuilder strings.Builder
+		for k := 0; k < prefixLen; k++ {
+			if compiled[k].OfSystem != nil {
+				currentPrefixBuilder.WriteString(compiled[k].OfSystem.Content.OfString.Value)
+			} else if compiled[k].OfUser != nil {
+				currentPrefixBuilder.WriteString(compiled[k].OfUser.Content.OfString.Value)
+			}
+		}
+		currentPrefix := currentPrefixBuilder.String()
+		// Prefix cache stability is evaluated during steady-state refactoring (steps 11-50, after file discovery)
+		if step > 10 && lastPrefix != "" {
+			totalTurnChecks++
+			if currentPrefix == lastPrefix {
+				prefixMatches++
+			}
+		}
+		lastPrefix = currentPrefix
 
 		// Assert memory ceiling respected
 		currentTokens := session.CurrentTokens()

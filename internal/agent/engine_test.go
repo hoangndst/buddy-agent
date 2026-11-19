@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -445,5 +447,92 @@ func TestEngineLocalNumCtxInjection(t *testing.T) {
 
 	if len(capturedOpts) == 0 {
 		t.Fatal("expected RequestOptions to be passed when isLocal=true")
+	}
+}
+
+type mockSimpleTool struct {
+	name string
+	exec func(ctx context.Context, args json.RawMessage) (string, error)
+}
+
+func (m *mockSimpleTool) Name() string { return m.name }
+func (m *mockSimpleTool) Description() string { return "mock tool" }
+func (m *mockSimpleTool) Parameters() any { return map[string]any{"type": "object"} }
+func (m *mockSimpleTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	return m.exec(ctx, args)
+}
+
+func TestEngineCumulativeToolOutputTruncation(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(100000)
+	// Register a mock tool that outputs large data with Title Case "Exit Code: 0"
+	reg.Register(&mockSimpleTool{
+		name: "noisy_cmd",
+		exec: func(_ context.Context, _ json.RawMessage) (string, error) {
+			return "Exit Code: 0\n" + strings.Repeat("log output line\n", 5000), nil
+		},
+	})
+	memMgr := memory.NewManager(tempDir)
+
+	mock := &mockChatClient{
+		responses: []*openai.ChatCompletion{
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: "assistant",
+							ToolCalls: []openai.ChatCompletionMessageToolCall{
+								{
+									ID: "call_noisy",
+									Function: openai.ChatCompletionMessageToolCallFunction{
+										Name:      "noisy_cmd",
+										Arguments: `{}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Done after truncation.",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	var events []Event
+	engine := NewEngine(
+		mock,
+		"test-model",
+		5,
+		reg,
+		memMgr,
+		func(e Event) { events = append(events, e) },
+		WithMaxContextTokens(8192),
+	)
+
+	_, err := engine.Run(context.Background(), "Run noisy command")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var truncatedResult string
+	for _, ev := range events {
+		if ev.Type == EventToolResult {
+			truncatedResult = ev.ToolResult
+			break
+		}
+	}
+
+	expectedPrefix := "[Output truncated: cumulative turn output limit reached] | Exit Code: 0"
+	if truncatedResult != expectedPrefix {
+		t.Errorf("expected truncated tool result %q, got %q", expectedPrefix, truncatedResult)
 	}
 }

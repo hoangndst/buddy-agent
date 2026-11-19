@@ -188,6 +188,7 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 				return "", fmt.Errorf("downscale watermark failed: %w", err)
 			}
 
+			e.eventHandler(Event{Type: EventCompactionStart, Step: step})
 			if err := session.ForceCompaction(ctx, e.client, e.model); err != nil {
 				if errors.Is(err, history.ErrContextExhausted) {
 					e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
@@ -199,6 +200,7 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
 				return "", fmt.Errorf("force compaction failed: %w", err)
 			}
+			e.eventHandler(Event{Type: EventCompactionDone, Step: step})
 		}
 
 		if completionErr != nil {
@@ -249,7 +251,7 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 			result := e.registry.Dispatch(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 
 			// Telemetry hook: track execution errors for StateTracker
-			if strings.HasPrefix(result, "Tool error:") || strings.Contains(result, "exit status") || strings.Contains(result, "exit code") {
+			if strings.HasPrefix(result, "Tool error:") || strings.Contains(result, "exit status") || strings.Contains(result, "exit code") || strings.Contains(result, "Exit Code") {
 				session.RecordError(fmt.Sprintf("%s: %s", tc.Function.Name, result))
 			}
 
@@ -260,14 +262,16 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 				}
 			}
 
-			// Headroom protection: cap cumulative tool outputs within turn
+			// Headroom protection: cap cumulative tool outputs within turn [F-03]
 			cumulativeBytes += len(result)
 			if cumulativeBytes > maxTurnBytes {
 				exitSuffix := ""
-				if idx := strings.LastIndex(result, "exit code"); idx != -1 {
-					exitSuffix = " | " + strings.TrimSpace(result[idx:])
-				} else if idx := strings.LastIndex(result, "exit status"); idx != -1 {
-					exitSuffix = " | " + strings.TrimSpace(result[idx:])
+				for _, line := range strings.Split(result, "\n") {
+					lower := strings.ToLower(line)
+					if strings.Contains(lower, "exit code") || strings.Contains(lower, "exit status") {
+						exitSuffix = " | " + strings.TrimSpace(line)
+						break
+					}
 				}
 				result = "[Output truncated: cumulative turn output limit reached]" + exitSuffix
 			}
@@ -290,6 +294,7 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		session.CommitToolTurn(choice.Message, toolResults)
 
 		// Watermark check: execute staged micro-pruning or macro-distillation
+		preTokens := session.CurrentTokens()
 		if err := session.EnsureWatermarks(ctx, e.client, e.model); err != nil {
 			if errors.Is(err, history.ErrContextExhausted) {
 				e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
@@ -300,6 +305,9 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 			}
 			e.eventHandler(Event{Type: EventError, Step: step, Error: err})
 			return "", fmt.Errorf("context compaction failed: %w", err)
+		}
+		if session.CurrentTokens() < preTokens {
+			e.eventHandler(Event{Type: EventCompactionDone, Step: step})
 		}
 	}
 

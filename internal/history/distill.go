@@ -91,6 +91,16 @@ func DistillIntermediateBlocks(
 			clamped.WriteString(l + "\n")
 		}
 		summary = strings.TrimSpace(clamped.String())
+		// Fallback: If line-based clamping resulted in empty content (e.g. single long paragraph),
+		// truncate cleanly at the rune boundary.
+		if summary == "" {
+			maxRunes := int(float64(MaxDistillTokens) * RuneTokenRatio)
+			runes := []rune(resp.Choices[0].Message.Content)
+			if len(runes) > maxRunes {
+				runes = runes[:maxRunes]
+			}
+			summary = strings.TrimSpace(string(runes))
+		}
 	}
 
 	return summary, nil

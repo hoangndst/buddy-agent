@@ -495,12 +495,18 @@ func TestSession_DownscaleWatermark(t *testing.T) {
 		t.Errorf("expected 15000 tokens (0.75 * 20000), got %d", session.MaxContextTokens())
 	}
 
-	// 3. Clamping at MinViableContextTokens (8192)
-	if err := session.DownscaleWatermark(4000); err != nil {
+	// 3. Clamping at MinViableContextTokens (8192) via proportional backoff
+	sessionLow := NewSession(
+		"Short system prompt",
+		"Task prompt",
+		WithMaxContextTokens(10000),
+		WithWorkingTailSize(2),
+	)
+	if err := sessionLow.DownscaleWatermark(0); err != nil {
 		t.Fatalf("unexpected error on clamped downscale: %v", err)
 	}
-	if session.MaxContextTokens() != MinViableContextTokens {
-		t.Errorf("expected %d tokens, got %d", MinViableContextTokens, session.MaxContextTokens())
+	if sessionLow.MaxContextTokens() != MinViableContextTokens {
+		t.Errorf("expected %d tokens, got %d", MinViableContextTokens, sessionLow.MaxContextTokens())
 	}
 
 	// 4. Irreducible state exceeding ceiling returns ErrContextExhausted
@@ -625,5 +631,140 @@ func TestSession_AlternatingBridgeInvariant(t *testing.T) {
 	}
 	if msgs[1].OfUser == nil {
 		t.Errorf("expected synthetic bridge to be user message")
+	}
+}
+
+func TestSession_ChildTimeout_TriggersTier3Fallback(t *testing.T) {
+	session := NewSession(
+		"System prompt",
+		"Task prompt",
+		WithMaxContextTokens(2000),
+		WithWorkingTailSize(2),
+		WithWatermarkRatios(0.30, 0.40),
+	)
+
+	// Add turns to trigger hard watermark
+	for i := 1; i <= 6; i++ {
+		session.CommitSimpleAssistant(openai.ChatCompletionMessage{
+			Role:    "assistant",
+			Content: fmt.Sprintf("Turn %d context line: %s", i, strings.Repeat("detailed history context information that consumes tokens ", 25)),
+		})
+	}
+
+	// Client simulates child context timeout during distillation
+	timeoutClient := &mockCompletionClient{
+		err: context.DeadlineExceeded,
+	}
+
+	// Parent context is active (NOT canceled)
+	ctx := context.Background()
+	err := session.EnsureWatermarks(ctx, timeoutClient, "test-model")
+	if err != nil {
+		t.Fatalf("expected nil error on child context timeout fallback, got: %v", err)
+	}
+
+	// Should have executed Tier 3 fallback: intermediate turns evicted, notice added
+	if !strings.Contains(session.episodicNarrative, "evicted via local fallback") {
+		t.Errorf("expected episodic narrative to contain local fallback notice, got: %s", session.episodicNarrative)
+	}
+	if session.BlockCount() != 2 {
+		t.Errorf("expected 2 working tail blocks remaining, got %d", session.BlockCount())
+	}
+}
+
+func TestSession_DownscaleExplicitUnder8k(t *testing.T) {
+	session := NewSession(
+		"System prompt",
+		"Task prompt",
+		WithMaxContextTokens(32000),
+		WithWorkingTailSize(2),
+	)
+
+	// Model returns explicit 4096 ceiling below MinViableContextTokens (8192)
+	err := session.DownscaleWatermark(4096)
+	if !errors.Is(err, ErrContextExhausted) {
+		t.Fatalf("expected ErrContextExhausted for target ceiling below 8192, got: %v", err)
+	}
+}
+
+func TestSession_EagerBoundaryMicroPruning(t *testing.T) {
+	session := NewSession(
+		"System prompt",
+		"Task prompt",
+		WithMaxContextTokens(64000),
+		WithWorkingTailSize(2),
+	)
+
+	largeOutput := strings.Repeat("A", 1000)
+
+	// Turn 1 (becomes tail block 1)
+	session.CommitToolTurn(
+		openai.ChatCompletionMessage{Role: "assistant"},
+		[]ToolResult{{ToolCallID: "c1", Name: "bash", Content: largeOutput}},
+	)
+
+	// Turn 2 (becomes tail block 2)
+	session.CommitToolTurn(
+		openai.ChatCompletionMessage{Role: "assistant"},
+		[]ToolResult{{ToolCallID: "c2", Name: "bash", Content: largeOutput}},
+	)
+
+	// Turn 3: Turn 1 is now pushed out of working tail into intermediate history
+	session.CommitToolTurn(
+		openai.ChatCompletionMessage{Role: "assistant"},
+		[]ToolResult{{ToolCallID: "c3", Name: "bash", Content: largeOutput}},
+	)
+
+	// The block that exited the working tail should have been eagerly micro-pruned immediately
+	session.mu.RLock()
+	exitedBlock := session.blocks[1] // block 0 is root user, block 1 is turn 1
+	session.mu.RUnlock()
+
+	if !strings.Contains(exitedBlock.ToolResults[0].Content, "Output pruned:") {
+		t.Errorf("expected turn 1 to be eagerly micro-pruned upon exiting working tail, got: %s", exitedBlock.ToolResults[0].Content)
+	}
+}
+
+func TestSession_NoConsecutiveUserTurnsWithEpisodicState(t *testing.T) {
+	session := NewSession(
+		"System prompt",
+		"Task prompt",
+		WithMaxContextTokens(64000),
+		WithWorkingTailSize(5),
+	)
+
+	// Add an assistant turn
+	session.CommitSimpleAssistant(openai.ChatCompletionMessage{
+		Role:    "assistant",
+		Content: "I have begun the task.",
+	})
+
+	// Touch a file to activate episodic state dynamic updates
+	session.RecordFileAccess("main.go", "modified")
+
+	// Compile messages
+	msgs := session.CompileMessages()
+
+	// Verify no consecutive User messages
+	for i := 1; i < len(msgs); i++ {
+		prevIsUser := msgs[i-1].OfUser != nil
+		currIsUser := msgs[i].OfUser != nil
+		if prevIsUser && currIsUser {
+			t.Fatalf("detected consecutive user messages at indices %d and %d", i-1, i)
+		}
+	}
+
+	// Should have: System (P1) -> User (P2 Episodic State) -> Assistant (P3)
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(msgs))
+	}
+	if msgs[0].OfSystem == nil {
+		t.Errorf("expected msgs[0] to be system message")
+	}
+	if msgs[1].OfUser == nil {
+		t.Errorf("expected msgs[1] to be user message (P2)")
+	}
+	if msgs[2].OfAssistant == nil {
+		t.Errorf("expected msgs[2] to be assistant message (P3)")
 	}
 }

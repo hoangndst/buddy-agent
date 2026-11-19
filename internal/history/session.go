@@ -2,7 +2,6 @@ package history
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,7 +12,8 @@ import (
 // Session manages the complete Three-Partition conversational lifecycle,
 // enforcing strict atomic turn blocks, staged micro-pruning, and multi-tier compaction.
 type Session struct {
-	mu sync.RWMutex
+	mu        sync.RWMutex
+	compactMu sync.Mutex // Serializes watermark checks and forced compaction [F-05]
 
 	systemAnchor      string        // Partition 1: Immutable System Anchor
 	episodicNarrative string        // Partition 2: Distilled narrative summary
@@ -67,6 +67,7 @@ func (s *Session) CompileMessages() []openai.ChatCompletionMessageParamUnion {
 	stateTable := s.tracker.RenderEpisodicState()
 	hasEpisodicState := s.episodicNarrative != "" || s.tracker.HasDynamicUpdates()
 
+	startIndex := 0
 	if hasEpisodicState {
 		var episodicBuilder strings.Builder
 		episodicBuilder.WriteString(stateTable)
@@ -74,17 +75,24 @@ func (s *Session) CompileMessages() []openai.ChatCompletionMessageParamUnion {
 			episodicBuilder.WriteString("\n\n### Distilled Progress Summary\n")
 			episodicBuilder.WriteString(s.episodicNarrative)
 		}
+
+		// [F-02] If the oldest uncompacted turn in s.blocks is the initial root user task (BlockKindUser),
+		// coalesce it into Partition 2 (which already contains the Root Objective) rather than emitting
+		// two consecutive User turns, preserving strict provider alternating role invariants.
+		if len(s.blocks) > 0 && s.blocks[0].Kind == BlockKindUser {
+			startIndex = 1
+		}
+
 		msgs = append(msgs, openai.UserMessage(episodicBuilder.String()))
+	} else {
+		// If P2 was omitted and the first block in P3 is an assistant turn,
+		// inject a synthetic user bridge turn to guarantee alternating conversational turns.
+		if len(s.blocks) > 0 && s.blocks[0].Kind != BlockKindUser {
+			msgs = append(msgs, openai.UserMessage("Continue executing the task based on the established context."))
+		}
 	}
 
-	// 3. Partition 3: Active Working Tail (& any active unevicted blocks)
-	// If P2 was omitted and the first block in P3 is an assistant turn,
-	// inject a synthetic user bridge turn to guarantee alternating conversational turns.
-	if !hasEpisodicState && len(s.blocks) > 0 && s.blocks[0].Kind != BlockKindUser {
-		msgs = append(msgs, openai.UserMessage("Continue executing the task based on the established context."))
-	}
-
-	for i := range s.blocks {
+	for i := startIndex; i < len(s.blocks); i++ {
 		compiled := s.blocks[i].CompileMessages()
 		msgs = append(msgs, compiled...)
 	}
@@ -108,6 +116,7 @@ func (s *Session) CommitSimpleAssistant(msg openai.ChatCompletionMessage) {
 	block.EstimatedTokens = EstimateBlock(&block)
 	s.blocks = append(s.blocks, block)
 	s.estimator.AddDelta(block.EstimatedTokens)
+	s.eagerMicroPruneBoundaryLocked()
 }
 
 // CommitToolTurn atomically records an assistant tool call message and all corresponding tool responses.
@@ -122,6 +131,23 @@ func (s *Session) CommitToolTurn(
 	block.EstimatedTokens = EstimateBlock(&block)
 	s.blocks = append(s.blocks, block)
 	s.estimator.AddDelta(block.EstimatedTokens)
+	s.eagerMicroPruneBoundaryLocked()
+}
+
+// eagerMicroPruneBoundaryLocked micro-prunes the block that just exited the working tail [F-04],
+// ensuring historical intermediate blocks remain byte-for-byte immutable across turns.
+func (s *Session) eagerMicroPruneBoundaryLocked() {
+	if len(s.blocks) <= s.config.WorkingTailSize {
+		return
+	}
+	boundaryIndex := len(s.blocks) - s.config.WorkingTailSize
+	transitionIdx := boundaryIndex - 1
+	if transitionIdx >= 0 {
+		reclaimed, _ := PruneStaleToolOutputs(&s.blocks[transitionIdx], DefaultMinPruneBytes)
+		if reclaimed > 0 {
+			s.estimator.AddDelta(-reclaimed)
+		}
+	}
 }
 
 // RecordFileAccess delegates touched file metadata tracking to the internal StateTracker.
@@ -182,32 +208,27 @@ func (s *Session) EnsureWatermarks(
 		return err
 	}
 
+	s.compactMu.Lock()
+	defer s.compactMu.Unlock()
+
 	s.mu.Lock()
 
-	softWatermark := int(float64(s.config.MaxContextTokens) * s.config.SoftWatermarkRatio)
 	hardWatermark := int(float64(s.config.MaxContextTokens) * s.config.HardWatermarkRatio)
 
-	currentTokens := s.estimator.CurrentTokens()
-
-	// 1. Tier 1: Staged Boundary Micro-Pruning
-	// Stale tool outputs transitioning out of the working tail into intermediate history are collapsed.
-	if currentTokens >= softWatermark && len(s.blocks) > s.config.WorkingTailSize {
+	// Ensure all intermediate blocks before boundaryIndex are micro-pruned
+	if len(s.blocks) > s.config.WorkingTailSize {
 		boundaryIndex := len(s.blocks) - s.config.WorkingTailSize
 		reclaimedTotal := 0
-
 		for i := 0; i < boundaryIndex; i++ {
 			reclaimed, _ := PruneStaleToolOutputs(&s.blocks[i], DefaultMinPruneBytes)
 			reclaimedTotal += reclaimed
 		}
-
 		if reclaimedTotal > 0 {
-			currentTokens -= reclaimedTotal
-			if currentTokens < 0 {
-				currentTokens = 0
-			}
-			s.estimator.ResetBaseline(currentTokens)
+			s.estimator.AddDelta(-reclaimedTotal)
 		}
 	}
+
+	currentTokens := s.estimator.CurrentTokens()
 
 	// If hard watermark not reached or no blocks outside working tail, check safe halt and return
 	if currentTokens < hardWatermark || len(s.blocks) <= s.config.WorkingTailSize {
@@ -219,11 +240,13 @@ func (s *Session) EnsureWatermarks(
 		return nil
 	}
 
-	// 2. Tier 2: Macro-Distillation & Tier 3: Deterministic Fallback
-	// Snapshot intermediate candidate blocks and state under lock
+	// Tier 2: Macro-Distillation & Tier 3: Deterministic Fallback
+	// Snapshot intermediate candidate blocks using Clone() [F-10]
 	boundaryIndex := len(s.blocks) - s.config.WorkingTailSize
 	intermediateBlocks := make([]TurnBlock, boundaryIndex)
-	copy(intermediateBlocks, s.blocks[:boundaryIndex])
+	for i := 0; i < boundaryIndex; i++ {
+		intermediateBlocks[i] = s.blocks[i].Clone()
+	}
 	narrativeSnapshot := s.episodicNarrative
 	distillModel := model
 	if s.config.DistillationModel != "" {
@@ -234,7 +257,7 @@ func (s *Session) EnsureWatermarks(
 	// Release lock during distillation network call [B3]
 	s.mu.Unlock()
 
-	// Check cancellation before network call
+	// Check parent cancellation before network call
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -252,8 +275,8 @@ func (s *Session) EnsureWatermarks(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If parent context canceled or timed out, propagate error without mutating state
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+	// [F-01] If parent context was canceled or timed out, propagate parent ctx.Err() without mutating state
+	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
@@ -261,7 +284,7 @@ func (s *Session) EnsureWatermarks(
 		// Tier 2 Success: Commit new Episodic Anchor and evict intermediate blocks
 		s.episodicNarrative = summary
 	} else {
-		// Tier 3 Local Fallback: Deterministic eviction with notice
+		// Tier 3 Local Fallback: Deterministic eviction with notice in state table
 		notice := fmt.Sprintf(
 			"[Notice: %d intermediate turns evicted via local fallback due to summarizer unavailability: %v]",
 			len(intermediateBlocks),
@@ -279,7 +302,7 @@ func (s *Session) EnsureWatermarks(
 	}
 	s.estimator.ResetBaseline(s.recalculateTotalTokensLocked())
 
-	// 3. Safe Halt Check: Verify irreducible context does not exceed hard ceiling
+	// Safe Halt Check: Verify irreducible context does not exceed hard ceiling
 	if s.estimator.CurrentTokens() > s.config.MaxContextTokens {
 		return ErrContextExhausted
 	}
@@ -290,10 +313,16 @@ func (s *Session) EnsureWatermarks(
 // DownscaleWatermark lowers the maximum context ceiling dynamically (e.g. upon HTTP 400 recovery).
 // If newCeiling <= 0, applies a 0.75x proportional downscale from the current ceiling.
 // Clamps ceiling at MinViableContextTokens (8192).
-// Returns ErrContextExhausted if irreducible state (P1 + P3 tail) exceeds the new ceiling.
+// Returns ErrContextExhausted if irreducible state exceeds the new ceiling.
 func (s *Session) DownscaleWatermark(newCeiling int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// [F-08] If provider returns explicit limit below MinViableContextTokens,
+	// abort immediately rather than clamping up to 8k and performing doomed retries.
+	if newCeiling > 0 && newCeiling < MinViableContextTokens {
+		return ErrContextExhausted
+	}
 
 	if newCeiling <= 0 {
 		newCeiling = int(float64(s.config.MaxContextTokens) * 0.75)
@@ -302,8 +331,14 @@ func (s *Session) DownscaleWatermark(newCeiling int) error {
 		newCeiling = MinViableContextTokens
 	}
 
-	// Calculate irreducible state: System Anchor (P1) + Working Tail blocks
+	// [F-07] Calculate irreducible state:
+	// System Anchor (P1) + Episodic State Table & Narrative (P2) + Working Tail blocks (P3)
 	irreducible := EstimateContent(s.systemAnchor)
+	irreducible += EstimateContent(s.tracker.RenderEpisodicState())
+	if s.episodicNarrative != "" {
+		irreducible += EstimateContent(s.episodicNarrative)
+	}
+
 	tailStart := len(s.blocks) - s.config.WorkingTailSize
 	if tailStart < 0 {
 		tailStart = 0
@@ -327,6 +362,9 @@ func (s *Session) ForceCompaction(ctx context.Context, client CompletionClient, 
 		return err
 	}
 
+	s.compactMu.Lock()
+	defer s.compactMu.Unlock()
+
 	s.mu.Lock()
 	if len(s.blocks) <= s.config.WorkingTailSize {
 		// Nothing to compact outside the working tail
@@ -340,7 +378,9 @@ func (s *Session) ForceCompaction(ctx context.Context, client CompletionClient, 
 
 	boundaryIndex := len(s.blocks) - s.config.WorkingTailSize
 	intermediateBlocks := make([]TurnBlock, boundaryIndex)
-	copy(intermediateBlocks, s.blocks[:boundaryIndex])
+	for i := 0; i < boundaryIndex; i++ {
+		intermediateBlocks[i] = s.blocks[i].Clone()
+	}
 	narrativeSnapshot := s.episodicNarrative
 	distillModel := model
 	if s.config.DistillationModel != "" {
@@ -366,7 +406,8 @@ func (s *Session) ForceCompaction(ctx context.Context, client CompletionClient, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+	// [F-01] If parent context was canceled or timed out, propagate parent ctx.Err() without mutating state
+	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
