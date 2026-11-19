@@ -201,3 +201,69 @@ func TestMemoryTools(t *testing.T) {
 		t.Fatalf("expected 1 skill loaded, got %d", len(skills))
 	}
 }
+
+func TestFileOpsPathConfinement(t *testing.T) {
+	tempDir := t.TempDir()
+	ctx := context.Background()
+
+	writeTool := NewWriteFileTool(tempDir)
+	readTool := NewReadFileTool(tempDir)
+	editTool := NewEditFileTool(tempDir)
+
+	traversalPaths := []string{
+		"../outside.txt",
+		"../../outside.txt",
+		"/tmp/buddy_test_outside.txt",
+		"nested/../../outside.txt",
+	}
+
+	for _, p := range traversalPaths {
+		writeArgs, _ := json.Marshal(map[string]string{
+			"path":    p,
+			"content": "illegal content",
+		})
+		if _, err := writeTool.Execute(ctx, writeArgs); err == nil {
+			t.Errorf("expected write to fail for path %q", p)
+		}
+
+		readArgs, _ := json.Marshal(map[string]string{
+			"path": p,
+		})
+		if _, err := readTool.Execute(ctx, readArgs); err == nil {
+			t.Errorf("expected read to fail for path %q", p)
+		}
+
+		editArgs, _ := json.Marshal(map[string]string{
+			"path":        p,
+			"target":      "foo",
+			"replacement": "bar",
+		})
+		if _, err := editTool.Execute(ctx, editArgs); err == nil {
+			t.Errorf("expected edit to fail for path %q", p)
+		}
+	}
+}
+
+func TestReadFileLongLines(t *testing.T) {
+	tempDir := t.TempDir()
+	ctx := context.Background()
+	readTool := NewReadFileTool(tempDir)
+
+	// Create a file with a single line > 128KB (default bufio.Scanner limit is 64KB)
+	longLine := strings.Repeat("x", 128*1024)
+	testFile := "longline.txt"
+	if err := os.WriteFile(filepath.Join(tempDir, testFile), []byte(longLine+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	readArgs, _ := json.Marshal(map[string]any{
+		"path": testFile,
+	})
+	out, err := readTool.Execute(ctx, readArgs)
+	if err != nil {
+		t.Fatalf("expected read of long line to succeed, got error: %v", err)
+	}
+	if !strings.Contains(out, "xxxx") {
+		t.Errorf("expected output to contain file content")
+	}
+}

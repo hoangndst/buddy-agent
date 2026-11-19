@@ -55,3 +55,23 @@ func TestMemoryManager(t *testing.T) {
 		t.Errorf("missing skill in prompt")
 	}
 }
+
+func TestSaveSkillPathConfinement(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir)
+
+	traversalNames := []string{
+		"../outside",
+		"../../outside",
+		"nested/skill",
+		`nested\skill`,
+		"../../../etc/passwd",
+	}
+
+	for _, name := range traversalNames {
+		err := mgr.SaveSkill(name, "malicious instructions")
+		if err == nil {
+			t.Errorf("expected SaveSkill to fail for traversal name %q", name)
+		}
+	}
+}

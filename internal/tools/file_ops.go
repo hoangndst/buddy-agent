@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,7 +39,7 @@ func (r *ReadFileTool) Parameters() any {
 		"properties": map[string]any{
 			"path": map[string]any{
 				"type":        "string",
-				"description": "Path to the file, relative to workspace or absolute.",
+				"description": "Path to the file, relative to workspace.",
 			},
 			"offset": map[string]any{
 				"type":        "integer",
@@ -66,7 +67,11 @@ func (r *ReadFileTool) Execute(_ context.Context, raw json.RawMessage) (string, 
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
 
-	targetPath := resolvePath(r.workspace, input.Path)
+	targetPath, err := resolvePath(r.workspace, input.Path)
+	if err != nil {
+		return "", err
+	}
+
 	file, err := os.Open(targetPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open file: %w", err)
@@ -84,26 +89,31 @@ func (r *ReadFileTool) Execute(_ context.Context, raw json.RawMessage) (string, 
 		limit = 500
 	}
 
-	scanner := bufio.NewScanner(file)
+	reader := bufio.NewReader(file)
 	currentLine := 0
 	linesRead := 0
 	var sb strings.Builder
 
-	for scanner.Scan() {
-		currentLine++
-		if currentLine < offset {
-			continue
+	for {
+		line, readErr := reader.ReadString('\n')
+		if len(line) > 0 {
+			currentLine++
+			if currentLine >= offset {
+				if linesRead >= limit {
+					sb.WriteString(fmt.Sprintf("\n...[Truncated: further lines omitted, read %d lines]...", limit))
+					break
+				}
+				trimmedLine := strings.TrimRight(line, "\r\n")
+				sb.WriteString(fmt.Sprintf("%4d | %s\n", currentLine, trimmedLine))
+				linesRead++
+			}
 		}
-		if linesRead >= limit {
-			sb.WriteString(fmt.Sprintf("\n...[Truncated: further lines omitted, read %d lines]...", limit))
-			break
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return "", fmt.Errorf("error reading file: %w", readErr)
 		}
-		sb.WriteString(fmt.Sprintf("%4d | %s\n", currentLine, scanner.Text()))
-		linesRead++
-	}
-
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("error reading file: %w", err)
 	}
 
 	if linesRead == 0 && currentLine < offset {
@@ -163,7 +173,11 @@ func (w *WriteFileTool) Execute(_ context.Context, raw json.RawMessage) (string,
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
 
-	targetPath := resolvePath(w.workspace, input.Path)
+	targetPath, err := resolvePath(w.workspace, input.Path)
+	if err != nil {
+		return "", err
+	}
+
 	dir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create directory: %w", err)
@@ -235,7 +249,11 @@ func (e *EditFileTool) Execute(_ context.Context, raw json.RawMessage) (string, 
 		return "", errors.New("target string cannot be empty")
 	}
 
-	targetPath := resolvePath(e.workspace, input.Path)
+	targetPath, err := resolvePath(e.workspace, input.Path)
+	if err != nil {
+		return "", err
+	}
+
 	data, err := os.ReadFile(targetPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read file: %w", err)
@@ -254,9 +272,29 @@ func (e *EditFileTool) Execute(_ context.Context, raw json.RawMessage) (string, 
 	return fmt.Sprintf("Successfully replaced target block in %s", input.Path), nil
 }
 
-func resolvePath(workspace, path string) string {
-	if filepath.IsAbs(path) {
-		return path
+// resolvePath canonicalizes target path and ensures it stays strictly within the workspace.
+func resolvePath(workspace, path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", errors.New("path cannot be empty")
 	}
-	return filepath.Join(workspace, path)
+
+	absWorkspace, err := filepath.Abs(workspace)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve workspace directory: %w", err)
+	}
+	absWorkspace = filepath.Clean(absWorkspace)
+
+	var target string
+	if filepath.IsAbs(path) {
+		target = filepath.Clean(path)
+	} else {
+		target = filepath.Clean(filepath.Join(absWorkspace, path))
+	}
+
+	rel, err := filepath.Rel(absWorkspace, target)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+		return "", fmt.Errorf("access denied: path %q is outside workspace directory", path)
+	}
+
+	return target, nil
 }

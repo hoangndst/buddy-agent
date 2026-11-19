@@ -2,6 +2,7 @@
 package memory
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -120,18 +121,37 @@ func (m *Manager) AppendMemory(entry string) (err error) {
 
 // SaveSkill saves a procedural skill to skills/<name>.md.
 func (m *Manager) SaveSkill(name, content string) error {
-	skillsDir := filepath.Join(m.workspace, "skills")
+	trimmedName := strings.TrimSpace(name)
+	if trimmedName == "" {
+		return errors.New("skill name cannot be empty")
+	}
+
+	// Reject path separators and traversal attempts
+	if strings.ContainsAny(trimmedName, `/\`) || strings.Contains(trimmedName, "..") {
+		return fmt.Errorf("invalid skill name %q: must not contain path separators or traversal sequences", name)
+	}
+
+	absWorkspace, err := filepath.Abs(m.workspace)
+	if err != nil {
+		return fmt.Errorf("failed to resolve workspace directory: %w", err)
+	}
+	skillsDir := filepath.Clean(filepath.Join(absWorkspace, "skills"))
 	if err := os.MkdirAll(skillsDir, 0755); err != nil {
 		return fmt.Errorf("failed to create skills directory: %w", err)
 	}
 
-	safeName := strings.ToLower(strings.ReplaceAll(name, " ", "-"))
+	safeName := strings.ToLower(strings.ReplaceAll(trimmedName, " ", "-"))
 	if !strings.HasSuffix(safeName, ".md") {
 		safeName += ".md"
 	}
 
-	path := filepath.Join(skillsDir, safeName)
-	if err := os.WriteFile(path, []byte(strings.TrimSpace(content)+"\n"), 0644); err != nil {
+	targetPath := filepath.Clean(filepath.Join(skillsDir, safeName))
+	rel, err := filepath.Rel(skillsDir, targetPath)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == ".." || rel != safeName {
+		return fmt.Errorf("access denied: skill name %q escapes skills directory", name)
+	}
+
+	if err := os.WriteFile(targetPath, []byte(strings.TrimSpace(content)+"\n"), 0644); err != nil {
 		return fmt.Errorf("failed to write skill file: %w", err)
 	}
 	return nil
