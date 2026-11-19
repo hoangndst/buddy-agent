@@ -447,3 +447,24 @@ func TestSession_ConcurrentCompileAndFileAccess(_ *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+func TestDistillSystemPrompt_EmbedContent(t *testing.T) {
+	if defaultDistillSystemPrompt == "" {
+		t.Fatal("expected defaultDistillSystemPrompt to be non-empty via go:embed")
+	}
+	expectedDirectives := []string{
+		"autonomous context compaction engine",
+		"Read-Only / Non-Execution Safety",
+		"Information Retention Priority",
+		"### Goal & Core Objectives",
+		"### Actions Taken & Key Findings",
+		"### Current State & Touched Resources",
+		"### Active Issues & Blockers",
+		"### Next Immediate Steps",
+	}
+	for _, directive := range expectedDirectives {
+		if !strings.Contains(defaultDistillSystemPrompt, directive) {
+			t.Errorf("expected embedded distill prompt to contain %q", directive)
+		}
+	}
+}
