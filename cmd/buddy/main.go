@@ -55,7 +55,7 @@ func main() {
 	memMgr := memory.NewManager(cfg.WorkspaceDir)
 	reg := tools.NewRegistry(cfg.MaxOutputChars)
 
-	reg.Register(tools.NewBashTool(cfg.WorkspaceDir, 60*time.Second))
+	reg.Register(tools.NewBashTool(cfg.WorkspaceDir, 60*time.Second, tools.WithMaxOutputBytes(cfg.MaxOutputChars)))
 	reg.Register(tools.NewReadFileTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewWriteFileTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewEditFileTool(cfg.WorkspaceDir))

@@ -9,12 +9,17 @@ A lightweight, local-first, self-evolving autonomous agent harness built in pure
 ## Key Architecture
 
 - **Autonomous ReAct Engine**: Deterministic reasoning and tool execution loop with configurable step budgets and live output streaming.
-- **Provider Agnostic**: OpenAI-compatible REST integration supporting local inference runners (vLLM, Ollama) and cloud providers.
+- **Subprocess Safety & Process Groups**: Executes shell commands within isolated OS process groups (`Setpgid: true` on POSIX, Job Objects on Windows) with escalated dual-phase termination (`SIGTERM` -> 1.5s grace -> `SIGKILL` to negative PGID) and descendant liveness probing to eliminate orphan processes.
+- **Memory-Bounded Streaming Truncation**: Line-aware, streaming dual-buffer truncators (70% stdout / 30% stderr) with circular rolling tail ring buffers and delimiter-free UTF-8 rune fallback.
+- **Provider Agnostic**: OpenAI-compatible REST integration using official `openai-go` SDK supporting local inference runners and cloud providers.
 - **Durable Memory & Persona**: Context-aware memory layer using file-backed storage (`SOUL.md`, `MEMORY.md`, `USER.md`) alongside structured episodic records.
 - **Self-Improving Skill System**: Dynamically captures discovered procedures and workflows into an extensible `skills/` library.
-- **Context Protection**: Intelligent tool output truncation preserving head/tail context to prevent context window overflow.
-- **Native Tools**: Built-in shell runner, targeted file reader, patch-based file editor, and memory management.
-- **Zero CGO**: Pure Go for fast, static single-binary compilation across platforms.
+- **Zero CGO**: Pure Go for fast, static single-binary compilation across platforms (`linux`, `darwin`, `windows`).
+
+## Architecture & Design Specifications
+
+Approved milestone design specifications are maintained under [`docs/designs/`](docs/designs/):
+- [`docs/designs/02_subprocess_safety.md`](docs/designs/02_subprocess_safety.md): Subprocess process group isolation, staged termination, and output safety.
 
 ## Getting Started
 

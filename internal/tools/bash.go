@@ -1,30 +1,59 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os/exec"
 	"time"
+
+	"github.com/hoangndst/buddy-agent/internal/tools/subprocess"
 )
+
+// BashToolOption configures a BashTool.
+type BashToolOption func(*BashTool)
+
+// WithRunner sets the subprocess.Runner for the BashTool.
+func WithRunner(r subprocess.Runner) BashToolOption {
+	return func(b *BashTool) {
+		if r != nil {
+			b.runner = r
+		}
+	}
+}
+
+// WithMaxOutputBytes sets the maximum byte output limit for the BashTool.
+func WithMaxOutputBytes(n int) BashToolOption {
+	return func(b *BashTool) {
+		if n > 0 {
+			b.maxOutputBytes = n
+		}
+	}
+}
 
 // BashTool executes shell commands in the agent's workspace.
 type BashTool struct {
-	workspace string
-	timeout   time.Duration
+	workspace      string
+	timeout        time.Duration
+	maxOutputBytes int
+	runner         subprocess.Runner
 }
 
-// NewBashTool creates a new BashTool.
-func NewBashTool(workspace string, timeout time.Duration) *BashTool {
+// NewBashTool creates a new BashTool with optional configuration options.
+func NewBashTool(workspace string, timeout time.Duration, opts ...BashToolOption) *BashTool {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	return &BashTool{
-		workspace: workspace,
-		timeout:   timeout,
+	b := &BashTool{
+		workspace:      workspace,
+		timeout:        timeout,
+		maxOutputBytes: 10000,
+		runner:         subprocess.NewDefaultRunner(1500 * time.Millisecond),
 	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
 }
 
 // Name returns the identifier of the tool.
@@ -34,7 +63,7 @@ func (b *BashTool) Name() string {
 
 // Description returns a human-readable explanation of the tool.
 func (b *BashTool) Description() string {
-	return "Execute a bash shell command in the workspace directory. Returns exit code, stdout, and stderr."
+	return "Execute a bash shell command in the workspace directory. Returns exit code, duration, stdout, and stderr."
 }
 
 // Parameters returns the JSON schema definition for tool arguments.
@@ -66,26 +95,21 @@ func (b *BashTool) Execute(ctx context.Context, raw json.RawMessage) (string, er
 		return "", errors.New("command argument cannot be empty")
 	}
 
-	execCtx, cancel := context.WithTimeout(ctx, b.timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(execCtx, "bash", "-c", input.Command)
-	cmd.Dir = b.workspace
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			return "", fmt.Errorf("command execution failed: %w", err)
-		}
+	// Reserve 256 bytes for execution summary headers so res.Combined <= b.maxOutputBytes
+	runnerMaxBytes := b.maxOutputBytes - 256
+	if runnerMaxBytes < 500 {
+		runnerMaxBytes = 500
 	}
 
-	return fmt.Sprintf("Exit Code: %d\nStdout:\n%s\nStderr:\n%s",
-		exitCode, stdout.String(), stderr.String()), nil
+	res, err := b.runner.Run(ctx, subprocess.ExecutionOptions{
+		Command:        input.Command,
+		Dir:            b.workspace,
+		Timeout:        b.timeout,
+		MaxOutputBytes: runnerMaxBytes,
+	})
+	if err != nil {
+		return "", fmt.Errorf("command execution failed: %w", err)
+	}
+
+	return res.Combined, nil
 }
