@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hoangndst/buddy-agent/internal/history"
 	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 	"github.com/openai/openai-go"
@@ -239,5 +240,46 @@ func TestEngineContextCompactionAndExhaustion(t *testing.T) {
 	}
 	if !hasExhaustEvent {
 		t.Errorf("expected EventContextExhausted in events, got: %+v", events)
+	}
+}
+
+func TestEngineInitialContextExhaustion(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	memMgr := memory.NewManager(tempDir)
+
+	mockClient := &mockChatClient{}
+	var events []Event
+
+	// Set MaxContextTokens so small (5 tokens) that initial task immediately exceeds it
+	engine := NewEngine(
+		mockClient,
+		"test-model",
+		5,
+		reg,
+		memMgr,
+		func(e Event) { events = append(events, e) },
+		WithMaxContextTokens(5),
+	)
+
+	_, err := engine.Run(context.Background(), "This is an oversized initial task that exceeds five tokens")
+	if !errors.Is(err, history.ErrContextExhausted) {
+		t.Fatalf("expected ErrContextExhausted on initial prompt, got: %v", err)
+	}
+
+	// Model client must NEVER have been called
+	if mockClient.calls > 0 {
+		t.Errorf("expected 0 LLM calls for oversized initial prompt, got %d", mockClient.calls)
+	}
+
+	hasExhaustEvent := false
+	for _, ev := range events {
+		if ev.Type == EventContextExhausted {
+			hasExhaustEvent = true
+			break
+		}
+	}
+	if !hasExhaustEvent {
+		t.Errorf("expected EventContextExhausted event, got: %+v", events)
 	}
 }

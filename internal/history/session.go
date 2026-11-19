@@ -65,7 +65,7 @@ func (s *Session) CompileMessages() []openai.ChatCompletionMessageParamUnion {
 	// 2. Partition 2: Structured Episodic Anchor
 	// Rendered as an openai.UserMessage to preserve valid alternating conversation turns.
 	stateTable := s.tracker.RenderEpisodicState()
-	hasEpisodicState := s.episodicNarrative != "" || len(s.tracker.ModifiedFiles) > 0 || len(s.tracker.RecentErrors) > 0
+	hasEpisodicState := s.episodicNarrative != "" || s.tracker.HasDynamicUpdates()
 
 	if hasEpisodicState {
 		var episodicBuilder strings.Builder

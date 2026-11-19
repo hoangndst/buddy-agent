@@ -60,3 +60,26 @@ func TestLoadCustom(t *testing.T) {
 		t.Errorf("expected Debug true, got false")
 	}
 }
+
+func TestInferModelContextLimit(t *testing.T) {
+	tests := []struct {
+		model    string
+		expected int
+	}{
+		{"qwen-128k", 64000},
+		{"llama-3-128k-instruct", 64000},
+		{"gpt-4o", 64000},
+		{"model-64k", 65536},
+		{"deepseek-32k", 32768},
+		{"mistral-16k", 16384},
+		{"llama-8k", 8192},
+		{"custom-unknown-model", 64000},
+	}
+
+	for _, tc := range tests {
+		actual := inferModelContextLimit(tc.model)
+		if actual != tc.expected {
+			t.Errorf("inferModelContextLimit(%q) = %d, expected %d", tc.model, actual, tc.expected)
+		}
+	}
+}

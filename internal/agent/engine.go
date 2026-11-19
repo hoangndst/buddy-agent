@@ -97,6 +97,19 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		history.WithWorkingTailSize(e.workingTailSize),
 	)
 
+	// Guard against oversized initial task or system prompt exceeding context ceiling
+	if err := session.EnsureWatermarks(ctx, e.client, e.model); err != nil {
+		if errors.Is(err, history.ErrContextExhausted) {
+			e.eventHandler(Event{Type: EventContextExhausted, Step: 0, Error: err})
+			return "", err
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return "", err
+		}
+		e.eventHandler(Event{Type: EventError, Step: 0, Error: err})
+		return "", fmt.Errorf("initial context validation failed: %w", err)
+	}
+
 	// 2. Main ReAct execution loop
 	for step := 1; step <= e.maxSteps; step++ {
 		select {

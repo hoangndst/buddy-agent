@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/openai/openai-go"
 )
@@ -394,4 +396,54 @@ func TestSession_ErrContextExhausted(t *testing.T) {
 	if !errors.Is(err, ErrContextExhausted) {
 		t.Fatalf("expected ErrContextExhausted, got: %v", err)
 	}
+}
+
+func TestSession_ConcurrentCompileAndFileAccess(_ *testing.T) {
+	session := NewSession(
+		"System prompt",
+		"Task prompt",
+		WithMaxContextTokens(10000),
+	)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Concurrently record file accesses and errors
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			counter := 0
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					session.RecordFileAccess(fmt.Sprintf("file_%d_%d.go", workerID, counter), "modified")
+					session.RecordError(fmt.Sprintf("error_%d_%d", workerID, counter))
+					counter++
+				}
+			}
+		}(i)
+	}
+
+	// Concurrently compile messages
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = session.CompileMessages()
+				}
+			}
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }

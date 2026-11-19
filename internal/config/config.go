@@ -74,16 +74,16 @@ func Load() (*Config, error) {
 func inferModelContextLimit(model string) int {
 	m := strings.ToLower(model)
 	switch {
-	case strings.Contains(m, "8k"):
-		return 8192
-	case strings.Contains(m, "16k"):
-		return 16384
-	case strings.Contains(m, "32k"):
-		return 32768
-	case strings.Contains(m, "64k"):
-		return 65536
 	case strings.Contains(m, "128k") || strings.Contains(m, "gpt-4o"):
 		return 64000 // Conservative 64k default ceiling within 128k window
+	case strings.Contains(m, "64k"):
+		return 65536
+	case strings.Contains(m, "32k"):
+		return 32768
+	case strings.Contains(m, "16k"):
+		return 16384
+	case strings.Contains(m, "8k"):
+		return 8192
 	default:
 		return 64000
 	}
