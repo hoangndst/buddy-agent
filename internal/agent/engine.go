@@ -11,6 +11,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 )
 
 // EngineOption configures operational parameters for the Agent Engine.
@@ -34,6 +35,13 @@ func WithWorkingTailSize(size int) EngineOption {
 	}
 }
 
+// WithIsLocal configures whether the engine is communicating with a local LLM endpoint (e.g. Ollama).
+func WithIsLocal(isLocal bool) EngineOption {
+	return func(e *Engine) {
+		e.isLocal = isLocal
+	}
+}
+
 // Engine orchestrates the ReAct loop: prompting, tool execution, and memory feedback.
 type Engine struct {
 	client           ChatClient
@@ -41,6 +49,7 @@ type Engine struct {
 	maxSteps         int
 	maxContextTokens int
 	workingTailSize  int
+	isLocal          bool
 	registry         *tools.Registry
 	memoryMgr        *memory.Manager
 	eventHandler     EventHandler
@@ -68,6 +77,7 @@ func NewEngine(
 		maxSteps:         maxSteps,
 		maxContextTokens: 64000,
 		workingTailSize:  5,
+		isLocal:          false,
 		registry:         reg,
 		memoryMgr:        mem,
 		eventHandler:     handler,
@@ -110,6 +120,8 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		return "", fmt.Errorf("initial context validation failed: %w", err)
 	}
 
+	const maxTurnRetries = 2
+
 	// 2. Main ReAct execution loop
 	for step := 1; step <= e.maxSteps; step++ {
 		select {
@@ -120,30 +132,78 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 
 		e.eventHandler(Event{Type: EventStepStart, Step: step})
 
-		params := openai.ChatCompletionNewParams{
-			Model:    e.model,
-			Messages: session.CompileMessages(),
-			Tools:    e.registry.OpenAITools(),
+		var choice openai.ChatCompletionChoice
+		var completionErr error
+
+		// Bounded reactive recovery completion loop
+		for retry := 0; retry <= maxTurnRetries; retry++ {
+			params := openai.ChatCompletionNewParams{
+				Model:    e.model,
+				Messages: session.CompileMessages(),
+				Tools:    e.registry.OpenAITools(),
+			}
+
+			// Local endpoint num_ctx injection (Ollama)
+			reqOpts := make([]option.RequestOption, 0, 1)
+			if e.isLocal {
+				reqOpts = append(reqOpts, option.WithJSONSet("options.num_ctx", session.MaxContextTokens()))
+			}
+
+			resp, err := e.client.CreateChatCompletion(ctx, params, reqOpts...)
+			if err == nil {
+				if len(resp.Choices) == 0 {
+					err := errors.New("model returned empty choices")
+					e.eventHandler(Event{Type: EventError, Step: step, Error: err})
+					return "", err
+				}
+
+				if resp.Usage.PromptTokens > 0 {
+					session.CalibrateUsage(resp.Usage.PromptTokens)
+				}
+				choice = resp.Choices[0]
+				completionErr = nil
+				break
+			}
+
+			completionErr = err
+			targetTokens, matched := ParseContextLengthError(err)
+			if !matched || retry == maxTurnRetries {
+				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
+				return "", fmt.Errorf("step %d LLM call failed: %w", step, err)
+			}
+
+			e.eventHandler(Event{
+				Type:    EventContextRetrying,
+				Step:    step,
+				Content: fmt.Sprintf("Context limit exceeded; ratcheting down and forcing compaction (retry %d/%d)", retry+1, maxTurnRetries),
+				Error:   err,
+			})
+
+			if err := session.DownscaleWatermark(targetTokens); err != nil {
+				if errors.Is(err, history.ErrContextExhausted) {
+					e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
+					return "", err
+				}
+				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
+				return "", fmt.Errorf("downscale watermark failed: %w", err)
+			}
+
+			if err := session.ForceCompaction(ctx, e.client, e.model); err != nil {
+				if errors.Is(err, history.ErrContextExhausted) {
+					e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
+					return "", err
+				}
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return "", err
+				}
+				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
+				return "", fmt.Errorf("force compaction failed: %w", err)
+			}
 		}
 
-		resp, err := e.client.CreateChatCompletion(ctx, params)
-		if err != nil {
-			e.eventHandler(Event{Type: EventError, Step: step, Error: err})
-			return "", fmt.Errorf("step %d LLM call failed: %w", step, err)
+		if completionErr != nil {
+			return "", completionErr
 		}
-
-		if len(resp.Choices) == 0 {
-			err := errors.New("model returned empty choices")
-			e.eventHandler(Event{Type: EventError, Step: step, Error: err})
-			return "", err
-		}
-
-		// Calibrate token tracker against exact API prompt token metrics
-		if resp.Usage.PromptTokens > 0 {
-			session.CalibrateUsage(resp.Usage.PromptTokens)
-		}
-
-		choice := resp.Choices[0]
 
 		// Emit thought if model generated reasoning or explanation
 		if choice.Message.Content != "" {
@@ -203,7 +263,13 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 			// Headroom protection: cap cumulative tool outputs within turn
 			cumulativeBytes += len(result)
 			if cumulativeBytes > maxTurnBytes {
-				result = "[Output truncated: cumulative turn output limit reached]"
+				exitSuffix := ""
+				if idx := strings.LastIndex(result, "exit code"); idx != -1 {
+					exitSuffix = " | " + strings.TrimSpace(result[idx:])
+				} else if idx := strings.LastIndex(result, "exit status"); idx != -1 {
+					exitSuffix = " | " + strings.TrimSpace(result[idx:])
+				}
+				result = "[Output truncated: cumulative turn output limit reached]" + exitSuffix
 			}
 
 			e.eventHandler(Event{

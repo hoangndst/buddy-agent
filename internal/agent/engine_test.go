@@ -10,6 +10,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 )
 
 type mockChatClient struct {
@@ -18,7 +19,7 @@ type mockChatClient struct {
 	calls     int
 }
 
-func (m *mockChatClient) CreateChatCompletion(_ context.Context, _ openai.ChatCompletionNewParams) (*openai.ChatCompletion, error) {
+func (m *mockChatClient) CreateChatCompletion(_ context.Context, _ openai.ChatCompletionNewParams, _ ...option.RequestOption) (*openai.ChatCompletion, error) {
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -281,5 +282,168 @@ func TestEngineInitialContextExhaustion(t *testing.T) {
 	}
 	if !hasExhaustEvent {
 		t.Errorf("expected EventContextExhausted event, got: %+v", events)
+	}
+}
+
+type flexibleMockClient struct {
+	calls   int
+	handler func(call int, params openai.ChatCompletionNewParams, opts []option.RequestOption) (*openai.ChatCompletion, error)
+}
+
+func (m *flexibleMockClient) CreateChatCompletion(_ context.Context, params openai.ChatCompletionNewParams, opts ...option.RequestOption) (*openai.ChatCompletion, error) {
+	resp, err := m.handler(m.calls, params, opts)
+	m.calls++
+	return resp, err
+}
+
+func TestEngineReactiveContextRecovery(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	memMgr := memory.NewManager(tempDir)
+
+	mock := &flexibleMockClient{
+		handler: func(call int, _ openai.ChatCompletionNewParams, _ []option.RequestOption) (*openai.ChatCompletion, error) {
+			if call == 0 {
+				// First call fails with context overflow
+				return nil, &openai.Error{
+					Code:    "context_length_exceeded",
+					Message: "maximum context length is 16384 tokens. However, your messages resulted in 18000 tokens.",
+				}
+			}
+			// Second call (retry) succeeds
+			return &openai.ChatCompletion{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Self-healed and completed successfully.",
+						},
+					},
+				},
+				Usage: openai.CompletionUsage{PromptTokens: 12000},
+			}, nil
+		},
+	}
+
+	var events []Event
+	engine := NewEngine(
+		mock,
+		"qwen2.5-coder:7b",
+		5,
+		reg,
+		memMgr,
+		func(e Event) { events = append(events, e) },
+		WithMaxContextTokens(32000),
+		WithWorkingTailSize(2),
+	)
+
+	result, err := engine.Run(context.Background(), "Perform recovery test")
+	if err != nil {
+		t.Fatalf("expected successful execution after reactive retry, got: %v", err)
+	}
+
+	if result != "Self-healed and completed successfully." {
+		t.Errorf("unexpected result: %s", result)
+	}
+
+	hasRetryingEvent := false
+	for _, ev := range events {
+		if ev.Type == EventContextRetrying {
+			hasRetryingEvent = true
+			break
+		}
+	}
+	if !hasRetryingEvent {
+		t.Errorf("expected EventContextRetrying to be emitted, got events: %+v", events)
+	}
+}
+
+func TestEngineReactiveContextExhausted(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	memMgr := memory.NewManager(tempDir)
+
+	mock := &flexibleMockClient{
+		handler: func(_ int, _ openai.ChatCompletionNewParams, _ []option.RequestOption) (*openai.ChatCompletion, error) {
+			return nil, &openai.Error{
+				Code:    "context_length_exceeded",
+				Message: "maximum context length is 16384 tokens.",
+			}
+		},
+	}
+
+	var events []Event
+	engine := NewEngine(
+		mock,
+		"qwen2.5-coder:7b",
+		5,
+		reg,
+		memMgr,
+		func(e Event) { events = append(events, e) },
+		WithMaxContextTokens(32000),
+		WithWorkingTailSize(2),
+	)
+
+	_, err := engine.Run(context.Background(), "Fail after retries")
+	if err == nil {
+		t.Fatal("expected error after retry exhaustion, got nil")
+	}
+
+	// Should have made 1 initial call + 2 retries = 3 calls
+	if mock.calls != 3 {
+		t.Errorf("expected 3 total calls (1 initial + 2 retries), got %d", mock.calls)
+	}
+
+	retryEvents := 0
+	for _, ev := range events {
+		if ev.Type == EventContextRetrying {
+			retryEvents++
+		}
+	}
+	if retryEvents != 2 {
+		t.Errorf("expected 2 EventContextRetrying events, got %d", retryEvents)
+	}
+}
+
+func TestEngineLocalNumCtxInjection(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	memMgr := memory.NewManager(tempDir)
+
+	var capturedOpts []option.RequestOption
+	mock := &flexibleMockClient{
+		handler: func(_ int, _ openai.ChatCompletionNewParams, opts []option.RequestOption) (*openai.ChatCompletion, error) {
+			capturedOpts = opts
+			return &openai.ChatCompletion{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Local run complete.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	engine := NewEngine(
+		mock,
+		"qwen2.5-coder:7b",
+		5,
+		reg,
+		memMgr,
+		nil,
+		WithMaxContextTokens(16384),
+		WithIsLocal(true),
+	)
+
+	_, err := engine.Run(context.Background(), "Check local num_ctx injection")
+	if err != nil {
+		t.Fatalf("unexpected engine error: %v", err)
+	}
+
+	if len(capturedOpts) == 0 {
+		t.Fatal("expected RequestOptions to be passed when isLocal=true")
 	}
 }

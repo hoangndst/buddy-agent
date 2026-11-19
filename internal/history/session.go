@@ -78,11 +78,9 @@ func (s *Session) CompileMessages() []openai.ChatCompletionMessageParamUnion {
 	}
 
 	// 3. Partition 3: Active Working Tail (& any active unevicted blocks)
-	hasIntermediateUserEviction := hasEpisodicState && len(s.blocks) > 0 && s.blocks[0].Kind != BlockKindUser
-
-	// If the oldest remaining turn is an Assistant block and earlier User turns were evicted,
-	// inject a synthetic user bridge turn to satisfy strict alternating-turn backends.
-	if hasIntermediateUserEviction && !hasEpisodicState {
+	// If P2 was omitted and the first block in P3 is an assistant turn,
+	// inject a synthetic user bridge turn to guarantee alternating conversational turns.
+	if !hasEpisodicState && len(s.blocks) > 0 && s.blocks[0].Kind != BlockKindUser {
 		msgs = append(msgs, openai.UserMessage("Continue executing the task based on the established context."))
 	}
 
@@ -143,6 +141,13 @@ func (s *Session) ReloadSystemAnchor(newSystemPrompt string) {
 	s.systemAnchor = newSystemPrompt
 }
 
+// MaxContextTokens returns the current maximum context limit.
+func (s *Session) MaxContextTokens() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config.MaxContextTokens
+}
+
 // MaxTurnOutputBytes returns the maximum cumulative bytes permitted for tool outputs
 // within a single turn, derived from headroom buffer limits.
 func (s *Session) MaxTurnOutputBytes() int {
@@ -173,20 +178,18 @@ func (s *Session) EnsureWatermarks(
 	client CompletionClient,
 	model string,
 ) error {
-	// 1. Check parent context cancellation immediately
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	softWatermark := int(float64(s.config.MaxContextTokens) * s.config.SoftWatermarkRatio)
 	hardWatermark := int(float64(s.config.MaxContextTokens) * s.config.HardWatermarkRatio)
 
 	currentTokens := s.estimator.CurrentTokens()
 
-	// 2. Tier 1: Staged Boundary Micro-Pruning
+	// 1. Tier 1: Staged Boundary Micro-Pruning
 	// Stale tool outputs transitioning out of the working tail into intermediate history are collapsed.
 	if currentTokens >= softWatermark && len(s.blocks) > s.config.WorkingTailSize {
 		boundaryIndex := len(s.blocks) - s.config.WorkingTailSize
@@ -198,7 +201,6 @@ func (s *Session) EnsureWatermarks(
 		}
 
 		if reclaimedTotal > 0 {
-			// Deduct reclaimed tokens from estimator
 			currentTokens -= reclaimedTotal
 			if currentTokens < 0 {
 				currentTokens = 0
@@ -207,58 +209,187 @@ func (s *Session) EnsureWatermarks(
 		}
 	}
 
-	// 3. Tier 2: Macro-Distillation & Tier 3: Deterministic Fallback
-	if currentTokens >= hardWatermark && len(s.blocks) > s.config.WorkingTailSize {
-		// Split blocks into intermediate eviction candidates and active working tail
-		boundaryIndex := len(s.blocks) - s.config.WorkingTailSize
-		intermediateBlocks := make([]TurnBlock, boundaryIndex)
-		copy(intermediateBlocks, s.blocks[:boundaryIndex])
-		tailBlocks := make([]TurnBlock, len(s.blocks)-boundaryIndex)
-		copy(tailBlocks, s.blocks[boundaryIndex:])
-
-		distillModel := model
-		if s.config.DistillationModel != "" {
-			distillModel = s.config.DistillationModel
+	// If hard watermark not reached or no blocks outside working tail, check safe halt and return
+	if currentTokens < hardWatermark || len(s.blocks) <= s.config.WorkingTailSize {
+		if s.estimator.CurrentTokens() > s.config.MaxContextTokens {
+			s.mu.Unlock()
+			return ErrContextExhausted
 		}
+		s.mu.Unlock()
+		return nil
+	}
 
-		// Attempt Tier 2 Distillation with isolated timeout
-		summary, err := DistillIntermediateBlocks(
-			ctx,
-			client,
-			distillModel,
-			s.episodicNarrative,
-			intermediateBlocks,
-			s.tracker,
+	// 2. Tier 2: Macro-Distillation & Tier 3: Deterministic Fallback
+	// Snapshot intermediate candidate blocks and state under lock
+	boundaryIndex := len(s.blocks) - s.config.WorkingTailSize
+	intermediateBlocks := make([]TurnBlock, boundaryIndex)
+	copy(intermediateBlocks, s.blocks[:boundaryIndex])
+	narrativeSnapshot := s.episodicNarrative
+	distillModel := model
+	if s.config.DistillationModel != "" {
+		distillModel = s.config.DistillationModel
+	}
+	trackerRef := s.tracker
+
+	// Release lock during distillation network call [B3]
+	s.mu.Unlock()
+
+	// Check cancellation before network call
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Attempt Tier 2 Distillation with isolated timeout
+	summary, err := DistillIntermediateBlocks(
+		ctx,
+		client,
+		distillModel,
+		narrativeSnapshot,
+		intermediateBlocks,
+		trackerRef,
+	)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// If parent context canceled or timed out, propagate error without mutating state
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	if err == nil && summary != "" {
+		// Tier 2 Success: Commit new Episodic Anchor and evict intermediate blocks
+		s.episodicNarrative = summary
+	} else {
+		// Tier 3 Local Fallback: Deterministic eviction with notice
+		notice := fmt.Sprintf(
+			"[Notice: %d intermediate turns evicted via local fallback due to summarizer unavailability: %v]",
+			len(intermediateBlocks),
+			err,
 		)
-
-		if err == nil && summary != "" {
-			// Tier 2 Success: Commit new Episodic Anchor and evict intermediate blocks
-			s.episodicNarrative = summary
-			s.blocks = tailBlocks
-			s.estimator.ResetBaseline(s.recalculateTotalTokensLocked())
+		if s.episodicNarrative != "" {
+			s.episodicNarrative += "\n\n" + notice
 		} else {
-			// If parent context canceled or timed out, propagate error without mutating state
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-				return ctx.Err()
-			}
-
-			// Tier 3 Local Fallback: Deterministic eviction with notice in state table
-			notice := fmt.Sprintf(
-				"[Notice: %d intermediate turns evicted via local fallback due to summarizer unavailability: %v]",
-				len(intermediateBlocks),
-				err,
-			)
-			if s.episodicNarrative != "" {
-				s.episodicNarrative += "\n\n" + notice
-			} else {
-				s.episodicNarrative = notice
-			}
-			s.blocks = tailBlocks
-			s.estimator.ResetBaseline(s.recalculateTotalTokensLocked())
+			s.episodicNarrative = notice
 		}
 	}
 
-	// 4. Safe Halt Check: Verify irreducible context does not exceed hard ceiling
+	if len(s.blocks) >= len(intermediateBlocks) {
+		s.blocks = s.blocks[len(intermediateBlocks):]
+	}
+	s.estimator.ResetBaseline(s.recalculateTotalTokensLocked())
+
+	// 3. Safe Halt Check: Verify irreducible context does not exceed hard ceiling
+	if s.estimator.CurrentTokens() > s.config.MaxContextTokens {
+		return ErrContextExhausted
+	}
+
+	return nil
+}
+
+// DownscaleWatermark lowers the maximum context ceiling dynamically (e.g. upon HTTP 400 recovery).
+// If newCeiling <= 0, applies a 0.75x proportional downscale from the current ceiling.
+// Clamps ceiling at MinViableContextTokens (8192).
+// Returns ErrContextExhausted if irreducible state (P1 + P3 tail) exceeds the new ceiling.
+func (s *Session) DownscaleWatermark(newCeiling int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if newCeiling <= 0 {
+		newCeiling = int(float64(s.config.MaxContextTokens) * 0.75)
+	}
+	if newCeiling < MinViableContextTokens {
+		newCeiling = MinViableContextTokens
+	}
+
+	// Calculate irreducible state: System Anchor (P1) + Working Tail blocks
+	irreducible := EstimateContent(s.systemAnchor)
+	tailStart := len(s.blocks) - s.config.WorkingTailSize
+	if tailStart < 0 {
+		tailStart = 0
+	}
+	for i := tailStart; i < len(s.blocks); i++ {
+		irreducible += EstimateBlock(&s.blocks[i])
+	}
+
+	if newCeiling < irreducible {
+		return ErrContextExhausted
+	}
+
+	s.config.MaxContextTokens = newCeiling
+	return nil
+}
+
+// ForceCompaction immediately forces compaction of intermediate blocks outside the working tail,
+// executing Tier 2 distillation or Tier 3 fallback regardless of current token watermark levels.
+func (s *Session) ForceCompaction(ctx context.Context, client CompletionClient, model string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if len(s.blocks) <= s.config.WorkingTailSize {
+		// Nothing to compact outside the working tail
+		currentTokens := s.estimator.CurrentTokens()
+		s.mu.Unlock()
+		if currentTokens > s.config.MaxContextTokens {
+			return ErrContextExhausted
+		}
+		return nil
+	}
+
+	boundaryIndex := len(s.blocks) - s.config.WorkingTailSize
+	intermediateBlocks := make([]TurnBlock, boundaryIndex)
+	copy(intermediateBlocks, s.blocks[:boundaryIndex])
+	narrativeSnapshot := s.episodicNarrative
+	distillModel := model
+	if s.config.DistillationModel != "" {
+		distillModel = s.config.DistillationModel
+	}
+	trackerRef := s.tracker
+	s.mu.Unlock()
+
+	// Check cancellation before network call
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	summary, err := DistillIntermediateBlocks(
+		ctx,
+		client,
+		distillModel,
+		narrativeSnapshot,
+		intermediateBlocks,
+		trackerRef,
+	)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	if err == nil && summary != "" {
+		s.episodicNarrative = summary
+	} else {
+		notice := fmt.Sprintf(
+			"[Notice: %d intermediate turns evicted via local fallback: %v]",
+			len(intermediateBlocks),
+			err,
+		)
+		if s.episodicNarrative != "" {
+			s.episodicNarrative += "\n\n" + notice
+		} else {
+			s.episodicNarrative = notice
+		}
+	}
+
+	if len(s.blocks) >= len(intermediateBlocks) {
+		s.blocks = s.blocks[len(intermediateBlocks):]
+	}
+	s.estimator.ResetBaseline(s.recalculateTotalTokensLocked())
+
 	if s.estimator.CurrentTokens() > s.config.MaxContextTokens {
 		return ErrContextExhausted
 	}

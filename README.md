@@ -1,6 +1,6 @@
 # buddy-agent
 
-A lightweight, local-first, self-evolving autonomous agent harness built in pure Go.
+A robust, self-evolving autonomous agent harness built in pure Go, supporting both local and cloud environments.
 
 ## Overview
 
@@ -9,7 +9,7 @@ A lightweight, local-first, self-evolving autonomous agent harness built in pure
 ## Key Architecture
 
 - **Autonomous ReAct Engine**: Deterministic reasoning and tool execution loop with configurable step budgets and live output streaming.
-- **Context Compaction & Episodic Anchoring**: Pure Go Three-Partition memory management ($P_1$ immutable system anchor, $P_2$ bounded episodic anchor with deterministic state tables, $P_3$ unpruned working tail) with staged boundary micro-pruning, Tier 2 LLM distillation, deterministic Tier 3 fallback, and safe halt.
+- **Context Compaction & Episodic Anchoring**: Pure Go Three-Partition memory management ($P_1$ immutable system anchor, $P_2$ bounded episodic anchor with deterministic state tables, $P_3$ unpruned working tail), URL topology-aware context capacity ceilings (16k local loopbacks, 64k cloud endpoints), staged boundary micro-pruning, Tier 2 LLM distillation, deterministic Tier 3 fallback, and closed-loop reactive HTTP 400 self-healing recovery.
 - **Subprocess Safety & Process Groups**: Executes shell commands within isolated OS process groups (`Setpgid: true` on POSIX, Job Objects on Windows) with escalated dual-phase termination (`SIGTERM` -> 1.5s grace -> `SIGKILL` to negative PGID) and descendant liveness probing to eliminate orphan processes.
 - **Memory-Bounded Streaming Truncation**: Line-aware, streaming dual-buffer truncators (70% stdout / 30% stderr) with circular rolling tail ring buffers and delimiter-free UTF-8 rune fallback.
 - **Provider Agnostic**: OpenAI-compatible REST integration using official `openai-go` SDK supporting local inference runners and cloud providers.

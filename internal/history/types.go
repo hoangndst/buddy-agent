@@ -8,17 +8,21 @@ import (
 	"time"
 
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 )
 
 // ErrContextExhausted is returned when the minimum viable context state
 // (System Anchor + Episodic Anchor + active turn) exceeds MaxContextTokens.
 var ErrContextExhausted = errors.New("context exhausted: minimum viable working state exceeds configured limit")
 
+// MinViableContextTokens defines the hard minimum viable operational context window (8k).
+const MinViableContextTokens = 8192
+
 // CompletionClient defines the minimal LLM completion interface required
 // by the context engine for Tier 2 distillation. Decoupled from internal/agent
 // to guarantee zero cyclic package dependencies.
 type CompletionClient interface {
-	CreateChatCompletion(ctx context.Context, params openai.ChatCompletionNewParams) (*openai.ChatCompletion, error)
+	CreateChatCompletion(ctx context.Context, params openai.ChatCompletionNewParams, opts ...option.RequestOption) (*openai.ChatCompletion, error)
 }
 
 // BlockKind identifies the atomic structure of a conversational turn.

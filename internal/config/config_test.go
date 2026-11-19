@@ -22,6 +22,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.MaxOutputChars != 10000 {
 		t.Errorf("expected default MaxOutputChars 10000, got %d", cfg.MaxOutputChars)
 	}
+	if cfg.MaxContextTokens != DefaultLocalContextTokens {
+		t.Errorf("expected default MaxContextTokens %d, got %d", DefaultLocalContextTokens, cfg.MaxContextTokens)
+	}
+	if !cfg.IsLocal {
+		t.Errorf("expected default IsLocal true for localhost:11434, got false")
+	}
 	if cfg.Debug {
 		t.Errorf("expected default Debug false, got true")
 	}
@@ -56,30 +62,111 @@ func TestLoadCustom(t *testing.T) {
 	if cfg.MaxOutputChars != 5000 {
 		t.Errorf("expected custom MaxOutputChars 5000, got %d", cfg.MaxOutputChars)
 	}
+	if cfg.MaxContextTokens != DefaultRemoteContextTokens {
+		t.Errorf("expected custom remote MaxContextTokens %d, got %d", DefaultRemoteContextTokens, cfg.MaxContextTokens)
+	}
+	if cfg.IsLocal {
+		t.Errorf("expected IsLocal false for remote endpoint, got true")
+	}
 	if !cfg.Debug {
 		t.Errorf("expected Debug true, got false")
 	}
 }
 
-func TestInferModelContextLimit(t *testing.T) {
+func TestResolveContextCeiling(t *testing.T) {
 	tests := []struct {
-		model    string
+		name     string
+		envVal   string
+		baseURL  string
 		expected int
 	}{
-		{"qwen-128k", 64000},
-		{"llama-3-128k-instruct", 64000},
-		{"gpt-4o", 64000},
-		{"model-64k", 65536},
-		{"deepseek-32k", 32768},
-		{"mistral-16k", 16384},
-		{"llama-8k", 8192},
-		{"custom-unknown-model", 64000},
+		{
+			name:     "Localhost port 11434 default",
+			envVal:   "",
+			baseURL:  "http://localhost:11434/v1",
+			expected: DefaultLocalContextTokens,
+		},
+		{
+			name:     "IPv4 loopback default",
+			envVal:   "",
+			baseURL:  "http://127.0.0.1:8080/v1",
+			expected: DefaultLocalContextTokens,
+		},
+		{
+			name:     "IPv6 loopback default",
+			envVal:   "",
+			baseURL:  "http://[::1]:8080/v1",
+			expected: DefaultLocalContextTokens,
+		},
+		{
+			name:     "Remote host on port 11434",
+			envVal:   "",
+			baseURL:  "http://remote-server:11434/v1",
+			expected: DefaultLocalContextTokens,
+		},
+		{
+			name:     "Remote cloud endpoint default",
+			envVal:   "",
+			baseURL:  "https://api.openai.com/v1",
+			expected: DefaultRemoteContextTokens,
+		},
+		{
+			name:     "Explicit env override takes precedence over local",
+			envVal:   "32768",
+			baseURL:  "http://localhost:11434/v1",
+			expected: 32768,
+		},
+		{
+			name:     "Explicit env override takes precedence over cloud",
+			envVal:   "128000",
+			baseURL:  "https://api.openai.com/v1",
+			expected: 128000,
+		},
+		{
+			name:     "Invalid env override falls back to topology",
+			envVal:   "invalid",
+			baseURL:  "http://localhost:11434/v1",
+			expected: DefaultLocalContextTokens,
+		},
+		{
+			name:     "Negative env override falls back to topology",
+			envVal:   "-10",
+			baseURL:  "https://api.openai.com/v1",
+			expected: DefaultRemoteContextTokens,
+		},
 	}
 
 	for _, tc := range tests {
-		actual := inferModelContextLimit(tc.model)
+		t.Run(tc.name, func(t *testing.T) {
+			actual := resolveContextCeiling(tc.envVal, tc.baseURL)
+			if actual != tc.expected {
+				t.Errorf("resolveContextCeiling(%q, %q) = %d, expected %d", tc.envVal, tc.baseURL, actual, tc.expected)
+			}
+		})
+	}
+}
+
+func TestIsLocalEndpoint(t *testing.T) {
+	tests := []struct {
+		url      string
+		expected bool
+	}{
+		{"http://localhost:11434/v1", true},
+		{"http://127.0.0.1:11434/v1", true},
+		{"http://127.0.0.1:8000/v1", true},
+		{"http://[::1]:11434/v1", true},
+		{"http://[::1]:9999/v1", true},
+		{"http://my-host.internal:11434/v1", true},
+		{"https://api.openai.com/v1", false},
+		{"https://api.anthropic.com/v1", false},
+		{"http://192.168.1.100:8000/v1", false},
+		{"", false},
+	}
+
+	for _, tc := range tests {
+		actual := IsLocalEndpoint(tc.url)
 		if actual != tc.expected {
-			t.Errorf("inferModelContextLimit(%q) = %d, expected %d", tc.model, actual, tc.expected)
+			t.Errorf("IsLocalEndpoint(%q) = %v, expected %v", tc.url, actual, tc.expected)
 		}
 	}
 }

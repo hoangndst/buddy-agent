@@ -57,8 +57,8 @@ Milestone 3 equips `buddy-agent` with a zero-CGO, memory-bounded **Context Compa
 
 ### 1.5 Open Questions & Resolutions
 
-* **Q1: How should context limits adapt across models with widely differing context windows (e.g. 8k vs 32k vs 128k)?**
-  * *Resolution*: Provide model-aware capacity inference in `internal/config/config.go`. If `MaxContextTokens` is unset (0), infer limits from model prefix (e.g. 8k for local small models, 32k for intermediate models, 128k for standard frontier models), with a default fallback of 64,000 tokens.
+* **Q1: How should context limits adapt across models with widely differing context windows and local/cloud runtime constraints?**
+  * *Resolution*: Determine baseline context capacity via endpoint URL topology sensing in `internal/config/config.go` (`isLocalEndpoint(baseURL)`). Local loopback endpoints (`localhost`, `127.0.0.1`, `11434`) default to a safe 16,384 tokens to prevent local GPU VRAM exhaustion, while remote cloud endpoints default to 64,000 tokens. Explicit `BUDDY_MAX_CONTEXT_TOKENS` environment overrides take absolute precedence, and reactive HTTP 400 recovery dynamically ratchets ceilings down if the provider enforces a smaller limit.
 * **Q2: How do we prevent untrusted content in tool outputs from injecting instructions into Tier 2 distillation?**
   * *Resolution*: Enclose conversation history passed to the summarizer in strict XML boundaries (`<conversation_history_to_summarize>`) with a system directive instructing the model that the enclosed text is passive execution data to be summarized, not commands to be executed.
 * **Q3: How do we prevent parallel tool calling from blowing past the headroom buffer?**
@@ -197,14 +197,14 @@ type TurnBlock struct {
 	Timestamp time.Time
 
 	// User block payload
-	UserMessage *openai.ChatCompletionUserMessageParam
+	UserPrompt string
 
 	// Assistant simple payload
 	AssistantSimple *openai.ChatCompletionMessage
 
 	// Assistant tool call payload
 	AssistantToolCall *openai.ChatCompletionMessage
-	ToolResults       []openai.ChatCompletionToolMessageParam
+	ToolResults       []ToolResult
 
 	// Cached token estimate for this block
 	EstimatedTokens int
@@ -215,7 +215,7 @@ type TurnBlock struct {
 func (b *TurnBlock) CompileMessages() []openai.ChatCompletionMessageParamUnion {
 	switch b.Kind {
 	case BlockKindUser:
-		return []openai.ChatCompletionMessageParamUnion{*b.UserMessage}
+		return []openai.ChatCompletionMessageParamUnion{openai.UserMessage(b.UserPrompt)}
 	case BlockKindAssistantSimple:
 		return []openai.ChatCompletionMessageParamUnion{b.AssistantSimple.ToParam()}
 	case BlockKindAssistantToolCall:
@@ -223,7 +223,7 @@ func (b *TurnBlock) CompileMessages() []openai.ChatCompletionMessageParamUnion {
 		msgs = append(msgs, b.AssistantToolCall.ToParam())
 
 		// Map existing results by tool_call_id
-		resultMap := make(map[string]openai.ChatCompletionToolMessageParam, len(b.ToolResults))
+		resultMap := make(map[string]ToolResult, len(b.ToolResults))
 		for _, tr := range b.ToolResults {
 			resultMap[tr.ToolCallID] = tr
 		}
@@ -231,7 +231,7 @@ func (b *TurnBlock) CompileMessages() []openai.ChatCompletionMessageParamUnion {
 		// Ensure every tool call has a response; synthesize fallback for missing IDs
 		for _, tc := range b.AssistantToolCall.ToolCalls {
 			if res, ok := resultMap[tc.ID]; ok {
-				msgs = append(msgs, res)
+				msgs = append(msgs, openai.ToolMessage(res.Content, res.ToolCallID))
 			} else {
 				msgs = append(msgs, openai.ToolMessage(
 					"[Execution aborted before tool completed: timeout, signal, or cancellation]",
@@ -268,7 +268,7 @@ To comply with API providers that reject consecutive assistant turns or require 
   ### Distilled Progress Summary
   <1-2 dense paragraphs from Tier 2 distillation>
   ```
-- **Alternating Turn Invariant in $P_3$**: If all intermediate user turns were evicted and $P_3$'s first active block is an Assistant turn, `Session.CompileMessages()` injects a synthetic bridge turn (`openai.UserMessage("Continue executing the task based on the episodic progress state above.")`) to guarantee strictly valid alternating conversational structure.
+- **Alternating Turn Invariant**: When $P_2$ is present as an `openai.UserMessage`, it immediately precedes $P_3$ and satisfies the requirement of a user turn prior to an assistant turn. A synthetic bridge turn (`openai.UserMessage("Continue executing the task based on the episodic progress state above.")`) is injected by `Session.CompileMessages()` **only** if $P_2$ is empty/omitted AND $P_3$'s first active block is an Assistant turn. This eliminates redundant consecutive user messages while strictly guaranteeing valid conversational alternation across all frontier model providers.
 
 `StateTracker` maintains this deterministic state and exposes telemetry hooks:
 
@@ -309,6 +309,7 @@ sequenceDiagram
     participant Fallback as Tier 3 Local Fallback
 
     Engine->>Session: EnsureWatermarks(ctx, client, model)
+    Session->>Session: Acquire s.mu.RLock()
     Session->>Session: Check currentEstimate >= SoftWatermark (70%)
     alt Soft Watermark Exceeded
         Session->>Pruner: PruneTransitioningBlocks(stagedBlocks, minBytes: 256)
@@ -317,26 +318,37 @@ sequenceDiagram
     end
     Session->>Session: Check currentEstimate >= HardWatermark (85%)
     alt Hard Watermark Exceeded
+        Session->>Session: Snapshot intermediate blocks & Release s.mu.RUnlock()
         opt Parent context canceled?
             Session-->>Engine: Return ctx.Err() immediately (Abort without fallback)
         end
-        Session->>Distiller: DistillIntermediateBlocks(distillCtx, client, model, blocks)
+        Session->>Distiller: DistillIntermediateBlocks(distillCtx, client, model, snapshot) (Network Call, Lock Free)
+        Session->>Session: Re-acquire s.mu.Lock()
         alt Distillation Succeeded
             Distiller-->>Session: Episodic Summary (MaxTokens: 1,500)
             Session->>Session: Commit Transaction (Swap Partition 2, Evict Intermediate Blocks)
         else Distillation Timed Out / Failed (parent ctx active)
-            Session->>Fallback: ExecuteLocalEviction(intermediateBlocks)
+            Session->>Fallback: ExecuteLocalEviction(snapshot)
             Fallback-->>Session: Evicted Blocks + System Notice
         end
         Session->>Session: Check if Still Exceeds MaxContextTokens
         alt Context Non-Reducible
             Session-->>Engine: Safe Halt (ErrContextExhausted)
         end
+        Session->>Session: Release s.mu.Unlock()
+    else Hard Watermark Not Exceeded
+        Session->>Session: Release s.mu.RUnlock()
     end
 ```
 
+#### Concurrency & Lock Discipline
+`EnsureWatermarks` strictly releases the session mutex before initiating Tier 2 distillation:
+1. Under `s.mu.RLock()`, the session assesses watermark thresholds and creates a deep snapshot of intermediate candidate blocks.
+2. The read lock is released before invoking `DistillIntermediateBlocks` (network call with an isolated 45s timeout).
+3. Upon completion (or failure) of distillation, `s.mu.Lock()` is acquired to commit the episodic summary and evict intermediate blocks atomically. This prevents long-running network I/O from blocking concurrent read access or telemetry operations.
+
 #### Staged Boundary Micro-Pruning (Prefix Cache Invariant)
-To protect provider KV prompt caching, tool output micro-pruning is **not** performed in-place across ancient history. Instead, pruning occurs monotonically at the boundary when turn blocks transition out of $P_3$ (Working Tail) into intermediate storage. Once pruned, intermediate blocks remain byte-for-byte immutable, preserving prefix cache hashes across subsequent turns.
+To protect provider KV prompt caching, tool output micro-pruning is applied **eagerly at the staged boundary** as turn blocks leave $P_3$ (Working Tail) into intermediate storage. Specifically, tool outputs $> 256$ bytes are truncated with a concise stub preserving exit status and diagnostics. Because this pruning occurs strictly when transitioning out of $P_3$ and never in-place across ancient history, intermediate blocks remain byte-for-byte immutable throughout the remainder of the session, preserving prefix cache hashes across subsequent turns.
 
 #### Tier 2 Distillation Prompt Template
 Distillation requests use `MaxTokens: 1500`, `Temperature: 0.2`, `//go:embed prompts/distill_system.md`, and strict non-execution XML boundaries:
@@ -409,20 +421,59 @@ for step := 1; step <= e.maxSteps; step++ {
     default:
     }
 
-    params := openai.ChatCompletionNewParams{
-        Model:    e.model,
-        Messages: session.CompileMessages(),
-        Tools:    e.registry.OpenAITools(),
+    const maxTurnRetries = 2
+    var choice openai.ChatCompletionChoice
+    var completionErr error
+
+    // LLM Completion with Bounded Reactive Recovery
+    for retry := 0; retry <= maxTurnRetries; retry++ {
+        params := openai.ChatCompletionNewParams{
+            Model:    e.model,
+            Messages: session.CompileMessages(),
+            Tools:    e.registry.OpenAITools(),
+        }
+
+        // Pass Ollama num_ctx in ExtraBody for local endpoints
+        if e.isLocal {
+            params.ExtraBody = map[string]interface{}{
+                "options": map[string]interface{}{
+                    "num_ctx": session.MaxContextTokens(),
+                },
+            }
+        }
+
+        resp, err := e.client.CreateChatCompletion(ctx, params)
+        if err == nil {
+            if resp.Usage.PromptTokens > 0 {
+                session.CalibrateUsage(resp.Usage.PromptTokens)
+            }
+            choice = resp.Choices[0]
+            completionErr = nil
+            break
+        }
+
+        completionErr = err
+        targetTokens, matched := ParseContextLengthError(err)
+        if !matched || retry == maxTurnRetries {
+            return "", err
+        }
+
+        e.eventHandler(Event{
+            Type: EventContextRetrying,
+            Step: step,
+            Data: fmt.Sprintf("Context limit exceeded; ratcheting down and forcing compaction (retry %d/%d)", retry+1, maxTurnRetries),
+        })
+
+        if err := session.DownscaleWatermark(targetTokens); err != nil {
+            return "", err
+        }
+        if err := session.ForceCompaction(ctx, e.client, e.model); err != nil {
+            return "", err
+        }
     }
-
-    resp, err := e.client.CreateChatCompletion(ctx, params)
-    if err != nil { return "", err }
-
-    if resp.Usage.PromptTokens > 0 {
-        session.CalibrateUsage(resp.Usage.PromptTokens)
+    if completionErr != nil {
+        return "", completionErr
     }
-
-    choice := resp.Choices[0]
 
     if len(choice.Message.ToolCalls) == 0 {
         session.CommitSimpleAssistant(choice.Message)
@@ -431,7 +482,7 @@ for step := 1; step <= e.maxSteps; step++ {
     }
 
     // Execute tools and accumulate atomically
-    var toolResults []openai.ChatCompletionToolMessageParam
+    var toolResults []history.ToolResult
     var cumulativeBytes int
     for _, tc := range choice.Message.ToolCalls {
         // Telemetry hook: track file accesses
@@ -458,9 +509,17 @@ for step := 1; step <= e.maxSteps; step++ {
 
         cumulativeBytes += len(result)
         if cumulativeBytes > session.MaxTurnOutputBytes() {
-            result = "[Output truncated: cumulative turn output limit reached]"
+            exitSuffix := ""
+            if idx := strings.LastIndex(result, "exit code:"); idx != -1 {
+                exitSuffix = " | " + strings.TrimSpace(result[idx:])
+            }
+            result = "[Output truncated: cumulative turn output limit reached]" + exitSuffix
         }
-        toolResults = append(toolResults, openai.ToolMessage(result, tc.ID))
+        toolResults = append(toolResults, history.ToolResult{
+            ToolCallID: tc.ID,
+            Name:       tc.Function.Name,
+            Content:    result,
+        })
     }
 
     // Atomic turn block commit
@@ -480,7 +539,69 @@ for step := 1; step <= e.maxSteps; step++ {
 }
 ```
 
-### 2.8 Security & Failure Modes Analysis
+### 2.8 Topology-Aware Baseline Ceilings & Local Context Injection
+
+To eliminate fragile substring model heuristics and support both cloud and local runtimes cleanly:
+
+1. **Topology Detection via `net/url`**:
+   `internal/config` inspects `OPENAI_BASE_URL`:
+   * **Local Loopback (`localhost`, `127.0.0.1`, `::1`, or port `11434`)**: Defaults to **16,384 tokens**. This protects local consumer GPU VRAM from KV cache exhaustion and matches local runtime memory footprints.
+   * **Remote Cloud Endpoints**: Defaults to **64,000 tokens**, optimizing KV prompt cache hit rates and bounded generation latency.
+   * **Precedence**: `BUDDY_MAX_CONTEXT_TOKENS` environment variable always takes absolute precedence when explicitly defined.
+2. **Ollama `num_ctx` Request Injection**:
+   When communicating with local endpoints (`isLocalEndpoint(baseURL)` is true), the engine passes `"options": {"num_ctx": maxContextTokens}` via the `ExtraBody` map in `openai.ChatCompletionNewParams` to guarantee the local server allocates matching context memory, preventing silent prompt truncation:
+   ```go
+   params.ExtraBody = map[string]interface{}{
+       "options": map[string]interface{}{
+           "num_ctx": session.MaxContextTokens(),
+       },
+   }
+   ```
+
+### 2.9 Closed-Loop Reactive Recovery & Watermark Ratchet
+
+When actual prompt token density diverges from pure-Go rune estimation (e.g. minified JSON, dense ASTs, foreign language corpora) and triggers an HTTP 400 `context_length_exceeded` error from the provider:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Engine as Engine (internal/agent)
+    participant Client as LLM Backend (Ollama / Cloud)
+    participant Session as Session (internal/history)
+    participant EventH as EventHandler
+
+    Engine->>Client: CreateChatCompletion(Messages, Tools, [num_ctx])
+    alt Normal Response (200 OK)
+        Client-->>Engine: 200 OK (Choices)
+        Engine->>Session: CommitTurn & CalibrateUsage
+    else Context Overflow (HTTP 400 context_length_exceeded)
+        Client-->>Engine: 400 Bad Request (context_length_exceeded)
+        Engine->>Engine: ParseContextLengthError: Extract limit or 0.75x fallback
+        Engine->>EventH: Emit EventContextRetrying(Step, OldCeiling, NewCeiling)
+        Engine->>Session: DownscaleWatermark(NewCeiling)
+        Engine->>Session: ForceCompaction(ctx, client, model)
+        Session-->>Engine: Compaction Done (Intermediate evicted)
+        Engine->>Session: CompileMessages()
+        Session-->>Engine: Retried Compacted Messages
+        Engine->>Client: Retry CreateChatCompletion(CompactedMessages)
+        Client-->>Engine: 200 OK (Successful Completion)
+        Engine->>Session: CommitTurn & Resume Loop
+    end
+```
+
+1. **Error Inspection (`internal/agent/llmerr.go`)**:
+   `ParseContextLengthError(err)` inspects HTTP 400 responses and OpenAI SDK errors. Regex extracts numeric limits (`max context length is (\d+)`). If no explicit number is present, it returns a flag to apply a 0.75x proportional downscale.
+2. **Session Watermark Ratchet (`internal/history/session.go`)**:
+   `session.DownscaleWatermark(newLimit)` updates `s.config.MaxContextTokens` and recalibrates soft/hard watermarks:
+   - If `newLimit <= 0`, downscales proportionally: `newLimit = int(float64(s.config.MaxContextTokens) * 0.75)`.
+   - Clamps at `MinViableContextTokens = 8192`.
+   - **Irreducible State Clamping**: Computes irreducible state size: $\text{irreducible} = \text{Estimate}(P_1) + \text{Estimate}(P_{3\text{tail}})$. If $\text{newLimit} < \text{irreducible}$, downscaling cannot fit the minimal necessary context, and `DownscaleWatermark` immediately returns `ErrContextExhausted`.
+3. **Forced Compaction (`internal/history/session.go`)**:
+   `session.ForceCompaction(ctx, client, model)` immediately runs Tier 2 distillation or Tier 3 local eviction on intermediate turns outside `WorkingTailSize`.
+4. **Bounded Retry Cycle**:
+   The engine re-compiles messages and retries the LLM call. Retries are strictly bounded to `maxTurnRetries = 2`. If 2 retries fail to fit context within the backend ceiling, the engine cleanly halts with `ErrContextExhausted` and emits `EventContextExhausted`.
+
+### 2.10 Security & Failure Modes Analysis
 
 | Failure Mode | Impact | Mitigation Mechanism |
 | :--- | :--- | :--- |
@@ -494,12 +615,13 @@ for step := 1; step <= e.maxSteps; step++ {
 
 ## 3. Alternatives Considered
 
-### 3.1 Reactive Error-Driven Compaction
-* **Description**: Wait for the LLM API to reject the request with `context_length_exceeded` or HTTP `400 Bad Request`, catch the error, and only then compact history and retry the API call.
+### 3.1 Reactive-Only Compaction (Without Proactive Watermarks)
+* **Description**: Rely exclusively on LLM API 400 errors (`context_length_exceeded`) to trigger compaction rather than proactive watermarks.
 * **Rejected by author**:
   - **Latency Spikes**: Doubles round-trip latency on watermark steps by paying the cost of a failed generation call before initiating compaction.
   - **Provider Inconsistency**: Error strings and JSON error envelopes vary significantly across model providers (OpenAI, Azure OpenAI, Ollama, vLLM, LM Studio). Parsing error codes across different gateways is brittle and error-prone.
   - **Payload Discard Risk**: In streaming mode, some proxies close the connection abruptly rather than returning a structured error object.
+  - *Resolution*: Adopted proactive soft/hard watermarks ($70\% / 85\%$) as the primary compaction mechanism, keeping reactive error recovery as a safety net / ground-truth ratchet.
 
 ### 3.2 Unstructured Narrative-Only Compaction
 * **Description**: Prompt an LLM to generate a single unstructured prose summary ("We inspected the codebase and ran some tests...") and replace all historical turns with that paragraph.
@@ -527,6 +649,18 @@ for step := 1; step <= e.maxSteps; step++ {
   - **Cache Prefix Invalidation**: Frequently mutating past messages breaks KV prompt cache prefixes, severely increasing inference latency and cost.
   - *Resolution*: Micro-pruning is applied strictly at the staged boundary as blocks transition out of $P_3$, preserving prefix immutability.
 
+### 3.6 Hardcoded Model Catalog Table
+* **Description**: Maintain an internal compiled Go dictionary mapping model IDs to physical context limits.
+* **Rejected by author**:
+  - **Rapid Catalog Rot**: New models, quantization variants, and fine-tunes are released continuously. A static catalog in a compiled binary becomes obsolete rapidly and fails on unlisted local or private enterprise models.
+  - *Resolution*: Replaced with topology-aware default ceilings (16k local, 64k cloud) with explicit user override and closed-loop reactive 400 error self-healing.
+
+### 3.7 Substring Model Matching Inversion
+* **Description**: Keep substring heuristics in `inferModelContextLimit` but order checks from largest to smallest.
+* **Rejected by author**:
+  - **Fragility**: Parameter count tags (e.g., `8b` in `gemini-1.5-flash-8b`) collide with token tags, and arbitrary model names fail to match any token heuristic.
+  - *Resolution*: Completely stripped model name substring parsing from configuration loading.
+
 ---
 
 ## 4. Detailed Implementation Plan
@@ -536,7 +670,8 @@ for step := 1; step <= e.maxSteps; step++ {
 1. **Step 1: Core History Types & Local Client Interface (`internal/history/types.go`)**:
    - Define `CompletionClient` interface locally to eliminate circular imports with `internal/agent`.
    - Define `BlockKind` enum (`BlockKindUser`, `BlockKindAssistantSimple`, `BlockKindAssistantToolCall`).
-   - Define `TurnBlock`, `StateTracker`, `FileRecord`, `SessionConfig`, and `Option` types.
+   - Define `TurnBlock`, `ToolResult`, `StateTracker`, `FileRecord`, `SessionConfig`, and `Option` types.
+   - Define context floor constant: `const MinViableContextTokens = 8192`.
 
 2. **Step 2: Atomic Turn Block Construction & Validation (`internal/history/block.go`)**:
    - Implement `NewUserBlock`, `NewAssistantSimpleBlock`, and `NewAssistantToolCallBlock`.
@@ -560,17 +695,28 @@ for step := 1; step <= e.maxSteps; step++ {
 7. **Step 7: Primary Session Coordinator (`internal/history/session.go`)**:
    - Implement `Session` managing $P_1$, $P_2$, and $P_3$.
    - Implement `CommitToolTurn` for atomic turn accumulation.
-   - Implement `EnsureWatermarks` coordinating the multi-tier hierarchy and `ErrContextExhausted` safe halt.
+   - Implement `EnsureWatermarks` coordinating the multi-tier hierarchy with non-blocking lock release during distillation, and `ErrContextExhausted` safe halt.
    - Implement `ReloadSystemAnchor(prompt)` for dynamic memory refresh.
+   - Implement watermark downscaling and forced compaction:
+     ```go
+     func (s *Session) DownscaleWatermark(newCeiling int) error
+     func (s *Session) ForceCompaction(ctx context.Context, client CompletionClient, model string) error
+     ```
 
-8. **Step 8: Configuration & Engine Integration (`internal/config/config.go`, `internal/agent/engine.go`)**:
-   - Add `MaxContextTokens` and `WorkingTailSize` to `config.Config` with model-aware inference.
-   - Wire `StateTracker` telemetry hooks and cumulative output byte cap in `Engine.Run`.
-   - Add compaction events (`EventCompactionStart`, `EventCompactionDone`, `EventMicroPruning`, `EventContextExhausted`) to `internal/agent/types.go`.
+8. **Step 8: Configuration, Reactive Recovery & Engine Integration (`internal/config/config.go`, `internal/agent/llmerr.go`, `internal/agent/engine.go`)**:
+   - Strip model substring inference from `internal/config/config.go` and implement `isLocalEndpoint(baseURL)` with topology defaults (16k local, 64k cloud).
+   - Implement context overflow error detection in `internal/agent/llmerr.go`:
+     ```go
+     func ParseContextLengthError(err error) (targetTokens int, matched bool)
+     ```
+   - Wire `StateTracker` telemetry hooks, cumulative output byte caps, and bounded reactive turn retries (`maxTurnRetries = 2`) in `Engine.Run`.
+   - Pass `num_ctx: maxContextTokens` in request options when connected to local endpoints.
+   - Add compaction events (`EventCompactionStart`, `EventCompactionDone`, `EventMicroPruning`, `EventContextRetrying`, `EventContextExhausted`) to `internal/agent/types.go`.
 
-9. **Step 9: Verification & Synthetic Benchmarks (`internal/history/session_test.go`, `benchmark_test.go`)**:
+9. **Step 9: Verification & Synthetic Benchmarks (`internal/history/session_test.go`, `internal/agent/engine_test.go`, `benchmark_test.go`)**:
    - Run 100% race detection (`go test -v -race ./...`).
    - Run synthetic 50–100 step trajectory benchmarks asserting $\ge 40\%$ token reduction, $\ge 90\%$ cache prefix stability during non-compaction intervals, and zero orphaned tool IDs.
+   - Verify reactive 400 error recovery and safe halt boundaries with mock client tests in `engine_test.go`.
    - Verify multi-OS static compilation (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`).
 
 ---
@@ -585,12 +731,15 @@ for step := 1; step <= e.maxSteps; step++ {
 | `internal/history/estimator.go` | **Create** | Implements pure-Go zero-CGO token estimation with rune counting, `ToolCallOverhead = 16`, and ground-truth calibration. |
 | `internal/history/prune.go` | **Create** | Implements Tier 1 staged boundary micro-pruning preserving prefix cache hashes. |
 | `internal/history/distill.go` | **Create** | Implements Tier 2 LLM episodic distillation (`MaxTokens: 1500`, XML framing, isolated timeout) and Tier 3 local eviction. |
-| `internal/history/session.go` | **Create** | Implements primary `Session` coordinator managing the Three-Partition memory model, atomic commits, and safe halt. |
-| `internal/history/session_test.go` | **Create** | Unit tests for atomic turn block pairing, micro-pruning, fallback paths, cancellation handling, and safe halt. |
+| `internal/history/session.go` | **Create** | Implements primary `Session` coordinator managing the Three-Partition memory model, atomic commits, watermark downscaling, forced compaction, and safe halt. |
+| `internal/history/session_test.go` | **Create** | Unit tests for atomic turn block pairing, micro-pruning, fallback paths, cancellation handling, watermark downscaling, and safe halt. |
 | `internal/history/benchmark_test.go` | **Create** | Synthetic 50–100 step trajectory benchmarks for token savings, $\ge 90\%$ cache stability, and zero heap leaks. |
-| `internal/config/config.go` | **Modify** | Adds `MaxContextTokens` and `WorkingTailSize` fields with model-aware default capacity inference. |
-| `internal/agent/types.go` | **Modify** | Adds `EventCompactionStart`, `EventCompactionDone`, `EventMicroPruning`, and `EventContextExhausted` event types. |
-| `internal/agent/engine.go` | **Modify** | Replaces monotonic flat message slice with `history.Session`, wiring telemetry, cumulative caps, and watermarks. |
-| `internal/agent/engine_test.go` | **Modify** | Updates mock clients and adds test cases for engine compaction lifecycle, cancellation, and context exhaustion events. |
-| `cmd/buddy/main.go` | **Modify** | Passes `cfg.MaxContextTokens` and `cfg.WorkingTailSize` to engine initialization. |
+| `internal/config/config.go` | **Modify** | Implements `isLocalEndpoint` URL topology sensing, setting 16k default for local loopbacks and 64k for remote endpoints with explicit env override. |
+| `internal/config/config_test.go` | **Modify** | Table-driven tests verifying topology resolution for local and cloud URLs and explicit overrides. |
+| `internal/agent/llmerr.go` | **Create** | Implements `ParseContextLengthError(err)` detecting HTTP 400 context overflow and extracting target limits. |
+| `internal/agent/llmerr_test.go` | **Create** | Unit tests covering structured OpenAI API errors, raw error text, and regex extraction. |
+| `internal/agent/types.go` | **Modify** | Adds `EventCompactionStart`, `EventCompactionDone`, `EventMicroPruning`, `EventContextRetrying`, and `EventContextExhausted` event types. |
+| `internal/agent/engine.go` | **Modify** | Replaces monotonic flat message slice with `history.Session`, wiring telemetry, cumulative caps, bounded reactive 400 retries, and Ollama `num_ctx` injection. |
+| `internal/agent/engine_test.go` | **Modify** | Mock tests for engine compaction lifecycle, reactive 400 recovery, cancellation, and context exhaustion events. |
+| `cmd/buddy/main.go` | **Modify** | Passes `cfg.MaxContextTokens` and `cfg.WorkingTailSize` to engine and renders terminal output for compaction events. |
 | `README.md` | **Modify** | Documents Milestone 3 context compaction architecture, three-partition model, and configuration settings. |

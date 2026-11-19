@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 )
 
 // mockCompletionClient simulates LLM completion responses for testing Tier 2 distillation.
@@ -22,6 +23,7 @@ type mockCompletionClient struct {
 func (m *mockCompletionClient) CreateChatCompletion(
 	ctx context.Context,
 	_ openai.ChatCompletionNewParams,
+	_ ...option.RequestOption,
 ) (*openai.ChatCompletion, error) {
 	m.invoked = true
 	if ctx.Err() != nil {
@@ -466,5 +468,162 @@ func TestDistillSystemPrompt_EmbedContent(t *testing.T) {
 		if !strings.Contains(defaultDistillSystemPrompt, directive) {
 			t.Errorf("expected embedded distill prompt to contain %q", directive)
 		}
+	}
+}
+
+func TestSession_DownscaleWatermark(t *testing.T) {
+	session := NewSession(
+		"Short system prompt",
+		"Task prompt",
+		WithMaxContextTokens(32000),
+		WithWorkingTailSize(2),
+	)
+
+	// 1. Explicit valid downscale
+	if err := session.DownscaleWatermark(20000); err != nil {
+		t.Fatalf("unexpected error downscaling watermark: %v", err)
+	}
+	if session.MaxContextTokens() != 20000 {
+		t.Errorf("expected 20000 tokens, got %d", session.MaxContextTokens())
+	}
+
+	// 2. Proportional downscale (0 or negative triggers 0.75x of 20000 = 15000)
+	if err := session.DownscaleWatermark(0); err != nil {
+		t.Fatalf("unexpected error on proportional downscale: %v", err)
+	}
+	if session.MaxContextTokens() != 15000 {
+		t.Errorf("expected 15000 tokens (0.75 * 20000), got %d", session.MaxContextTokens())
+	}
+
+	// 3. Clamping at MinViableContextTokens (8192)
+	if err := session.DownscaleWatermark(4000); err != nil {
+		t.Fatalf("unexpected error on clamped downscale: %v", err)
+	}
+	if session.MaxContextTokens() != MinViableContextTokens {
+		t.Errorf("expected %d tokens, got %d", MinViableContextTokens, session.MaxContextTokens())
+	}
+
+	// 4. Irreducible state exceeding ceiling returns ErrContextExhausted
+	hugeSystemPrompt := strings.Repeat("huge system prompt invariant ", 500) // ~15000 runes ~= 4200 tokens
+	sessionHuge := NewSession(
+		hugeSystemPrompt,
+		"Task prompt",
+		WithMaxContextTokens(32000),
+		WithWorkingTailSize(2),
+	)
+	// Add huge assistant blocks in working tail
+	for i := 0; i < 2; i++ {
+		sessionHuge.CommitSimpleAssistant(openai.ChatCompletionMessage{
+			Role:    "assistant",
+			Content: strings.Repeat("working tail assistant context ", 500),
+		})
+	}
+
+	// Try downscaling to 8192 when irreducible state is ~12000+ tokens
+	err := sessionHuge.DownscaleWatermark(8192)
+	if !errors.Is(err, ErrContextExhausted) {
+		t.Fatalf("expected ErrContextExhausted when irreducible state exceeds ceiling, got: %v", err)
+	}
+}
+
+func TestSession_ForceCompaction(t *testing.T) {
+	session := NewSession(
+		"System prompt",
+		"Task prompt",
+		WithMaxContextTokens(64000),
+		WithWorkingTailSize(2),
+	)
+
+	// Add 5 turns (3 intermediate + 2 working tail)
+	for i := 1; i <= 5; i++ {
+		session.CommitSimpleAssistant(openai.ChatCompletionMessage{
+			Role:    "assistant",
+			Content: fmt.Sprintf("Step %d execution completed successfully.", i),
+		})
+	}
+
+	if session.BlockCount() != 6 { // 1 root user + 5 assistant
+		t.Fatalf("expected 6 blocks, got %d", session.BlockCount())
+	}
+
+	// Mock client returns distilled summary
+	mockClient := &mockCompletionClient{
+		response: &openai.ChatCompletion{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    "assistant",
+						Content: "### Goal & Core Objectives\nProgress achieved through step 3.",
+					},
+				},
+			},
+		},
+	}
+
+	// Force compaction should immediately distill intermediate blocks even below watermark
+	ctx := context.Background()
+	if err := session.ForceCompaction(ctx, mockClient, "qwen2.5-coder:7b"); err != nil {
+		t.Fatalf("unexpected error during force compaction: %v", err)
+	}
+
+	// Should have evicted 4 intermediate blocks (root user + 3 assistant) leaving 2 working tail blocks
+	if session.BlockCount() != 2 {
+		t.Errorf("expected 2 working tail blocks remaining, got %d", session.BlockCount())
+	}
+	if !strings.Contains(session.episodicNarrative, "Progress achieved through step 3") {
+		t.Errorf("expected episodic narrative to contain distilled summary, got: %s", session.episodicNarrative)
+	}
+}
+
+func TestSession_AlternatingBridgeInvariant(t *testing.T) {
+	session := NewSession(
+		"System prompt",
+		"Task prompt",
+		WithMaxContextTokens(64000),
+		WithWorkingTailSize(2),
+	)
+
+	// Case 1: Initial compile has System prompt, no P2 (no dynamic updates yet), and P3 starts with Root User turn.
+	// No synthetic bridge user turn should be injected.
+	msgs := session.CompileMessages()
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages (system + user), got %d", len(msgs))
+	}
+
+	// Case 2: P2 is present as UserMessage. P3 starts with an Assistant block.
+	// P2 satisfies the alternating turn requirement, so NO synthetic bridge turn should be injected.
+	session.episodicNarrative = "Episodic summary active"
+	session.blocks = []TurnBlock{
+		{
+			Kind: BlockKindAssistantSimple,
+			AssistantSimple: &openai.ChatCompletionMessage{
+				Role:    "assistant",
+				Content: "Working tail response",
+			},
+		},
+	}
+	msgs = session.CompileMessages()
+	// Should have: System (P1), User (P2), Assistant (P3) = 3 messages.
+	if len(msgs) != 3 {
+		t.Fatalf("expected exactly 3 messages when P2 is present, got %d", len(msgs))
+	}
+	if msgs[1].OfUser == nil {
+		t.Errorf("expected second message to be user (P2)")
+	}
+	if msgs[2].OfAssistant == nil {
+		t.Errorf("expected third message to be assistant (P3)")
+	}
+
+	// Case 3: P2 is completely omitted (no narrative and no dynamic updates), and P3 starts with an Assistant block.
+	// Synthetic bridge turn MUST be injected to prevent consecutive system -> assistant.
+	session.episodicNarrative = ""
+	session.tracker = NewStateTracker("", nil) // clean tracker without updates
+	msgs = session.CompileMessages()
+	// Should have: System (P1), Synthetic User Bridge, Assistant (P3) = 3 messages.
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages with synthetic bridge, got %d", len(msgs))
+	}
+	if msgs[1].OfUser == nil {
+		t.Errorf("expected synthetic bridge to be user message")
 	}
 }

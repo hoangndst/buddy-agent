@@ -2,12 +2,21 @@
 package config
 
 import (
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
+)
+
+const (
+	// DefaultRemoteContextTokens is the default context limit for cloud endpoints.
+	DefaultRemoteContextTokens = 64000
+	// DefaultLocalContextTokens is the default context limit for local/loopback endpoints to protect GPU VRAM.
+	DefaultLocalContextTokens = 16384
 )
 
 // Config holds runtime configuration for buddy-agent.
@@ -21,6 +30,7 @@ type Config struct {
 	WorkingTailSize  int
 	WorkspaceDir     string
 	Debug            bool
+	IsLocal          bool
 }
 
 // Load loads configuration from environment variables, optionally reading from .env if present.
@@ -44,11 +54,9 @@ func Load() (*Config, error) {
 	}
 
 	model := getEnv("BUDDY_MODEL", "qwen2.5-coder:7b")
+	baseURL := getEnv("OPENAI_BASE_URL", "http://localhost:11434/v1")
 
-	maxContextTokens, err := strconv.Atoi(getEnv("BUDDY_MAX_CONTEXT_TOKENS", ""))
-	if err != nil || maxContextTokens <= 0 {
-		maxContextTokens = inferModelContextLimit(model)
-	}
+	maxContextTokens := resolveContextCeiling(os.Getenv("BUDDY_MAX_CONTEXT_TOKENS"), baseURL)
 
 	workingTailSize, err := strconv.Atoi(getEnv("BUDDY_WORKING_TAIL_SIZE", "5"))
 	if err != nil || workingTailSize <= 0 {
@@ -56,9 +64,10 @@ func Load() (*Config, error) {
 	}
 
 	debug, _ := strconv.ParseBool(getEnv("BUDDY_DEBUG", "false"))
+	isLocal := IsLocalEndpoint(baseURL)
 
 	return &Config{
-		BaseURL:          getEnv("OPENAI_BASE_URL", "http://localhost:11434/v1"),
+		BaseURL:          baseURL,
 		APIKey:           getEnv("OPENAI_API_KEY", ""),
 		Model:            model,
 		MaxSteps:         maxSteps,
@@ -67,26 +76,53 @@ func Load() (*Config, error) {
 		WorkingTailSize:  workingTailSize,
 		WorkspaceDir:     absWorkspace,
 		Debug:            debug,
+		IsLocal:          isLocal,
 	}, nil
 }
 
-// inferModelContextLimit estimates context window capacity based on model name heuristics.
-func inferModelContextLimit(model string) int {
-	m := strings.ToLower(model)
-	switch {
-	case strings.Contains(m, "128k") || strings.Contains(m, "gpt-4o"):
-		return 64000 // Conservative 64k default ceiling within 128k window
-	case strings.Contains(m, "64k"):
-		return 65536
-	case strings.Contains(m, "32k"):
-		return 32768
-	case strings.Contains(m, "16k"):
-		return 16384
-	case strings.Contains(m, "8k"):
-		return 8192
-	default:
-		return 64000
+// resolveContextCeiling determines the baseline context window ceiling.
+// Explicit BUDDY_MAX_CONTEXT_TOKENS takes absolute precedence if defined and > 0.
+// Otherwise, local loopbacks/Ollama ports default to 16,384 tokens, and remote endpoints default to 64,000.
+func resolveContextCeiling(envVal, baseURL string) int {
+	if envVal != "" {
+		if tokens, err := strconv.Atoi(envVal); err == nil && tokens > 0 {
+			return tokens
+		}
 	}
+	if IsLocalEndpoint(baseURL) {
+		return DefaultLocalContextTokens
+	}
+	return DefaultRemoteContextTokens
+}
+
+// IsLocalEndpoint checks whether a base URL points to a local machine or Ollama daemon.
+func IsLocalEndpoint(rawURL string) bool {
+	if rawURL == "" {
+		return false
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		lower := strings.ToLower(rawURL)
+		return strings.Contains(lower, "localhost") || strings.Contains(lower, "127.0.0.1") || strings.Contains(lower, "::1") || strings.Contains(lower, "11434")
+	}
+
+	host := parsed.Hostname()
+	port := parsed.Port()
+
+	if port == "11434" {
+		return true
+	}
+
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+	if ip != nil && (ip.IsLoopback() || ip.IsUnspecified()) {
+		return true
+	}
+
+	return false
 }
 
 func getEnv(key, defaultVal string) string {
