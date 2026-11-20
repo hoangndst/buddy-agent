@@ -3,6 +3,8 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -39,11 +41,39 @@ func NewRegistry(maxOutputChars int) *Registry {
 	}
 }
 
-// Register adds a tool to the registry.
+// Register adds a tool to the registry. If a different tool with the same name
+// is already registered, the new tool is safely disambiguated to prevent
+// silent tool disappearance and nondeterministic overwrites.
 func (r *Registry) Register(t Tool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.tools[t.Name()] = t
+
+	name := t.Name()
+	if existing, exists := r.tools[name]; exists && existing != t {
+		counter := 2
+		disambiguated := name
+		for {
+			disambiguated = fmt.Sprintf("%s_%d", name, counter)
+			if len(disambiguated) > 64 {
+				h := sha256.Sum256([]byte(disambiguated))
+				prefix := name
+				if len(prefix) > 55 {
+					prefix = prefix[:55]
+				}
+				disambiguated = fmt.Sprintf("%s_%s", prefix, hex.EncodeToString(h[:4]))
+			}
+			if _, taken := r.tools[disambiguated]; !taken {
+				break
+			}
+			counter++
+		}
+		if renamable, ok := t.(interface{ SetName(string) }); ok {
+			renamable.SetName(disambiguated)
+		}
+		r.tools[disambiguated] = t
+		return
+	}
+	r.tools[name] = t
 }
 
 // Get retrieves a tool by name.

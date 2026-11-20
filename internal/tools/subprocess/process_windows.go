@@ -30,18 +30,18 @@ type windowsSupervisor struct {
 	closeOnce sync.Once
 }
 
-func newPlatformSupervisor() platformSupervisor {
+func newPlatformSupervisor() Supervisor {
 	return &windowsSupervisor{}
 }
 
-func (s *windowsSupervisor) prepareCmd(cmd *exec.Cmd) error {
+func (s *windowsSupervisor) PrepareCmd(cmd *exec.Cmd) error {
 	cmd.SysProcAttr = &windows.SysProcAttr{
 		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP,
 	}
 	return nil
 }
 
-func (s *windowsSupervisor) attachProcess(cmd *exec.Cmd) error {
+func (s *windowsSupervisor) AttachProcess(cmd *exec.Cmd) error {
 	if cmd.Process == nil || cmd.Process.Pid <= 0 {
 		return fmt.Errorf("invalid process pid: %d", cmd.Process.Pid)
 	}
@@ -83,14 +83,14 @@ func (s *windowsSupervisor) attachProcess(cmd *exec.Cmd) error {
 	return nil
 }
 
-func (s *windowsSupervisor) terminate(graceful bool) error {
+func (s *windowsSupervisor) Terminate(graceful bool) error {
 	if s.jobHandle != 0 {
 		_ = windows.TerminateJobObject(s.jobHandle, 1)
 	}
 	return nil
 }
 
-func (s *windowsSupervisor) isAlive() bool {
+func (s *windowsSupervisor) IsAlive() bool {
 	if s.jobHandle == 0 {
 		return false
 	}
@@ -108,7 +108,7 @@ func (s *windowsSupervisor) isAlive() bool {
 	return basicInfo.ActiveProcesses > 0
 }
 
-func (s *windowsSupervisor) close() error {
+func (s *windowsSupervisor) Close() error {
 	s.closeOnce.Do(func() {
 		if s.jobHandle != 0 {
 			_ = windows.CloseHandle(s.jobHandle)

@@ -13,16 +13,16 @@ type posixSupervisor struct {
 	pgid int
 }
 
-func newPlatformSupervisor() platformSupervisor {
+func newPlatformSupervisor() Supervisor {
 	return &posixSupervisor{}
 }
 
-func (s *posixSupervisor) prepareCmd(cmd *exec.Cmd) error {
+func (s *posixSupervisor) PrepareCmd(cmd *exec.Cmd) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return nil
 }
 
-func (s *posixSupervisor) attachProcess(cmd *exec.Cmd) error {
+func (s *posixSupervisor) AttachProcess(cmd *exec.Cmd) error {
 	if cmd.Process == nil || cmd.Process.Pid <= 1 {
 		return fmt.Errorf("invalid process pid: %d", cmd.Process.Pid)
 	}
@@ -30,7 +30,7 @@ func (s *posixSupervisor) attachProcess(cmd *exec.Cmd) error {
 	return nil
 }
 
-func (s *posixSupervisor) terminate(graceful bool) error {
+func (s *posixSupervisor) Terminate(graceful bool) error {
 	if s.pgid <= 1 {
 		return nil
 	}
@@ -45,7 +45,7 @@ func (s *posixSupervisor) terminate(graceful bool) error {
 	return err
 }
 
-func (s *posixSupervisor) isAlive() bool {
+func (s *posixSupervisor) IsAlive() bool {
 	if s.pgid <= 1 {
 		return false
 	}
@@ -53,6 +53,6 @@ func (s *posixSupervisor) isAlive() bool {
 	return err == nil
 }
 
-func (s *posixSupervisor) close() error {
+func (s *posixSupervisor) Close() error {
 	return nil
 }
