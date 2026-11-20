@@ -2,12 +2,16 @@
 package memory
 
 import (
+	_ "embed"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+//go:embed prompts/default_soul.md
+var defaultSoulPrompt string
 
 // Manager coordinates file-backed identity, durable memory, and dynamic skills.
 type Manager struct {
@@ -28,7 +32,8 @@ func (m *Manager) LoadSystemPrompt() (string, error) {
 	soulContent, err := os.ReadFile(soulPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			sb.WriteString("You are Buddy, an autonomous software engineering agent.\n")
+			sb.WriteString(strings.TrimSpace(defaultSoulPrompt))
+			sb.WriteString("\n\n")
 		} else {
 			return "", fmt.Errorf("failed to read SOUL.md: %w", err)
 		}

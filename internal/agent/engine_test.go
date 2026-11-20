@@ -2,13 +2,17 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/hoangndst/buddy-agent/internal/history"
 	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 )
 
 type mockChatClient struct {
@@ -17,7 +21,7 @@ type mockChatClient struct {
 	calls     int
 }
 
-func (m *mockChatClient) CreateChatCompletion(_ context.Context, _ openai.ChatCompletionNewParams) (*openai.ChatCompletion, error) {
+func (m *mockChatClient) CreateChatCompletion(_ context.Context, _ openai.ChatCompletionNewParams, _ ...option.RequestOption) (*openai.ChatCompletion, error) {
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -177,5 +181,358 @@ func TestEngineErrorAndBudgetExhaustion(t *testing.T) {
 	_, err = loopEngine.Run(context.Background(), "infinite loop task")
 	if err == nil {
 		t.Fatal("expected budget exhaustion error")
+	}
+}
+
+
+func TestEngineContextCompactionAndExhaustion(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	reg.Register(tools.NewWriteFileTool(tempDir))
+	memMgr := memory.NewManager(tempDir)
+
+	// 1. Test safe halt on context exhaustion
+	exhaustClient := &mockChatClient{
+		responses: []*openai.ChatCompletion{
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Running heavy task",
+							ToolCalls: []openai.ChatCompletionMessageToolCall{
+								{
+									ID: "call_exhaust",
+									Function: openai.ChatCompletionMessageToolCallFunction{
+										Name:      "write_file",
+										Arguments: `{"path": "test.txt", "content": "hello"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+				Usage: openai.CompletionUsage{PromptTokens: 20},
+			},
+		},
+	}
+
+	var events []Event
+	exhaustEngine := NewEngine(
+		exhaustClient,
+		"test-model",
+		5,
+		reg,
+		memMgr,
+		func(e Event) { events = append(events, e) },
+		WithMaxContextTokens(15), // Ceiling lower than prompt tokens (20) triggers safe halt
+		WithWorkingTailSize(2),
+	)
+
+	_, err := exhaustEngine.Run(context.Background(), "Trigger context exhaustion")
+	if err == nil {
+		t.Fatal("expected context exhaustion error")
+	}
+
+	hasExhaustEvent := false
+	for _, ev := range events {
+		if ev.Type == EventContextExhausted {
+			hasExhaustEvent = true
+			break
+		}
+	}
+	if !hasExhaustEvent {
+		t.Errorf("expected EventContextExhausted in events, got: %+v", events)
+	}
+}
+
+func TestEngineInitialContextExhaustion(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	memMgr := memory.NewManager(tempDir)
+
+	mockClient := &mockChatClient{}
+	var events []Event
+
+	// Set MaxContextTokens so small (5 tokens) that initial task immediately exceeds it
+	engine := NewEngine(
+		mockClient,
+		"test-model",
+		5,
+		reg,
+		memMgr,
+		func(e Event) { events = append(events, e) },
+		WithMaxContextTokens(5),
+	)
+
+	_, err := engine.Run(context.Background(), "This is an oversized initial task that exceeds five tokens")
+	if !errors.Is(err, history.ErrContextExhausted) {
+		t.Fatalf("expected ErrContextExhausted on initial prompt, got: %v", err)
+	}
+
+	// Model client must NEVER have been called
+	if mockClient.calls > 0 {
+		t.Errorf("expected 0 LLM calls for oversized initial prompt, got %d", mockClient.calls)
+	}
+
+	hasExhaustEvent := false
+	for _, ev := range events {
+		if ev.Type == EventContextExhausted {
+			hasExhaustEvent = true
+			break
+		}
+	}
+	if !hasExhaustEvent {
+		t.Errorf("expected EventContextExhausted event, got: %+v", events)
+	}
+}
+
+type flexibleMockClient struct {
+	calls   int
+	handler func(call int, params openai.ChatCompletionNewParams, opts []option.RequestOption) (*openai.ChatCompletion, error)
+}
+
+func (m *flexibleMockClient) CreateChatCompletion(_ context.Context, params openai.ChatCompletionNewParams, opts ...option.RequestOption) (*openai.ChatCompletion, error) {
+	resp, err := m.handler(m.calls, params, opts)
+	m.calls++
+	return resp, err
+}
+
+func TestEngineReactiveContextRecovery(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	memMgr := memory.NewManager(tempDir)
+
+	mock := &flexibleMockClient{
+		handler: func(call int, _ openai.ChatCompletionNewParams, _ []option.RequestOption) (*openai.ChatCompletion, error) {
+			if call == 0 {
+				// First call fails with context overflow
+				return nil, &openai.Error{
+					Code:    "context_length_exceeded",
+					Message: "maximum context length is 16384 tokens. However, your messages resulted in 18000 tokens.",
+				}
+			}
+			// Second call (retry) succeeds
+			return &openai.ChatCompletion{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Self-healed and completed successfully.",
+						},
+					},
+				},
+				Usage: openai.CompletionUsage{PromptTokens: 12000},
+			}, nil
+		},
+	}
+
+	var events []Event
+	engine := NewEngine(
+		mock,
+		"qwen2.5-coder:7b",
+		5,
+		reg,
+		memMgr,
+		func(e Event) { events = append(events, e) },
+		WithMaxContextTokens(32000),
+		WithWorkingTailSize(2),
+	)
+
+	result, err := engine.Run(context.Background(), "Perform recovery test")
+	if err != nil {
+		t.Fatalf("expected successful execution after reactive retry, got: %v", err)
+	}
+
+	if result != "Self-healed and completed successfully." {
+		t.Errorf("unexpected result: %s", result)
+	}
+
+	hasRetryingEvent := false
+	for _, ev := range events {
+		if ev.Type == EventContextRetrying {
+			hasRetryingEvent = true
+			break
+		}
+	}
+	if !hasRetryingEvent {
+		t.Errorf("expected EventContextRetrying to be emitted, got events: %+v", events)
+	}
+}
+
+func TestEngineReactiveContextExhausted(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	memMgr := memory.NewManager(tempDir)
+
+	mock := &flexibleMockClient{
+		handler: func(_ int, _ openai.ChatCompletionNewParams, _ []option.RequestOption) (*openai.ChatCompletion, error) {
+			return nil, &openai.Error{
+				Code:    "context_length_exceeded",
+				Message: "maximum context length is 16384 tokens.",
+			}
+		},
+	}
+
+	var events []Event
+	engine := NewEngine(
+		mock,
+		"qwen2.5-coder:7b",
+		5,
+		reg,
+		memMgr,
+		func(e Event) { events = append(events, e) },
+		WithMaxContextTokens(32000),
+		WithWorkingTailSize(2),
+	)
+
+	_, err := engine.Run(context.Background(), "Fail after retries")
+	if err == nil {
+		t.Fatal("expected error after retry exhaustion, got nil")
+	}
+
+	// Should have made 1 initial call + 2 retries = 3 calls
+	if mock.calls != 3 {
+		t.Errorf("expected 3 total calls (1 initial + 2 retries), got %d", mock.calls)
+	}
+
+	retryEvents := 0
+	for _, ev := range events {
+		if ev.Type == EventContextRetrying {
+			retryEvents++
+		}
+	}
+	if retryEvents != 2 {
+		t.Errorf("expected 2 EventContextRetrying events, got %d", retryEvents)
+	}
+}
+
+func TestEngineLocalNumCtxInjection(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	memMgr := memory.NewManager(tempDir)
+
+	var capturedOpts []option.RequestOption
+	mock := &flexibleMockClient{
+		handler: func(_ int, _ openai.ChatCompletionNewParams, opts []option.RequestOption) (*openai.ChatCompletion, error) {
+			capturedOpts = opts
+			return &openai.ChatCompletion{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Local run complete.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	engine := NewEngine(
+		mock,
+		"qwen2.5-coder:7b",
+		5,
+		reg,
+		memMgr,
+		nil,
+		WithMaxContextTokens(16384),
+		WithIsLocal(true),
+	)
+
+	_, err := engine.Run(context.Background(), "Check local num_ctx injection")
+	if err != nil {
+		t.Fatalf("unexpected engine error: %v", err)
+	}
+
+	if len(capturedOpts) == 0 {
+		t.Fatal("expected RequestOptions to be passed when isLocal=true")
+	}
+}
+
+type mockSimpleTool struct {
+	name string
+	exec func(ctx context.Context, args json.RawMessage) (string, error)
+}
+
+func (m *mockSimpleTool) Name() string { return m.name }
+func (m *mockSimpleTool) Description() string { return "mock tool" }
+func (m *mockSimpleTool) Parameters() any { return map[string]any{"type": "object"} }
+func (m *mockSimpleTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	return m.exec(ctx, args)
+}
+
+func TestEngineCumulativeToolOutputTruncation(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(100000)
+	// Register a mock tool that outputs large data with Title Case "Exit Code: 0"
+	reg.Register(&mockSimpleTool{
+		name: "noisy_cmd",
+		exec: func(_ context.Context, _ json.RawMessage) (string, error) {
+			return "Exit Code: 0\n" + strings.Repeat("log output line\n", 5000), nil
+		},
+	})
+	memMgr := memory.NewManager(tempDir)
+
+	mock := &mockChatClient{
+		responses: []*openai.ChatCompletion{
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: "assistant",
+							ToolCalls: []openai.ChatCompletionMessageToolCall{
+								{
+									ID: "call_noisy",
+									Function: openai.ChatCompletionMessageToolCallFunction{
+										Name:      "noisy_cmd",
+										Arguments: `{}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Done after truncation.",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	var events []Event
+	engine := NewEngine(
+		mock,
+		"test-model",
+		5,
+		reg,
+		memMgr,
+		func(e Event) { events = append(events, e) },
+		WithMaxContextTokens(8192),
+	)
+
+	_, err := engine.Run(context.Background(), "Run noisy command")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var truncatedResult string
+	for _, ev := range events {
+		if ev.Type == EventToolResult {
+			truncatedResult = ev.ToolResult
+			break
+		}
+	}
+
+	expectedPrefix := "[Output truncated: cumulative turn output limit reached] | Exit Code: 0"
+	if truncatedResult != expectedPrefix {
+		t.Errorf("expected truncated tool result %q, got %q", expectedPrefix, truncatedResult)
 	}
 }

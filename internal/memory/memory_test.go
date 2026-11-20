@@ -16,8 +16,8 @@ func TestMemoryManager(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(prompt, "Buddy") {
-		t.Errorf("expected prompt to contain 'Buddy', got: %s", prompt)
+	if !strings.Contains(prompt, "Buddy") || !strings.Contains(prompt, "autonomous agent harness") {
+		t.Errorf("expected prompt to contain 'Buddy' and 'autonomous agent harness', got: %s", prompt)
 	}
 
 	// Test 2: Create SOUL.md, USER.md, MEMORY.md

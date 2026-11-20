@@ -79,12 +79,30 @@ func main() {
 			fmt.Println(resultStyle.Render(fmt.Sprintf("→ %s", trimmed)))
 		case agent.EventFinished:
 			fmt.Println(doneStyle.Render("\n✓ Done"))
+		case agent.EventCompactionStart:
+			fmt.Println(thoughtStyle.Render("⚡ Compacting context history..."))
+		case agent.EventCompactionDone:
+			fmt.Println(thoughtStyle.Render("✓ Context compaction complete"))
+		case agent.EventContextRetrying:
+			fmt.Println(thoughtStyle.Render(fmt.Sprintf("⚡ Context limit reached; self-healing with compaction (step %d)...", ev.Step)))
+		case agent.EventContextExhausted:
+			fmt.Println(errStyle.Render(fmt.Sprintf("\n✖ Context Exhausted: %v", ev.Error)))
 		case agent.EventError:
 			fmt.Println(errStyle.Render(fmt.Sprintf("\n✖ Error: %v", ev.Error)))
 		}
 	}
 
-	engine := agent.NewEngine(clientAdapter, cfg.Model, cfg.MaxSteps, reg, memMgr, eventHandler)
+	engine := agent.NewEngine(
+		clientAdapter,
+		cfg.Model,
+		cfg.MaxSteps,
+		reg,
+		memMgr,
+		eventHandler,
+		agent.WithMaxContextTokens(cfg.MaxContextTokens),
+		agent.WithWorkingTailSize(cfg.WorkingTailSize),
+		agent.WithIsLocal(cfg.IsLocal),
+	)
 
 	// If argument provided, run once
 	if len(os.Args) > 1 {
