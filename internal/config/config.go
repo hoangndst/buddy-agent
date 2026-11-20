@@ -54,7 +54,8 @@ func Load() (*Config, error) {
 	}
 
 	model := getEnv("BUDDY_MODEL", "qwen2.5-coder:7b")
-	baseURL := getEnv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+	baseURL := getEnv("BUDDY_BASE_URL", getEnv("OPENAI_BASE_URL", "http://localhost:11434/v1"))
+	apiKey := getEnv("BUDDY_API_KEY", getEnv("OPENAI_API_KEY", ""))
 
 	maxContextTokens := resolveContextCeiling(os.Getenv("BUDDY_MAX_CONTEXT_TOKENS"), baseURL)
 
@@ -68,7 +69,7 @@ func Load() (*Config, error) {
 
 	return &Config{
 		BaseURL:          baseURL,
-		APIKey:           getEnv("OPENAI_API_KEY", ""),
+		APIKey:           apiKey,
 		Model:            model,
 		MaxSteps:         maxSteps,
 		MaxOutputChars:   maxOutputChars,

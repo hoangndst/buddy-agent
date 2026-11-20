@@ -73,6 +73,32 @@ func TestLoadCustom(t *testing.T) {
 	}
 }
 
+func TestLoadCustom_BuddyEnvPrecedence(t *testing.T) {
+	os.Clearenv()
+	// Generic fallbacks
+	t.Setenv("OPENAI_BASE_URL", "https://generic-openai.com/v1")
+	t.Setenv("OPENAI_API_KEY", "generic-key")
+
+	// Scoped BUDDY_* variables take precedence
+	t.Setenv("BUDDY_BASE_URL", "http://localhost:11434/v1")
+	t.Setenv("BUDDY_API_KEY", "buddy-scoped-key")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+
+	if cfg.BaseURL != "http://localhost:11434/v1" {
+		t.Errorf("expected BUDDY_BASE_URL to take precedence, got %s", cfg.BaseURL)
+	}
+	if cfg.APIKey != "buddy-scoped-key" {
+		t.Errorf("expected BUDDY_API_KEY to take precedence, got %s", cfg.APIKey)
+	}
+	if !cfg.IsLocal {
+		t.Errorf("expected IsLocal true for localhost, got false")
+	}
+}
+
 func TestResolveContextCeiling(t *testing.T) {
 	tests := []struct {
 		name     string
