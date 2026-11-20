@@ -41,13 +41,18 @@ type Runner interface {
 	Run(ctx context.Context, opts ExecutionOptions) (*ExecutionResult, error)
 }
 
-// platformSupervisor defines the internal cross-platform OS process management contract.
-type platformSupervisor interface {
-	prepareCmd(cmd *exec.Cmd) error
-	attachProcess(cmd *exec.Cmd) error
-	terminate(graceful bool) error
-	isAlive() bool
-	close() error
+// Supervisor defines the internal cross-platform OS process management contract.
+type Supervisor interface {
+	PrepareCmd(cmd *exec.Cmd) error
+	AttachProcess(cmd *exec.Cmd) error
+	Terminate(graceful bool) error
+	IsAlive() bool
+	Close() error
+}
+
+// NewSupervisor instantiates a platform-specific OS process lifecycle supervisor.
+func NewSupervisor() Supervisor {
+	return newPlatformSupervisor()
 }
 
 // DefaultRunner implements Runner using OS process groups and streaming truncation.
@@ -105,12 +110,12 @@ func (r *DefaultRunner) Run(ctx context.Context, opts ExecutionOptions) (*Execut
 		cmd.Env = os.Environ()
 	}
 
-	sup := newPlatformSupervisor()
+	sup := NewSupervisor()
 	defer func() {
-		_ = sup.close()
+		_ = sup.Close()
 	}()
 
-	if err := sup.prepareCmd(cmd); err != nil {
+	if err := sup.PrepareCmd(cmd); err != nil {
 		return nil, fmt.Errorf("failed to prepare command: %w", err)
 	}
 
@@ -119,7 +124,7 @@ func (r *DefaultRunner) Run(ctx context.Context, opts ExecutionOptions) (*Execut
 		return nil, fmt.Errorf("command execution failed to start: %w", err)
 	}
 
-	if err := sup.attachProcess(cmd); err != nil {
+	if err := sup.AttachProcess(cmd); err != nil {
 		_ = cmd.Process.Kill()
 		return nil, fmt.Errorf("failed to attach process group: %w", err)
 	}
@@ -139,7 +144,7 @@ func (r *DefaultRunner) Run(ctx context.Context, opts ExecutionOptions) (*Execut
 		// Normal completion before timeout/cancellation
 	case <-execCtx.Done():
 		terminated = true
-		_ = sup.terminate(true) // Phase 1: Graceful SIGTERM
+		_ = sup.Terminate(true) // Phase 1: Graceful SIGTERM
 
 		gracePeriod := opts.GracePeriod
 		if gracePeriod <= 0 {
@@ -151,7 +156,7 @@ func (r *DefaultRunner) Run(ctx context.Context, opts ExecutionOptions) (*Execut
 		select {
 		case waitErr = <-waitDone:
 			// Leader exited. Check if background child descendants are still alive
-			if sup.isAlive() {
+			if sup.IsAlive() {
 				ticker := time.NewTicker(25 * time.Millisecond)
 				defer ticker.Stop()
 				escalated := false
@@ -159,12 +164,12 @@ func (r *DefaultRunner) Run(ctx context.Context, opts ExecutionOptions) (*Execut
 				for {
 					select {
 					case <-graceTimer.C:
-						_ = sup.terminate(false) // Phase 2: Forced SIGKILL
+						_ = sup.Terminate(false) // Phase 2: Forced SIGKILL
 						escalatedKill = true
 						escalated = true
 						break descendantLoop
 					case <-ticker.C:
-						if !sup.isAlive() {
+						if !sup.IsAlive() {
 							break descendantLoop
 						}
 					}
@@ -175,7 +180,7 @@ func (r *DefaultRunner) Run(ctx context.Context, opts ExecutionOptions) (*Execut
 			}
 		case <-graceTimer.C:
 			// Grace period expired without leader exit; escalate to forced SIGKILL
-			_ = sup.terminate(false)
+			_ = sup.Terminate(false)
 			escalatedKill = true
 			waitErr = <-waitDone
 		}
@@ -183,7 +188,7 @@ func (r *DefaultRunner) Run(ctx context.Context, opts ExecutionOptions) (*Execut
 
 	if waitErr != nil {
 		if errors.Is(waitErr, exec.ErrWaitDelay) {
-			_ = sup.terminate(false)
+			_ = sup.Terminate(false)
 			exitCode = -1
 			terminated = true
 		} else if exitErr, ok := waitErr.(*exec.ExitError); ok {
