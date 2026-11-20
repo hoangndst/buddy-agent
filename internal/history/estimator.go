@@ -84,9 +84,9 @@ func (t *UsageTracker) Calibrate(promptTokens int64) {
 	}
 }
 
-// AddDelta records incremental tokens added by local turns since the last API call.
+// AddDelta records incremental tokens added or reclaimed by local turns.
 func (t *UsageTracker) AddDelta(delta int) {
-	if delta > 0 {
+	if delta != 0 {
 		t.deltaTokens.Add(int64(delta))
 	}
 }
@@ -99,5 +99,9 @@ func (t *UsageTracker) ResetBaseline(tokens int) {
 
 // CurrentTokens returns the current estimated total context tokens.
 func (t *UsageTracker) CurrentTokens() int {
-	return int(t.baselineTokens.Load() + t.deltaTokens.Load())
+	total := t.baselineTokens.Load() + t.deltaTokens.Load()
+	if total < 0 {
+		return 0
+	}
+	return int(total)
 }

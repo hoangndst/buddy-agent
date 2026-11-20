@@ -295,6 +295,9 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 
 		// Watermark check: execute staged micro-pruning or macro-distillation
 		preTokens := session.CurrentTokens()
+		if preTokens >= int(float64(session.MaxContextTokens())*0.70) {
+			e.eventHandler(Event{Type: EventCompactionStart, Step: step})
+		}
 		if err := session.EnsureWatermarks(ctx, e.client, e.model); err != nil {
 			if errors.Is(err, history.ErrContextExhausted) {
 				e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})

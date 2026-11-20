@@ -768,3 +768,101 @@ func TestSession_NoConsecutiveUserTurnsWithEpisodicState(t *testing.T) {
 		t.Errorf("expected msgs[2] to be assistant message (P3)")
 	}
 }
+
+func TestUsageTracker_NegativeDeltaAndClamping(t *testing.T) {
+	tracker := NewUsageTracker(1000)
+	if tracker.CurrentTokens() != 1000 {
+		t.Fatalf("expected 1000, got %d", tracker.CurrentTokens())
+	}
+
+	// Add positive delta
+	tracker.AddDelta(500)
+	if tracker.CurrentTokens() != 1500 {
+		t.Fatalf("expected 1500, got %d", tracker.CurrentTokens())
+	}
+
+	// Add negative delta (e.g. from micro-pruning reclamation)
+	tracker.AddDelta(-400)
+	if tracker.CurrentTokens() != 1100 {
+		t.Fatalf("expected 1100, got %d", tracker.CurrentTokens())
+	}
+
+	// Clamping at zero on excessive negative delta
+	tracker.AddDelta(-2000)
+	if tracker.CurrentTokens() != 0 {
+		t.Fatalf("expected 0 on underflow clamp, got %d", tracker.CurrentTokens())
+	}
+}
+
+func TestSession_MicroPruningReducesTokenEstimate(t *testing.T) {
+	session := NewSession(
+		"System prompt",
+		"Task prompt",
+		WithMaxContextTokens(64000),
+		WithWorkingTailSize(2),
+	)
+
+	largeOutput := strings.Repeat("A", 1000)
+
+	// Turn 1
+	session.CommitToolTurn(
+		openai.ChatCompletionMessage{Role: "assistant"},
+		[]ToolResult{{ToolCallID: "c1", Name: "bash", Content: largeOutput}},
+	)
+	// Turn 2
+	session.CommitToolTurn(
+		openai.ChatCompletionMessage{Role: "assistant"},
+		[]ToolResult{{ToolCallID: "c2", Name: "bash", Content: largeOutput}},
+	)
+
+	tokensBefore := session.CurrentTokens()
+
+	// Turn 3: pushes Turn 1 out of working tail, triggering eager micro-pruning
+	session.CommitToolTurn(
+		openai.ChatCompletionMessage{Role: "assistant"},
+		[]ToolResult{{ToolCallID: "c3", Name: "bash", Content: "small"}},
+	)
+
+	tokensAfter := session.CurrentTokens()
+	if tokensAfter >= tokensBefore {
+		t.Fatalf("expected tokensAfter (%d) < tokensBefore (%d) after eager micro-pruning", tokensAfter, tokensBefore)
+	}
+}
+
+func TestDistill_SingleParagraphRuneClamp(t *testing.T) {
+	ctx := context.Background()
+	longSingleParagraph := strings.Repeat("word ", 2000)
+
+	mockClient := &mockCompletionClient{
+		response: &openai.ChatCompletion{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    "assistant",
+						Content: longSingleParagraph,
+					},
+				},
+			},
+		},
+	}
+
+	blocks := []TurnBlock{
+		{
+			Kind:            BlockKindAssistantSimple,
+			AssistantSimple: &openai.ChatCompletionMessage{Role: "assistant", Content: "Previous work"},
+			EstimatedTokens: 50,
+		},
+	}
+
+	tracker := NewStateTracker("Goal", nil)
+	summary, err := DistillIntermediateBlocks(ctx, mockClient, "gpt-4o", "", blocks, tracker)
+	if err != nil {
+		t.Fatalf("expected successful distillation, got error: %v", err)
+	}
+	if summary == "" {
+		t.Fatalf("expected non-empty summary from rune fallback clamp")
+	}
+	if EstimateContent(summary) > MaxDistillTokens {
+		t.Fatalf("expected summary tokens <= %d, got %d", MaxDistillTokens, EstimateContent(summary))
+	}
+}
