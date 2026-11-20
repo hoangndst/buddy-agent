@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -111,6 +112,9 @@ func (m *ClientManager) StartAll(ctx context.Context) map[string]error {
 	errMap := make(map[string]error)
 	var errMu sync.Mutex
 
+	var allDiscoveredAdapters []*ToolAdapter
+	var adaptersMu sync.Mutex
+
 	for name, srvCfg := range m.cfg.MCPServers {
 		if srvCfg.Disabled {
 			m.mu.Lock()
@@ -160,7 +164,7 @@ func (m *ClientManager) StartAll(ctx context.Context) map[string]error {
 					fmt.Fprintf(os.Stderr, "Warning: MCP server %q failed to prepare: %v\n", srvName, prepErr)
 					return
 				}
-				transport = newCommandTransport(cmd)
+				transport = newSupervisedCommandTransport(cmd, sup)
 			} else {
 				transport, prepErr = newStreamableTransport(cfg)
 				if prepErr != nil {
@@ -213,19 +217,14 @@ func (m *ClientManager) StartAll(ctx context.Context) map[string]error {
 				return
 			}
 
-			// If stdio, attach process to supervisor
-			if cmd != nil && cmd.Process != nil && sup != nil {
-				_ = sup.AttachProcess(cmd)
-			}
-
 			// Discover tools
-			var discoveredAdapters []tools.Tool
+			var serverAdapters []*ToolAdapter
 			toolsRes, err := session.ListTools(handshakeCtx, nil)
 			if err == nil && toolsRes != nil {
 				for _, t := range toolsRes.Tools {
 					if isToolAllowed(t.Name, cfg.IncludeTools, cfg.ExcludeTools) {
 						timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
-						discoveredAdapters = append(discoveredAdapters, NewToolAdapter(srvName, *t, m, timeout))
+						serverAdapters = append(serverAdapters, NewToolAdapter(srvName, *t, m, timeout))
 					}
 				}
 			}
@@ -237,20 +236,54 @@ func (m *ClientManager) StartAll(ctx context.Context) map[string]error {
 				Transport:       cfg.TransportType(),
 				Source:          cfg.Source,
 				Status:          StatusRunning,
-				DiscoveredTools: len(discoveredAdapters),
+				DiscoveredTools: len(serverAdapters),
 			}
 			if sup != nil {
 				m.supervisors[srvName] = sup
 				m.cmds[srvName] = cmd
 				m.stderrBuffers[srvName] = stderrBuf
 			}
-			m.tools = append(m.tools, discoveredAdapters...)
 			m.mu.Unlock()
+
+			adaptersMu.Lock()
+			allDiscoveredAdapters = append(allDiscoveredAdapters, serverAdapters...)
+			adaptersMu.Unlock()
 		}(name, srvCfg)
 	}
 
 	wg.Wait()
+
+	// Deterministically sort and disambiguate tool adapters across all servers
+	sort.Slice(allDiscoveredAdapters, func(i, j int) bool {
+		if allDiscoveredAdapters[i].ServerName() != allDiscoveredAdapters[j].ServerName() {
+			return allDiscoveredAdapters[i].ServerName() < allDiscoveredAdapters[j].ServerName()
+		}
+		return allDiscoveredAdapters[i].ToolName() < allDiscoveredAdapters[j].ToolName()
+	})
+
+	m.mu.Lock()
+	m.tools = disambiguateToolAdapters(allDiscoveredAdapters)
+	m.mu.Unlock()
+
 	return errMap
+}
+
+// disambiguateToolAdapters scans tool adapters and resolves naming collisions
+// deterministically using the original (server\x00tool) pair hash.
+func disambiguateToolAdapters(adapters []*ToolAdapter) []tools.Tool {
+	nameCounts := make(map[string]int)
+	for _, a := range adapters {
+		nameCounts[a.Name()]++
+	}
+
+	result := make([]tools.Tool, len(adapters))
+	for i, a := range adapters {
+		if nameCounts[a.Name()] > 1 {
+			a.SetName(DisambiguateToolName(a.ServerName(), a.ToolName()))
+		}
+		result[i] = a
+	}
+	return result
 }
 
 func isToolAllowed(toolName string, include, exclude []string) bool {

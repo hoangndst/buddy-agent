@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -100,13 +101,44 @@ func buildStdioCommand(srv ServerConfig) (*exec.Cmd, subprocess.Supervisor, *rol
 	return cmd, sup, stderrBuf, nil
 }
 
-// newCommandTransport creates an SDK CommandTransport configured with a short
-// TerminateDuration so Buddy's dual-phase supervisor controls signal escalation.
-func newCommandTransport(cmd *exec.Cmd) *mcp.CommandTransport {
-	return &mcp.CommandTransport{
-		Command:           cmd,
-		TerminateDuration: 100 * time.Millisecond,
+// supervisedCommandTransport wraps mcp.CommandTransport to attach the process group
+// supervisor immediately upon child process creation, before the JSON-RPC initialization handshake.
+type supervisedCommandTransport struct {
+	inner *mcp.CommandTransport
+	cmd   *exec.Cmd
+	sup   subprocess.Supervisor
+}
+
+// newSupervisedCommandTransport creates a supervisedCommandTransport wrapping an SDK CommandTransport.
+func newSupervisedCommandTransport(cmd *exec.Cmd, sup subprocess.Supervisor) *supervisedCommandTransport {
+	return &supervisedCommandTransport{
+		inner: &mcp.CommandTransport{
+			Command:           cmd,
+			TerminateDuration: 100 * time.Millisecond,
+		},
+		cmd: cmd,
+		sup: sup,
 	}
+}
+
+// Connect starts the child process and immediately attaches the process group supervisor
+// before returning the connection for the JSON-RPC initialization handshake.
+func (t *supervisedCommandTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	conn, err := t.inner.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if t.cmd != nil && t.cmd.Process != nil && t.sup != nil {
+		if attachErr := t.sup.AttachProcess(t.cmd); attachErr != nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			_ = t.sup.Terminate(false)
+			_ = t.sup.Close()
+			return nil, fmt.Errorf("attaching process supervisor: %w", attachErr)
+		}
+	}
+	return conn, nil
 }
 
 // newStreamableTransport creates an SDK StreamableClientTransport configured with custom HTTP headers.

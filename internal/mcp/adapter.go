@@ -19,6 +19,7 @@ type ToolAdapter struct {
 	tool       mcp.Tool
 	manager    *ClientManager
 	timeout    time.Duration
+	name       string
 }
 
 // NewToolAdapter constructs a new ToolAdapter for an MCP server tool.
@@ -31,12 +32,31 @@ func NewToolAdapter(serverName string, tool mcp.Tool, manager *ClientManager, ti
 		tool:       tool,
 		manager:    manager,
 		timeout:    timeout,
+		name:       SanitizeToolName(serverName, tool.Name),
 	}
 }
 
 // Name returns the deterministic sanitized and namespaced tool identifier.
 func (a *ToolAdapter) Name() string {
+	if a.name != "" {
+		return a.name
+	}
 	return SanitizeToolName(a.serverName, a.tool.Name)
+}
+
+// SetName overrides the tool identifier (used for collision resolution).
+func (a *ToolAdapter) SetName(name string) {
+	a.name = name
+}
+
+// ServerName returns the originating server name.
+func (a *ToolAdapter) ServerName() string {
+	return a.serverName
+}
+
+// ToolName returns the original tool name.
+func (a *ToolAdapter) ToolName() string {
+	return a.tool.Name
 }
 
 // Description returns the tool's description.
@@ -89,6 +109,7 @@ func (a *ToolAdapter) Execute(ctx context.Context, args json.RawMessage) (string
 
 // SanitizeToolName formats and clamps tool identifiers to comply with OpenAI's
 // regex ^[a-zA-Z0-9_-]{1,64}$ constraint while avoiding name truncation collisions.
+// When names exceed 64 runes, the unambiguous original (server\x00tool) pair is hashed.
 func SanitizeToolName(server, tool string) string {
 	cleanServer := sanitizeString(server)
 	cleanTool := sanitizeString(tool)
@@ -98,12 +119,31 @@ func SanitizeToolName(server, tool string) string {
 		return base
 	}
 
-	// Clamp prefix to 55 runes and append 8-character hex hash of the full name
-	hash := sha256.Sum256([]byte(base))
+	// Clamp prefix to 55 runes and append 8-character hex hash of the unambiguous original (server\x00tool) pair
+	pairKey := fmt.Sprintf("%s\x00%s", server, tool)
+	hash := sha256.Sum256([]byte(pairKey))
 	hashHex := hex.EncodeToString(hash[:4]) // 4 bytes = 8 hex characters
 	prefix := base[:55]
 
 	return fmt.Sprintf("%s_%s", prefix, hashHex)
+}
+
+// DisambiguateToolName generates a collision-free tool identifier by appending
+// an 8-character hex hash of the unambiguous original (server\x00tool) pair,
+// clamped to 64 runes.
+func DisambiguateToolName(server, tool string) string {
+	cleanServer := sanitizeString(server)
+	cleanTool := sanitizeString(tool)
+	base := fmt.Sprintf("mcp_%s_%s", cleanServer, cleanTool)
+
+	pairKey := fmt.Sprintf("%s\x00%s", server, tool)
+	hash := sha256.Sum256([]byte(pairKey))
+	hashHex := hex.EncodeToString(hash[:4])
+
+	if len(base) > 55 {
+		base = base[:55]
+	}
+	return fmt.Sprintf("%s_%s", base, hashHex)
 }
 
 func sanitizeString(s string) string {

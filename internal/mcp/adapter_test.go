@@ -52,6 +52,35 @@ func TestSanitizeToolName_CollisionResistanceOver64Runes(t *testing.T) {
 	}
 }
 
+func TestSanitizeToolName_DistinctBoundariesHashDivergence(t *testing.T) {
+	// Two pairs where sanitized concatenated string is identical but boundaries differ
+	srv1, tool1 := "long_enterprise_warehouse", "system_query_customer_transactions_detailed"
+	srv2, tool2 := "long_enterprise", "warehouse_system_query_customer_transactions_detailed"
+
+	name1 := SanitizeToolName(srv1, tool1)
+	name2 := SanitizeToolName(srv2, tool2)
+
+	if name1 == name2 {
+		t.Fatalf("collision detected across boundary shift: %q == %q", name1, name2)
+	}
+}
+
+func TestDisambiguateToolName_Divergence(t *testing.T) {
+	// Short names that collide when sanitized
+	srv1, tool1 := "a_b", "c"
+	srv2, tool2 := "a", "b_c"
+
+	d1 := DisambiguateToolName(srv1, tool1)
+	d2 := DisambiguateToolName(srv2, tool2)
+
+	if d1 == d2 {
+		t.Fatalf("DisambiguateToolName collided: %q == %q", d1, d2)
+	}
+	if len(d1) > 64 || len(d2) > 64 {
+		t.Fatalf("disambiguated names exceed 64 runes: len(d1)=%d, len(d2)=%d", len(d1), len(d2))
+	}
+}
+
 func TestToolAdapter_ParametersCanonicalization(t *testing.T) {
 	mgr := NewClientManager(nil)
 	rawSchema := map[string]any{

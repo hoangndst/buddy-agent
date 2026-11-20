@@ -20,6 +20,7 @@ type dummyTool struct {
 }
 
 func (d *dummyTool) Name() string        { return d.name }
+func (d *dummyTool) SetName(name string) { d.name = name }
 func (d *dummyTool) Description() string { return d.description }
 func (d *dummyTool) Parameters() any     { return d.params }
 func (d *dummyTool) Execute(_ context.Context, _ json.RawMessage) (string, error) {
@@ -50,6 +51,25 @@ func TestRegistryAndDispatch(t *testing.T) {
 	missingOut := reg.Dispatch(ctx, "unknown_tool", json.RawMessage(`{}`))
 	if !strings.Contains(missingOut, "not registered") {
 		t.Errorf("expected not registered error, got: %s", missingOut)
+	}
+}
+
+func TestRegistry_CollisionHandling(t *testing.T) {
+	reg := NewRegistry(1000)
+	t1 := &dummyTool{name: "duplicate_tool", description: "first tool"}
+	t2 := &dummyTool{name: "duplicate_tool", description: "second tool"}
+
+	reg.Register(t1)
+	reg.Register(t2)
+
+	toolsList := reg.OpenAITools()
+	if len(toolsList) != 2 {
+		t.Fatalf("expected both tools to be preserved in registry, got %d", len(toolsList))
+	}
+
+	names := []string{toolsList[0].Function.Name, toolsList[1].Function.Name}
+	if names[0] == names[1] {
+		t.Fatalf("tools must have distinct names after collision handling, got %v", names)
 	}
 }
 

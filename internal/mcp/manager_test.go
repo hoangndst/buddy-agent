@@ -195,3 +195,71 @@ func TestManager_ConcurrentReadWriteAccess(_ *testing.T) {
 	_ = mgr.Close()
 	wg.Wait()
 }
+
+// TestHangingHelperProcess simulates a stdio server that hangs on initialization.
+func TestHangingHelperProcess(_ *testing.T) {
+	if os.Getenv("GO_WANT_HANGING_MCP_HELPER") != "1" {
+		return
+	}
+	time.Sleep(10 * time.Second)
+	os.Exit(0)
+}
+
+func TestManager_SupervisedCleanupOnHandshakeFailure(t *testing.T) {
+	cfg := &Config{
+		MCPServers: map[string]ServerConfig{
+			"hanging_helper": {
+				Command: os.Args[0],
+				Args:    []string{"-test.run=TestHangingHelperProcess", "--"},
+				Env: map[string]string{
+					"GO_WANT_HANGING_MCP_HELPER": "1",
+				},
+				TimeoutSeconds: 1,
+			},
+		},
+	}
+
+	mgr := NewClientManager(cfg)
+	ctx := context.Background()
+
+	start := time.Now()
+	errs := mgr.StartAll(ctx)
+	elapsed := time.Since(start)
+
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 error for hanging server, got %d", len(errs))
+	}
+	if elapsed > 4*time.Second {
+		t.Errorf("expected fast timeout and termination, took %v", elapsed)
+	}
+
+	states := mgr.ServerStates()
+	if states["hanging_helper"].Status != StatusFailed {
+		t.Errorf("expected failed status, got %s", states["hanging_helper"].Status)
+	}
+
+	_ = mgr.Close()
+}
+
+func TestManager_DisambiguateToolCollisions(t *testing.T) {
+	mgr := NewClientManager(nil)
+	adapters := []*ToolAdapter{
+		NewToolAdapter("a_b", mcp.Tool{Name: "c"}, mgr, 5*time.Second),
+		NewToolAdapter("a", mcp.Tool{Name: "b_c"}, mgr, 5*time.Second),
+	}
+
+	disambiguated := disambiguateToolAdapters(adapters)
+	if len(disambiguated) != 2 {
+		t.Fatalf("expected 2 tools, got %d", len(disambiguated))
+	}
+
+	name1 := disambiguated[0].Name()
+	name2 := disambiguated[1].Name()
+
+	if name1 == name2 {
+		t.Fatalf("collision detected! Both tools have identical name %q", name1)
+	}
+	if len(name1) > 64 || len(name2) > 64 {
+		t.Fatalf("tool names must not exceed 64 runes: len1=%d, len2=%d", len(name1), len(name2))
+	}
+}
