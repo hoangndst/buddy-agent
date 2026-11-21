@@ -332,7 +332,7 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 			exitCode := parseToolExitCode(result)
 
 			// Telemetry hook: track execution errors for StateTracker
-			if strings.HasPrefix(result, "Tool error:") || strings.Contains(result, "exit status") || strings.Contains(result, "exit code") || strings.Contains(result, "Exit Code") {
+			if exitCode != 0 {
 				session.RecordError(fmt.Sprintf("%s: %s", tc.Name, result))
 			}
 
