@@ -407,18 +407,29 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 
 // parseToolExitCode extracts a process exit code from tool output or defaults to 0 on success.
 func parseToolExitCode(output string) int {
-	if strings.Contains(output, "exit status ") {
-		parts := strings.Split(output, "exit status ")
-		if len(parts) > 1 {
+	// 1. Check for subprocess runner header "Exit Code: <N>"
+	for _, marker := range []string{"Exit Code: ", "exit code: "} {
+		if idx := strings.Index(output, marker); idx != -1 {
 			var code int
-			if _, err := fmt.Sscanf(parts[1], "%d", &code); err == nil {
+			if _, err := fmt.Sscanf(output[idx+len(marker):], "%d", &code); err == nil {
 				return code
 			}
 		}
+	}
+
+	// 2. Check for standard Go exec error "exit status <N>"
+	if idx := strings.Index(output, "exit status "); idx != -1 {
+		var code int
+		if _, err := fmt.Sscanf(output[idx+len("exit status "):], "%d", &code); err == nil {
+			return code
+		}
 		return 1
 	}
+
+	// 3. Tool execution error
 	if strings.HasPrefix(output, "Tool error:") || strings.HasPrefix(output, "Error:") || strings.HasPrefix(output, "error:") {
 		return -1
 	}
+
 	return 0
 }

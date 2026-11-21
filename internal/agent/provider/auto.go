@@ -18,6 +18,7 @@ type AutoProvider struct {
 	responses *ResponsesProvider
 	isLocal   bool
 	latch     int32
+	forceNone int32
 }
 
 // NewAutoProvider creates an AutoProvider instance.
@@ -55,13 +56,19 @@ func (p *AutoProvider) Generate(ctx context.Context, req GenerateRequest) (*Gene
 		return p.responses.Generate(ctx, req)
 	}
 
+	// If reasoning downgrade was previously latched, enforce reasoning_effort: "none"
+	if atomic.LoadInt32(&p.forceNone) == 1 {
+		req.ReasoningEffort = "none"
+	}
+
 	// If already latched to chat, delegate directly
 	if currentLatch == latchChat {
 		resp, err := p.chat.Generate(ctx, req)
-		if err != nil && req.ReasoningEffort != "" {
+		if err != nil {
 			kind := ParseCapabilityError(err)
 			if kind == CapabilityErrorReasoningConflict || kind == CapabilityErrorParamRejected {
-				// Retry with sanitized reasoning_effort
+				// Retry with sanitized reasoning_effort and latch the downgrade
+				atomic.StoreInt32(&p.forceNone, 1)
 				sanitizedReq := req
 				sanitizedReq.ReasoningEffort = "none"
 				return p.chat.Generate(ctx, sanitizedReq)
@@ -83,7 +90,7 @@ func (p *AutoProvider) Generate(ctx context.Context, req GenerateRequest) (*Gene
 
 	// Check for capability conflict
 	kind := ParseCapabilityError(err)
-	if kind == CapabilityErrorReasoningConflict {
+	if kind == CapabilityErrorReasoningConflict || kind == CapabilityErrorParamRejected {
 		// Diagnostic escalation to Responses API
 		respResp, respErr := p.responses.Generate(ctx, req)
 		if respErr == nil {
@@ -93,6 +100,7 @@ func (p *AutoProvider) Generate(ctx context.Context, req GenerateRequest) (*Gene
 		// If Responses API is unsupported (404/405), downgrade to chat with reasoning_effort: "none"
 		if ParseCapabilityError(respErr) == CapabilityErrorEndpointUnsupported {
 			atomic.StoreInt32(&p.latch, latchChat)
+			atomic.StoreInt32(&p.forceNone, 1)
 			sanitizedReq := req
 			sanitizedReq.ReasoningEffort = "none"
 			return p.chat.Generate(ctx, sanitizedReq)

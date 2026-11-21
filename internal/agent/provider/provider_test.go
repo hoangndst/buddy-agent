@@ -288,6 +288,21 @@ func TestAutoProvider_Responses404FallbackToSanitizedChat(t *testing.T) {
 	if auto.Protocol() != "chat" {
 		t.Errorf("expected auto provider to latch 'chat', got %s", auto.Protocol())
 	}
+
+	// Turn 2: User sends subsequent turn with empty ReasoningEffort (default unset)
+	// Invariant: The downgrade to reasoning_effort: "none" must persist so subsequent tool turns don't fail.
+	req2 := GenerateRequest{
+		Model:    "test-model",
+		Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage("step 2")},
+		Tools:    []tools.Tool{&mockTool{name: "test_tool", desc: "mock tool"}},
+	}
+	genResp2, err := auto.Generate(context.Background(), req2)
+	if err != nil {
+		t.Fatalf("expected Turn 2 to succeed with persisted reasoning_effort none, got: %v", err)
+	}
+	if genResp2.Content != "chat success with reasoning_effort none" {
+		t.Errorf("expected success message on Turn 2, got: %s", genResp2.Content)
+	}
 }
 
 func TestAutoProvider_OperationalErrorFailFast(t *testing.T) {

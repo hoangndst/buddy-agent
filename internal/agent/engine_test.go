@@ -666,3 +666,61 @@ func TestEngineReasoningEventEmission(t *testing.T) {
 		t.Errorf("expected EventTextComplete event, got events: %+v", events)
 	}
 }
+
+func TestParseToolExitCode(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		expected int
+	}{
+		{
+			name:     "Subprocess runner Exit Code 0",
+			output:   "Exit Code: 0\nstdout output",
+			expected: 0,
+		},
+		{
+			name:     "Subprocess runner Exit Code 42",
+			output:   "Exit Code: 42\nsome command failure",
+			expected: 42,
+		},
+		{
+			name:     "Subprocess runner timeout with Exit Code 124",
+			output:   "Exit Code: 124 (timeout: 10s)\ncommand timed out",
+			expected: 124,
+		},
+		{
+			name:     "Lowercase exit code header",
+			output:   "exit code: 1\nerror",
+			expected: 1,
+		},
+		{
+			name:     "Standard Go exec exit status",
+			output:   "Command failed: exit status 2",
+			expected: 2,
+		},
+		{
+			name:     "Tool execution error prefix",
+			output:   "Tool error: invalid parameter format",
+			expected: -1,
+		},
+		{
+			name:     "Error prefix",
+			output:   "Error: cannot open file",
+			expected: -1,
+		},
+		{
+			name:     "Normal clean tool output without exit code",
+			output:   "file contents here\nline 2",
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseToolExitCode(tt.output)
+			if got != tt.expected {
+				t.Errorf("parseToolExitCode(%q) = %d, want %d", tt.output, got, tt.expected)
+			}
+		})
+	}
+}
