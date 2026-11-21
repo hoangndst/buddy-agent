@@ -427,6 +427,7 @@ func (s *SearchFilesTool) Execute(_ context.Context, raw json.RawMessage) (strin
 	}
 
 	absWorkspace, _ := filepath.Abs(s.workspace)
+	cleanStart := filepath.Clean(startPath)
 	var sb strings.Builder
 	count := 0
 
@@ -435,9 +436,11 @@ func (s *SearchFilesTool) Execute(_ context.Context, raw json.RawMessage) (strin
 			return nil
 		}
 		if info.IsDir() {
-			name := info.Name()
-			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == "bin" {
-				return filepath.SkipDir
+			if filepath.Clean(path) != cleanStart {
+				name := info.Name()
+				if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == "bin" {
+					return filepath.SkipDir
+				}
 			}
 			return nil
 		}

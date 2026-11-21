@@ -379,6 +379,23 @@ func TestListDirectoryAndSearchFiles(t *testing.T) {
 		t.Errorf("expected search output to find helper.go match, got:\n%s", searchRes)
 	}
 
+	// Test SearchFilesTool on explicit dot-directory (e.g. .github)
+	dotDir := filepath.Join(tempDir, ".github", "workflows")
+	if err := os.MkdirAll(dotDir, 0755); err != nil {
+		t.Fatalf("failed to create dot dir: %v", err)
+	}
+	ciFile := filepath.Join(dotDir, "ci.yml")
+	if err := os.WriteFile(ciFile, []byte("name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n"), 0644); err != nil {
+		t.Fatalf("failed to write ci file: %v", err)
+	}
+	dotSearchRes, err := searchTool.Execute(ctx, json.RawMessage(`{"query": "ubuntu-latest", "path": ".github"}`))
+	if err != nil {
+		t.Fatalf("search in dot dir failed: %v", err)
+	}
+	if !strings.Contains(dotSearchRes, "ci.yml:5: runs-on: ubuntu-latest") {
+		t.Errorf("expected search in .github to find ci.yml match, got:\n%s", dotSearchRes)
+	}
+
 	// 3. Test ReadFileTool on directory returns helpful guidance
 	readTool := NewReadFileTool(tempDir)
 	readDirRes, err := readTool.Execute(ctx, json.RawMessage(`{"path": "pkg"}`))
