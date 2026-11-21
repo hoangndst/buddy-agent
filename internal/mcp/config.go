@@ -21,6 +21,8 @@ type ServerConfig struct {
 	Command string            `json:"command,omitempty"`
 	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
+	WorkDir string            `json:"workDir,omitempty"`
+	Cwd     string            `json:"cwd,omitempty"`
 
 	// Remote HTTP/SSE transport parameters
 	URL     string            `json:"url,omitempty"`
@@ -67,6 +69,7 @@ func LoadConfig(projectDir, userHome string) (*Config, error) {
 		if globalCfg, err := loadSingleConfigFile(globalPath); err == nil && globalCfg != nil {
 			for name, srv := range globalCfg.MCPServers {
 				srv.Source = "global"
+				normalizeServerDirs(&srv, projectDir)
 				merged[name] = srv
 			}
 		} else if err != nil && !os.IsNotExist(err) {
@@ -80,6 +83,7 @@ func LoadConfig(projectDir, userHome string) (*Config, error) {
 		if projectCfg, err := loadSingleConfigFile(projectPath); err == nil && projectCfg != nil {
 			for name, srv := range projectCfg.MCPServers {
 				srv.Source = "project"
+				normalizeServerDirs(&srv, projectDir)
 				merged[name] = srv
 			}
 		} else if err != nil && !os.IsNotExist(err) {
@@ -109,6 +113,21 @@ func loadSingleConfigFile(path string) (*Config, error) {
 		cfg.MCPServers = make(map[string]ServerConfig)
 	}
 	return &cfg, nil
+}
+
+func normalizeServerDirs(srv *ServerConfig, baseDir string) {
+	if srv.WorkDir == "" && srv.Cwd != "" {
+		srv.WorkDir = srv.Cwd
+	}
+	if srv.WorkDir == "" && baseDir != "" {
+		srv.WorkDir = baseDir
+	}
+	if srv.WorkDir != "" && !filepath.IsAbs(srv.WorkDir) && baseDir != "" {
+		srv.WorkDir = filepath.Clean(filepath.Join(baseDir, srv.WorkDir))
+	}
+	if srv.Cwd != "" && !filepath.IsAbs(srv.Cwd) && baseDir != "" {
+		srv.Cwd = filepath.Clean(filepath.Join(baseDir, srv.Cwd))
+	}
 }
 
 func expandServerEnv(s *ServerConfig) {

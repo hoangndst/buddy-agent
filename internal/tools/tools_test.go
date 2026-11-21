@@ -421,3 +421,17 @@ func TestListDirectoryAndSearchFiles(t *testing.T) {
 	}
 }
 
+func TestBashTool_WithEnv(t *testing.T) {
+	tempDir := t.TempDir()
+	customEnv := append(os.Environ(), "BUDDY_CUSTOM_CALLER_ENV=verified_caller_val")
+	bash := NewBashTool(tempDir, 5*time.Second, WithEnv(customEnv))
+
+	out, err := bash.Execute(context.Background(), json.RawMessage(`{"command": "echo $BUDDY_CUSTOM_CALLER_ENV"}`))
+	if err != nil {
+		t.Fatalf("bash execute failed: %v", err)
+	}
+	if !strings.Contains(out, "verified_caller_val") {
+		t.Errorf("expected output to contain verified_caller_val, got: %s", out)
+	}
+}
+

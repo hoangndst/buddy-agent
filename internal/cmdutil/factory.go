@@ -19,9 +19,11 @@ type Factory struct {
 	MCPConfigLoader  func(projectDir, userHome string) (*mcp.Config, error)
 	WorkDir          func() (string, error)
 	UserHome         func() (string, error)
-	NewClientManager func(cfg *mcp.Config) *mcp.ClientManager
-	NewModelProvider func(cfg *config.Config, client *openai.Client) provider.ModelProvider
-	Store            func() (persistence.Store, func(), error)
+	Environ          func() []string
+	NewClientManager func(cfg *mcp.Config, baseEnv ...[]string) *mcp.ClientManager
+	NewModelProvider  func(cfg *config.Config, client *openai.Client) provider.ModelProvider
+	Store             func() (persistence.Store, func(), error)
+	StoreForWorkspace func(wsDir string, dbPath ...string) (persistence.Store, func(), error)
 }
 
 // NewFactory constructs a default production command factory.
@@ -32,8 +34,9 @@ func NewFactory() *Factory {
 		MCPConfigLoader: mcp.LoadConfig,
 		WorkDir:         os.Getwd,
 		UserHome:        os.UserHomeDir,
-		NewClientManager: func(cfg *mcp.Config) *mcp.ClientManager {
-			return mcp.NewClientManager(cfg)
+		Environ:          os.Environ,
+		NewClientManager: func(cfg *mcp.Config, baseEnv ...[]string) *mcp.ClientManager {
+			return mcp.NewClientManager(cfg, baseEnv...)
 		},
 		NewModelProvider: func(cfg *config.Config, client *openai.Client) provider.ModelProvider {
 			switch cfg.APIType {
@@ -55,6 +58,33 @@ func NewFactory() *Factory {
 			dbPath := cfg.DBPath
 			if dbPath == "" {
 				ws := cfg.WorkspaceDir
+				if ws == "" {
+					ws = "."
+				}
+				dbPath = filepath.Join(ws, ".buddy", "history.db")
+			}
+			store, err := persistence.NewSQLiteStore(dbPath)
+			if err != nil {
+				if home, homeErr := os.UserHomeDir(); homeErr == nil {
+					fallbackPath := filepath.Join(home, ".buddy", "history.db")
+					store, err = persistence.NewSQLiteStore(fallbackPath)
+				}
+				if err != nil {
+					return nil, nil, err
+				}
+			}
+			cleanup := func() {
+				_ = store.Close()
+			}
+			return store, cleanup, nil
+		},
+		StoreForWorkspace: func(wsDir string, customDBPath ...string) (persistence.Store, func(), error) {
+			var dbPath string
+			if len(customDBPath) > 0 && customDBPath[0] != "" {
+				dbPath = customDBPath[0]
+			}
+			if dbPath == "" {
+				ws := wsDir
 				if ws == "" {
 					ws = "."
 				}

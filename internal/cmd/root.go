@@ -6,16 +6,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
+	"github.com/hoangndst/buddy-agent/internal/client"
+	daemoncmd "github.com/hoangndst/buddy-agent/internal/cmd/daemon"
 	"github.com/hoangndst/buddy-agent/internal/cmd/doc"
 	mcpcmd "github.com/hoangndst/buddy-agent/internal/cmd/mcp"
 	sessioncmd "github.com/hoangndst/buddy-agent/internal/cmd/session"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
+	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	core "github.com/hoangndst/buddy-agent/internal/mcp"
 	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/persistence"
@@ -35,6 +43,9 @@ var (
 
 // NewRootCmd constructs the primary buddy-agent root command tree.
 func NewRootCmd(f *cmdutil.Factory) *cobra.Command {
+	var standalone bool
+	var socketPath string
+
 	rootCmd := &cobra.Command{
 		Use:   "buddy [task]",
 		Short: "buddy-agent is an autonomous software engineering agent",
@@ -44,16 +55,21 @@ three-partition context memory compaction, and Model Context Protocol (MCP) inte
 		Args:         cobra.ArbitraryArgs,
 		RunE: func(c *cobra.Command, args []string) error {
 			if len(args) > 0 {
-				return runTask(c.Context(), f, args)
+				return runTask(c.Context(), f, args, standalone, socketPath)
 			}
 			return runREPL(c.Context(), f)
 		},
 	}
 
+	rootCmd.PersistentFlags().BoolVar(&standalone, "standalone", false, "Run task in-process without connecting to the background daemon")
+	rootCmd.PersistentFlags().StringVar(&socketPath, "socket", "", "Path to the Unix domain socket")
+
 	rootCmd.AddCommand(mcpcmd.NewCmdMCP(f))
 	rootCmd.AddCommand(doc.NewCmdDoc(f))
 	rootCmd.AddCommand(sessioncmd.NewCmdSession(f))
 	rootCmd.AddCommand(NewCmdResume(f))
+	rootCmd.AddCommand(daemoncmd.NewCmdDaemon(f))
+	rootCmd.AddCommand(NewCmdAttach(f))
 
 	return rootCmd
 }
@@ -98,6 +114,33 @@ func formatToolPreview(name, rawArgs string) string {
 	return fmt.Sprintf("⚙ %s(%s)", name, rawArgs)
 }
 
+func absolutizePATHEntries(env []string, baseDir string) ([]string, error) {
+	baseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return nil, err
+	}
+
+	resolved := append([]string(nil), env...)
+	for i, envVar := range resolved {
+		key, value, ok := strings.Cut(envVar, "=")
+		if !ok || key != "PATH" && (runtime.GOOS != "windows" || !strings.EqualFold(key, "PATH")) {
+			continue
+		}
+		entries := filepath.SplitList(value)
+		for j, entry := range entries {
+			if entry == "" {
+				entry = "."
+			}
+			if !filepath.IsAbs(entry) {
+				entry = filepath.Join(baseDir, entry)
+			}
+			entries[j] = filepath.Clean(entry)
+		}
+		resolved[i] = key + "=" + strings.Join(entries, string(filepath.ListSeparator))
+	}
+	return resolved, nil
+}
+
 func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func(), error) {
 	cfg, err := f.ConfigLoader()
 	if err != nil {
@@ -129,7 +172,16 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 	memMgr := memory.NewManager(cfg.WorkspaceDir)
 	reg := tools.NewRegistry(cfg.MaxOutputChars)
 
-	reg.Register(tools.NewBashTool(cfg.WorkspaceDir, 60*time.Second, tools.WithMaxOutputBytes(cfg.MaxOutputChars)))
+	var callerEnv []string
+	if f.Environ != nil {
+		callerEnv = f.Environ()
+	}
+	var bashOpts []tools.BashToolOption
+	bashOpts = append(bashOpts, tools.WithMaxOutputBytes(cfg.MaxOutputChars))
+	if len(callerEnv) > 0 {
+		bashOpts = append(bashOpts, tools.WithEnv(callerEnv))
+	}
+	reg.Register(tools.NewBashTool(cfg.WorkspaceDir, 60*time.Second, bashOpts...))
 	reg.Register(tools.NewReadFileTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewListDirectoryTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewSearchFilesTool(cfg.WorkspaceDir))
@@ -144,7 +196,7 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 	home, _ := f.UserHome()
 	mcpCfg, mcpErr := f.MCPConfigLoader(wd, home)
 	if mcpErr == nil && mcpCfg != nil && len(mcpCfg.MCPServers) > 0 {
-		mcpMgr := f.NewClientManager(mcpCfg)
+		mcpMgr := f.NewClientManager(mcpCfg, callerEnv)
 		_ = mcpMgr.StartAll(ctx)
 		cleanupFunc = func() {
 			_ = mcpMgr.Close()
@@ -249,17 +301,170 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 	return engine, combinedCleanup, nil
 }
 
-func runTask(ctx context.Context, f *cmdutil.Factory, args []string) error {
+func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone bool, socketPath string) error {
+	task := strings.Join(args, " ")
+	if !standalone {
+		// Attempt to execute via background daemon
+		cl, err := client.ConnectOrSpawn(socketPath)
+		if err == nil {
+			defer func() { _ = cl.Close() }()
+			cfg, _ := f.ConfigLoader()
+			workspaceDir := ""
+			model := ""
+			maxSteps := 0
+			maxContextTokens := 0
+			var reasoningEffort *string
+			baseURL := ""
+			var apiKey *string
+			apiType := ""
+			dbPath := ""
+			maxOutputChars := 0
+			workingTailSize := 0
+			if cfg != nil {
+				workspaceDir = cfg.WorkspaceDir
+				model = cfg.Model
+				maxSteps = cfg.MaxSteps
+				maxContextTokens = cfg.MaxContextTokens
+				r := cfg.ReasoningEffort
+				reasoningEffort = &r
+				baseURL = cfg.BaseURL
+				k := cfg.APIKey
+				apiKey = &k
+				apiType = cfg.APIType
+				dbPath = cfg.DBPath
+				maxOutputChars = cfg.MaxOutputChars
+				workingTailSize = cfg.WorkingTailSize
+			}
+			if dbPath != "" && dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") && !filepath.IsAbs(dbPath) {
+				if wd, err := f.WorkDir(); err == nil && wd != "" {
+					dbPath = filepath.Clean(filepath.Join(wd, dbPath))
+				}
+			}
+			effectiveDir := workspaceDir
+			if effectiveDir == "" {
+				effectiveDir, _ = f.WorkDir()
+			}
+			var mcpCfg *core.Config
+			if f.MCPConfigLoader != nil {
+				home, _ := f.UserHome()
+				mcpCfg, _ = f.MCPConfigLoader(effectiveDir, home)
+			}
+			var callerEnv []string
+			if f.Environ != nil {
+				callerEnv = f.Environ()
+			}
+			callerDir := ""
+			if f.WorkDir != nil {
+				callerDir, _ = f.WorkDir()
+			}
+			if callerDir == "" {
+				var err error
+				callerDir, err = os.Getwd()
+				if err != nil {
+					return fmt.Errorf("failed to resolve caller working directory: %w", err)
+				}
+			}
+			callerEnv, err = absolutizePATHEntries(callerEnv, callerDir)
+			if err != nil {
+				return fmt.Errorf("failed to resolve caller PATH entries: %w", err)
+			}
+			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{
+				Task:             task,
+				WorkspaceDir:     workspaceDir,
+				Model:            model,
+				MaxSteps:         maxSteps,
+				MaxContextTokens: maxContextTokens,
+				MaxOutputChars:   maxOutputChars,
+				WorkingTailSize:  workingTailSize,
+				ReasoningEffort:  reasoningEffort,
+				BaseURL:          baseURL,
+				APIKey:           apiKey,
+				APIType:          apiType,
+				MCPConfig:        mcpCfg,
+				DBPath:           dbPath,
+				Env:              callerEnv,
+			})
+			if startErr != nil {
+				// Avoid ambiguous double-execution: if daemon connection succeeded but start failed, abort immediately
+				return fmt.Errorf("failed to start daemon session: %w", startErr)
+			}
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "Dispatched task to daemon (Session ID: %s)\n", sessionID)
+			return streamClientEvents(ctx, f, cl, sessionID)
+		}
+		// Graceful fallback to standalone ONLY if daemon connection/spawn failed before request submission
+		_, _ = fmt.Fprintln(f.IOStreams.Out, "Notice: Daemon unavailable; running task in-process.")
+	}
+
 	engine, cleanup, err := setupEngine(ctx, f)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	task := strings.Join(args, " ")
 	_, _ = fmt.Fprintf(f.IOStreams.Out, "Executing task: %s\n", task)
 	_, err = engine.Run(ctx, task)
 	return err
+}
+
+func streamClientEvents(ctx context.Context, f *cmdutil.Factory, cl *client.Client, sessionID string) error {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	inputScanner := bufio.NewScanner(f.IOStreams.In)
+	permCh := cl.Permissions()
+	eventsCh := cl.Events()
+
+	for {
+		select {
+		case <-sigCh:
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "\nDetaching from session %s. Task continues in background.\nRun 'buddy attach %s' to reconnect.\n", sessionID, sessionID)
+			_ = cl.DetachSession(sessionID)
+			return nil
+
+		case <-ctx.Done():
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "\nDetaching from session %s. Task continues in background.\nRun 'buddy attach %s' to reconnect.\n", sessionID, sessionID)
+			_ = cl.DetachSession(sessionID)
+			return nil
+
+		case req, ok := <-permCh:
+			if !ok {
+				permCh = nil
+				continue
+			}
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "\n%s Tool %s requests permission with arguments: %+v\nAllow? [y/N]: ",
+				toolStyle.Render("⚡ [PERMISSION REQUIRED]"), req.Tool, req.Arguments)
+			decision := "deny"
+			if inputScanner.Scan() {
+				text := strings.TrimSpace(strings.ToLower(inputScanner.Text()))
+				if text == "y" || text == "yes" {
+					decision = "allow"
+				}
+			}
+			_ = cl.RespondPermission(req.RequestID, decision)
+
+		case evt, ok := <-eventsCh:
+			if !ok {
+				return fmt.Errorf("connection to daemon closed unexpectedly before session completed")
+			}
+			renderEvent(f, evt)
+			if evt.Type == string(agent.EventFinished) {
+				return nil
+			}
+			if evt.Type == string(agent.EventError) {
+				isTerminal, _ := evt.Data["terminal"].(bool)
+				if isTerminal {
+					errMsg := evt.Content
+					if errMsg == "" && evt.Data != nil {
+						if e, ok := evt.Data["error"].(string); ok {
+							errMsg = e
+						}
+					}
+					return fmt.Errorf("task failed: %s", errMsg)
+				}
+			}
+		}
+	}
 }
 
 func runREPL(ctx context.Context, f *cmdutil.Factory) error {

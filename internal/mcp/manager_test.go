@@ -263,3 +263,26 @@ func TestManager_DisambiguateToolCollisions(t *testing.T) {
 		t.Fatalf("tool names must not exceed 64 runes: len1=%d, len2=%d", len(name1), len(name2))
 	}
 }
+
+func TestClientManager_BaseEnv(t *testing.T) {
+	t.Run("NilBaseEnv", func(t *testing.T) {
+		mgr := NewClientManager(nil)
+		if mgr.BaseEnv() != nil {
+			t.Errorf("expected nil BaseEnv, got %+v", mgr.BaseEnv())
+		}
+	})
+
+	t.Run("ProvidedBaseEnv", func(t *testing.T) {
+		env := []string{"FOO=BAR", "BAZ=QUX"}
+		mgr := NewClientManager(nil, env)
+		got := mgr.BaseEnv()
+		if len(got) != 2 || got[0] != "FOO=BAR" || got[1] != "BAZ=QUX" {
+			t.Errorf("expected %+v, got %+v", env, got)
+		}
+		// Ensure copy
+		got[0] = "MODIFIED"
+		if mgr.BaseEnv()[0] != "FOO=BAR" {
+			t.Error("BaseEnv() should return an isolated copy")
+		}
+	})
+}

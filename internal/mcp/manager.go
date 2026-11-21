@@ -20,20 +20,26 @@ import (
 type ClientManager struct {
 	mu            sync.RWMutex
 	cfg           *Config
+	baseEnv       []string
 	client        *mcp.Client
 	sessions      map[string]*mcp.ClientSession
 	states        map[string]ServerState
 	supervisors   map[string]subprocess.Supervisor
 	cmds          map[string]*exec.Cmd
-	stderrBuffers map[string]*rollingBuffer
+	stderrBuffers map[string]*RollingBuffer
 	tools         []tools.Tool
 	closed        bool
 }
 
 // NewClientManager constructs a new ClientManager.
-func NewClientManager(cfg *Config) *ClientManager {
+func NewClientManager(cfg *Config, baseEnv ...[]string) *ClientManager {
 	if cfg == nil {
 		cfg = &Config{MCPServers: make(map[string]ServerConfig)}
+	}
+	var env []string
+	if len(baseEnv) > 0 && baseEnv[0] != nil {
+		env = make([]string, len(baseEnv[0]))
+		copy(env, baseEnv[0])
 	}
 	client := mcp.NewClient(&mcp.Implementation{
 		Name:    "buddy-agent",
@@ -42,14 +48,27 @@ func NewClientManager(cfg *Config) *ClientManager {
 
 	return &ClientManager{
 		cfg:           cfg,
+		baseEnv:       env,
 		client:        client,
 		sessions:      make(map[string]*mcp.ClientSession),
 		states:        make(map[string]ServerState),
 		supervisors:   make(map[string]subprocess.Supervisor),
 		cmds:          make(map[string]*exec.Cmd),
-		stderrBuffers: make(map[string]*rollingBuffer),
+		stderrBuffers: make(map[string]*RollingBuffer),
 		tools:         make([]tools.Tool, 0),
 	}
+}
+
+// BaseEnv returns a copy of the base environment configured for stdio MCP subprocesses.
+func (m *ClientManager) BaseEnv() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.baseEnv == nil {
+		return nil
+	}
+	res := make([]string, len(m.baseEnv))
+	copy(res, m.baseEnv)
+	return res
 }
 
 // Tools returns a snapshot of all discovered and filtered tool adapters across active servers.
@@ -142,11 +161,11 @@ func (m *ClientManager) StartAll(ctx context.Context) map[string]error {
 			var transport mcp.Transport
 			var cmd *exec.Cmd
 			var sup subprocess.Supervisor
-			var stderrBuf *rollingBuffer
+			var stderrBuf *RollingBuffer
 			var prepErr error
 
 			if cfg.TransportType() == TransportStdio {
-				cmd, sup, stderrBuf, prepErr = buildStdioCommand(cfg)
+				stdioTransport, prepErr := NewStdioTransport(cfg, m.baseEnv)
 				if prepErr != nil {
 					errMu.Lock()
 					errMap[srvName] = prepErr
@@ -164,7 +183,10 @@ func (m *ClientManager) StartAll(ctx context.Context) map[string]error {
 					fmt.Fprintf(os.Stderr, "Warning: MCP server %q failed to prepare: %v\n", srvName, prepErr)
 					return
 				}
-				transport = newSupervisedCommandTransport(cmd, sup)
+				transport = stdioTransport
+				cmd = stdioTransport.Cmd()
+				sup = stdioTransport.Supervisor()
+				stderrBuf = stdioTransport.StderrBuffer()
 			} else {
 				transport, prepErr = newStreamableTransport(cfg)
 				if prepErr != nil {

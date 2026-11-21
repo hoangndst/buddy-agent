@@ -2,12 +2,18 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
+	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
 	"github.com/hoangndst/buddy-agent/internal/config"
+	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
+	core "github.com/hoangndst/buddy-agent/internal/mcp"
 	"github.com/openai/openai-go"
 )
 
@@ -32,6 +38,12 @@ func TestRootCmd_StructureAndSubcommands(t *testing.T) {
 	}
 	if !subcommands["doc"] {
 		t.Error("expected 'doc' subcommand to be attached")
+	}
+	if !subcommands["daemon"] {
+		t.Error("expected 'daemon' subcommand to be attached")
+	}
+	if !subcommands["attach"] {
+		t.Error("expected 'attach' subcommand to be attached")
 	}
 }
 
@@ -181,7 +193,7 @@ func TestRootCmd_TaskExecution_FormattingAndNoRawStepHeaders(t *testing.T) {
 	}
 
 	rootCmd := NewRootCmd(f)
-	rootCmd.SetArgs([]string{"list files"})
+	rootCmd.SetArgs([]string{"--standalone", "list files"})
 	if err := rootCmd.Execute(); err != nil {
 		t.Fatalf("task execution failed: %v", err)
 	}
@@ -211,5 +223,234 @@ func TestRootCmd_TaskExecution_FormattingAndNoRawStepHeaders(t *testing.T) {
 	// Done banner
 	if !strings.Contains(out, "✓ Done") {
 		t.Errorf("expected Done banner in output, got:\n%s", out)
+	}
+}
+
+func TestRenderEvent_ToolResultDelegatedOutput(t *testing.T) {
+	f := cmdutil.NewFactory()
+	ioStreams, _, outBuf, _ := cmdutil.TestIOStreams()
+	f.IOStreams = ioStreams
+
+	evt := protocol.SessionEventNotification{
+		Type:    string(agent.EventToolResult),
+		Content: "  [subagent:researcher] ",
+		Data: map[string]any{
+			"tool_result": "found 4 matches in src/main.go",
+		},
+	}
+	renderEvent(f, evt)
+
+	out := outBuf.String()
+	if !strings.Contains(out, "found 4 matches in src/main.go") {
+		t.Errorf("expected output to contain delegated tool result, got:\n%s", out)
+	}
+	if !strings.Contains(out, "[subagent:researcher]") {
+		t.Errorf("expected output to preserve subagent label, got:\n%s", out)
+	}
+}
+
+func TestRenderEvent_TextComplete(t *testing.T) {
+	f := cmdutil.NewFactory()
+	ioStreams, _, outBuf, _ := cmdutil.TestIOStreams()
+	f.IOStreams = ioStreams
+
+	evt := protocol.SessionEventNotification{
+		Type:    string(agent.EventTextComplete),
+		Content: "I have prepared the changes and will now execute the build.",
+	}
+	renderEvent(f, evt)
+
+	out := outBuf.String()
+	if !strings.Contains(out, "I have prepared the changes and will now execute the build.") {
+		t.Errorf("expected conversational text in output, got:\n%s", out)
+	}
+}
+
+func TestSetupEngine_PassesCallerEnvToMCPManager(t *testing.T) {
+	f := cmdutil.NewFactory()
+	tempDir := t.TempDir()
+
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			APIKey:           "test-key",
+			Model:            "test-model",
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   1000,
+			MaxContextTokens: 4096,
+		}, nil
+	}
+
+	callerEnv := []string{
+		"BUDDY_CLI_TOKEN=custom_cli_token_999",
+		"BUDDY_CLI_SETTING=1",
+	}
+	f.Environ = func() []string {
+		return callerEnv
+	}
+
+	f.MCPConfigLoader = func(_, _ string) (*core.Config, error) {
+		return &core.Config{
+			MCPServers: map[string]core.ServerConfig{
+				"test-mcp-server": {Command: "echo"},
+			},
+		}, nil
+	}
+
+	var observedBaseEnv []string
+	f.NewClientManager = func(cfg *core.Config, baseEnv ...[]string) *core.ClientManager {
+		if len(baseEnv) > 0 {
+			observedBaseEnv = baseEnv[0]
+		}
+		return core.NewClientManager(cfg, baseEnv...)
+	}
+
+	eng, cleanup, err := setupEngine(context.Background(), f)
+	if err != nil {
+		t.Fatalf("setupEngine failed: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+
+	if len(observedBaseEnv) != len(callerEnv) {
+		t.Fatalf("expected observedBaseEnv length %d, got %d", len(callerEnv), len(observedBaseEnv))
+	}
+	for i, val := range callerEnv {
+		if observedBaseEnv[i] != val {
+			t.Errorf("expected observedBaseEnv[%d] = %q, got %q", i, val, observedBaseEnv[i])
+		}
+	}
+}
+
+func TestRunTask_ForwardsParamsAndPreservesSpecialDB(t *testing.T) {
+	tempDir := t.TempDir()
+
+	tests := []struct {
+		name               string
+		configuredDB       string
+		expectedDB         string
+		configuredMaxChars int
+		expectedMaxChars   int
+	}{
+		{
+			name:               "exact memory special name preserved",
+			configuredDB:       ":memory:",
+			expectedDB:         ":memory:",
+			configuredMaxChars: 25000,
+			expectedMaxChars:   25000,
+		},
+		{
+			name:               "file URI in-memory preserved",
+			configuredDB:       "file:memdb?mode=memory&cache=shared",
+			expectedDB:         "file:memdb?mode=memory&cache=shared",
+			configuredMaxChars: 30000,
+			expectedMaxChars:   30000,
+		},
+		{
+			name:               "relative file path absolutized",
+			configuredDB:       "test_history.db",
+			expectedDB:         filepath.Join(tempDir, "test_history.db"),
+			configuredMaxChars: 15000,
+			expectedMaxChars:   15000,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sockDir := t.TempDir()
+			sockFile := filepath.Join(sockDir, "d.sock")
+			listener, err := net.Listen("unix", sockFile)
+			if err != nil {
+				t.Fatalf("failed to bind listener: %v", err)
+			}
+			defer func() { _ = listener.Close() }()
+
+			var receivedParams protocol.SessionStartParams
+			serverErrCh := make(chan error, 1)
+
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					serverErrCh <- err
+					return
+				}
+				defer func() { _ = conn.Close() }()
+
+				codec := protocol.NewStreamCodec(conn, conn)
+				msg, err := codec.ReadMessage()
+				if err != nil {
+					serverErrCh <- err
+					return
+				}
+
+				if msg.Method == protocol.MethodSessionStart {
+					_ = json.Unmarshal(msg.Params, &receivedParams)
+					res, _ := protocol.NewResponse(*msg.ID, protocol.SessionStartResult{SessionID: "sess-test"})
+					_ = codec.WriteMessage(res)
+
+					// Send finished notification to conclude the stream
+					notif, _ := protocol.NewNotification(protocol.NotifySessionEvent, protocol.SessionEventNotification{
+						Type: string(agent.EventFinished),
+					})
+					_ = codec.WriteMessage(notif)
+				}
+				serverErrCh <- nil
+			}()
+
+			f := cmdutil.NewFactory()
+			ioStreams, _, _, _ := cmdutil.TestIOStreams()
+			f.IOStreams = ioStreams
+			f.WorkDir = func() (string, error) {
+				return tempDir, nil
+			}
+			f.Environ = func() []string {
+				return []string{"PATH=./node_modules/.bin"}
+			}
+			f.ConfigLoader = func() (*config.Config, error) {
+				return &config.Config{
+					APIKey:           "key",
+					Model:            "model",
+					WorkspaceDir:     tempDir,
+					DBPath:           tc.configuredDB,
+					MaxOutputChars:   tc.configuredMaxChars,
+					WorkingTailSize:  7,
+					MaxContextTokens: 4096,
+				}, nil
+			}
+
+			rootCmd := NewRootCmd(f)
+			rootCmd.SetArgs([]string{"--socket", sockFile, "do something"})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("rootCmd.Execute failed: %v", err)
+			}
+
+			if err := <-serverErrCh; err != nil {
+				t.Fatalf("server mock error: %v", err)
+			}
+
+			if receivedParams.DBPath != tc.expectedDB {
+				t.Errorf("expected DBPath %q, got %q", tc.expectedDB, receivedParams.DBPath)
+			}
+			if receivedParams.MaxOutputChars != tc.expectedMaxChars {
+				t.Errorf("expected MaxOutputChars %d, got %d", tc.expectedMaxChars, receivedParams.MaxOutputChars)
+			}
+			if receivedParams.WorkingTailSize != 7 {
+				t.Errorf("expected WorkingTailSize 7, got %d", receivedParams.WorkingTailSize)
+			}
+			wantPATH := "PATH=" + filepath.Join(tempDir, "node_modules", ".bin")
+			foundPATH := false
+			for _, env := range receivedParams.Env {
+				if env == wantPATH {
+					foundPATH = true
+					break
+				}
+			}
+			if !foundPATH {
+				t.Errorf("expected caller-relative PATH to be forwarded as %q, got %v", wantPATH, receivedParams.Env)
+			}
+		})
 	}
 }
