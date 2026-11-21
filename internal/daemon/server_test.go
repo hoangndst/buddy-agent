@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -217,6 +218,14 @@ func TestServer_DoneSignalsAfterDrain(t *testing.T) {
 		// Done channel closed after Stop
 	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for server.Done() to close")
+	}
+
+	lockPath := sockPath + ".lock"
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Errorf("expected lock file %s to remain on disk after server.Stop, got: %v", lockPath, err)
+	}
+	if _, err := os.Stat(sockPath); !os.IsNotExist(err) {
+		t.Errorf("expected socket file %s to be unlinked after server.Stop", sockPath)
 	}
 }
 

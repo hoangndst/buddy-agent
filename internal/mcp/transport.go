@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -64,18 +66,70 @@ func (rt *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	return base.RoundTrip(r)
 }
 
+// isExecutable verifies that the file exists, is not a directory,
+// and has executable permissions.
+func isExecutable(file string) bool {
+	info, err := os.Stat(file)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return info.Mode().Perm()&0111 != 0
+}
+
+// lookPathIn searches for file in the directories specified by pathList.
+// On success, it resolves and returns the absolute executable path.
+func lookPathIn(file string, pathList string) (string, error) {
+	if strings.ContainsRune(file, filepath.Separator) || strings.ContainsRune(file, '/') {
+		if isExecutable(file) {
+			absPath, err := filepath.Abs(file)
+			if err != nil {
+				return file, nil
+			}
+			return absPath, nil
+		}
+		return "", exec.ErrNotFound
+	}
+
+	dirs := filepath.SplitList(pathList)
+	for _, dir := range dirs {
+		if dir == "" {
+			dir = "."
+		}
+		target := filepath.Join(dir, file)
+		if runtime.GOOS == "windows" && filepath.Ext(file) == "" {
+			for _, ext := range []string{".exe", ".cmd", ".bat", ".com"} {
+				candidate := target + ext
+				if isExecutable(candidate) {
+					absPath, err := filepath.Abs(candidate)
+					if err != nil {
+						return candidate, nil
+					}
+					return absPath, nil
+				}
+			}
+		}
+		if isExecutable(target) {
+			absPath, err := filepath.Abs(target)
+			if err != nil {
+				return target, nil
+			}
+			return absPath, nil
+		}
+	}
+	return "", exec.ErrNotFound
+}
+
 // buildStdioCommand prepares an exec.Cmd with environment merging,
 // process group supervisor preparation, and rolling stderr buffer attachment.
 func buildStdioCommand(srv ServerConfig, baseEnv ...[]string) (*exec.Cmd, subprocess.Supervisor, *RollingBuffer, error) {
 	if srv.Command == "" {
 		return nil, nil, nil, fmt.Errorf("stdio server requires a command: %w", ErrMissingCommandOrURL)
-	}
-
-	cmd := exec.Command(srv.Command, srv.Args...)
-	if srv.WorkDir != "" {
-		cmd.Dir = srv.WorkDir
-	} else if srv.Cwd != "" {
-		cmd.Dir = srv.Cwd
 	}
 
 	var initialEnv []string
@@ -96,6 +150,33 @@ func buildStdioCommand(srv ServerConfig, baseEnv ...[]string) (*exec.Cmd, subpro
 	for k, v := range srv.Env {
 		envMap[k] = v
 	}
+
+	resolvedPath := srv.Command
+	if !strings.ContainsRune(srv.Command, filepath.Separator) && !strings.ContainsRune(srv.Command, '/') {
+		pathVal, ok := envMap["PATH"]
+		if !ok && runtime.GOOS == "windows" {
+			for k, v := range envMap {
+				if strings.EqualFold(k, "PATH") {
+					pathVal = v
+					ok = true
+					break
+				}
+			}
+		}
+		if ok {
+			if lp, err := lookPathIn(srv.Command, pathVal); err == nil {
+				resolvedPath = lp
+			}
+		}
+	}
+
+	cmd := exec.Command(resolvedPath, srv.Args...)
+	if srv.WorkDir != "" {
+		cmd.Dir = srv.WorkDir
+	} else if srv.Cwd != "" {
+		cmd.Dir = srv.Cwd
+	}
+
 	var mergedEnv []string
 	for k, v := range envMap {
 		mergedEnv = append(mergedEnv, fmt.Sprintf("%s=%s", k, v))

@@ -119,7 +119,6 @@ func (m *SocketManager) releaseLock() {
 		_ = releaseFileLock(m.lockFile)
 		_ = m.lockFile.Close()
 		m.lockFile = nil
-		_ = os.Remove(m.lockPath)
 	}
 }
 

@@ -1,6 +1,11 @@
 package mcp
 
 import (
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -167,5 +172,153 @@ func TestStdioTransport_Accessors(t *testing.T) {
 	}
 	if transport.StderrText() != "" {
 		t.Errorf("expected empty initial StderrText, got %q", transport.StderrText())
+	}
+}
+
+func TestStdioTransport_ResolveBareCommandInCustomPATH(t *testing.T) {
+	tempDir := t.TempDir()
+	binName := "custom-runner"
+	targetPath := filepath.Join(tempDir, binName)
+	if runtime.GOOS == "windows" {
+		targetPath = filepath.Join(tempDir, binName+".bat")
+		if err := os.WriteFile(targetPath, []byte("@echo off\r\necho custom\r\n"), 0755); err != nil {
+			t.Fatalf("failed to create script: %v", err)
+		}
+	} else {
+		if err := os.WriteFile(targetPath, []byte("#!/bin/sh\necho custom\n"), 0755); err != nil {
+			t.Fatalf("failed to create script: %v", err)
+		}
+	}
+
+	baseEnv := []string{
+		"PATH=" + tempDir,
+	}
+	srv := ServerConfig{
+		Command: binName,
+	}
+
+	transport, err := NewStdioTransport(srv, baseEnv)
+	if err != nil {
+		t.Fatalf("NewStdioTransport failed: %v", err)
+	}
+
+	cmd := transport.Cmd()
+	if cmd == nil {
+		t.Fatal("expected non-nil cmd")
+	}
+
+	expectedAbs, err := filepath.Abs(targetPath)
+	if err != nil {
+		t.Fatalf("filepath.Abs failed: %v", err)
+	}
+	if cmd.Path != expectedAbs {
+		t.Errorf("expected cmd.Path %q, got %q", expectedAbs, cmd.Path)
+	}
+}
+
+func TestStdioTransport_CustomPATH_PrecedenceOverHost(t *testing.T) {
+	tempDir := t.TempDir()
+	binName := "node"
+	targetPath := filepath.Join(tempDir, binName)
+	if runtime.GOOS == "windows" {
+		targetPath = filepath.Join(tempDir, binName+".bat")
+		if err := os.WriteFile(targetPath, []byte("@echo off\r\necho custom-node\r\n"), 0755); err != nil {
+			t.Fatalf("failed to create script: %v", err)
+		}
+	} else {
+		if err := os.WriteFile(targetPath, []byte("#!/bin/sh\necho custom-node\n"), 0755); err != nil {
+			t.Fatalf("failed to create script: %v", err)
+		}
+	}
+
+	// Place tempDir at the front of PATH so it takes precedence over host PATH
+	hostPath := os.Getenv("PATH")
+	customPath := tempDir + string(filepath.ListSeparator) + hostPath
+
+	baseEnv := []string{
+		"PATH=" + customPath,
+	}
+	srv := ServerConfig{
+		Command: binName,
+	}
+
+	transport, err := NewStdioTransport(srv, baseEnv)
+	if err != nil {
+		t.Fatalf("NewStdioTransport failed: %v", err)
+	}
+
+	cmd := transport.Cmd()
+	if cmd == nil {
+		t.Fatal("expected non-nil cmd")
+	}
+
+	expectedAbs, err := filepath.Abs(targetPath)
+	if err != nil {
+		t.Fatalf("filepath.Abs failed: %v", err)
+	}
+	if cmd.Path != expectedAbs {
+		t.Errorf("expected cmd.Path to resolve to custom directory %q, got %q", expectedAbs, cmd.Path)
+	}
+}
+
+func TestLookPathIn(t *testing.T) {
+	tempDir := t.TempDir()
+	dirA := filepath.Join(tempDir, "a")
+	dirB := filepath.Join(tempDir, "b")
+	if err := os.MkdirAll(dirA, 0755); err != nil {
+		t.Fatalf("mkdir dirA: %v", err)
+	}
+	if err := os.MkdirAll(dirB, 0755); err != nil {
+		t.Fatalf("mkdir dirB: %v", err)
+	}
+
+	toolName := "mytool"
+	pathB := filepath.Join(dirB, toolName)
+	if runtime.GOOS == "windows" {
+		pathB = filepath.Join(dirB, toolName+".bat")
+		if err := os.WriteFile(pathB, []byte("@echo off\r\n"), 0755); err != nil {
+			t.Fatalf("write pathB: %v", err)
+		}
+	} else {
+		if err := os.WriteFile(pathB, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+			t.Fatalf("write pathB: %v", err)
+		}
+	}
+
+	pathList := dirA + string(filepath.ListSeparator) + dirB
+	resolved, err := lookPathIn(toolName, pathList)
+	if err != nil {
+		t.Fatalf("lookPathIn failed: %v", err)
+	}
+	expectedAbs, _ := filepath.Abs(pathB)
+	if resolved != expectedAbs {
+		t.Errorf("expected %q, got %q", expectedAbs, resolved)
+	}
+
+	// Non-existent command returns ErrNotFound
+	_, err = lookPathIn("non-existent-binary-12345", pathList)
+	if !errors.Is(err, exec.ErrNotFound) {
+		t.Errorf("expected exec.ErrNotFound, got: %v", err)
+	}
+
+	// Command with path separator evaluated directly
+	directResolved, err := lookPathIn(pathB, "")
+	if err != nil {
+		t.Fatalf("lookPathIn direct path failed: %v", err)
+	}
+	if directResolved != expectedAbs {
+		t.Errorf("expected direct %q, got %q", expectedAbs, directResolved)
+	}
+
+	// Unix-only: test non-executable permissions skipped
+	if runtime.GOOS != "windows" {
+		nonExec := filepath.Join(dirA, "noexec")
+		if err := os.WriteFile(nonExec, []byte("#!/bin/sh\n"), 0644); err != nil {
+			t.Fatalf("write noexec: %v", err)
+		}
+		_, err = lookPathIn("noexec", dirA)
+		if !errors.Is(err, exec.ErrNotFound) {
+			t.Errorf("expected ErrNotFound for non-executable file, got: %v", err)
+		}
 	}
 }

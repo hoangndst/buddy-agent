@@ -50,6 +50,15 @@ func TestSocketManager_AcquireAndDoubleLock(t *testing.T) {
 		t.Fatalf("failed to close mgr1: %v", err)
 	}
 
+	// Verify companion lock file remains permanently on disk, but socket file is unlinked
+	lockPath := sockPath + ".lock"
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("expected lock file %s to remain on disk after Close, got: %v", lockPath, err)
+	}
+	if _, err := os.Stat(sockPath); !os.IsNotExist(err) {
+		t.Fatalf("expected socket file %s to be unlinked after Close", sockPath)
+	}
+
 	// Now mgr2 should be able to acquire and bind cleanly
 	listener2, err := mgr2.AcquireLockAndBind()
 	if err != nil {
@@ -58,6 +67,45 @@ func TestSocketManager_AcquireAndDoubleLock(t *testing.T) {
 	defer func() { _ = mgr2.Close() }()
 	if listener2 == nil {
 		t.Fatalf("expected non-nil listener from mgr2")
+	}
+}
+
+func TestSocketManager_LockFilePreservedOnShutdown(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "preserve.sock")
+	lockPath := sockPath + ".lock"
+
+	mgr1 := NewSocketManager(sockPath)
+	l1, err := mgr1.AcquireLockAndBind()
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	if l1 == nil {
+		t.Fatal("expected non-nil listener")
+	}
+
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("lock file %s not found while active: %v", lockPath, err)
+	}
+
+	if err := mgr1.Close(); err != nil {
+		t.Fatalf("mgr1 close failed: %v", err)
+	}
+
+	// Lock file must still exist after shutdown
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("lock file %s must remain permanently after shutdown: %v", lockPath, err)
+	}
+
+	// Immediate re-acquire by new manager must succeed
+	mgr2 := NewSocketManager(sockPath)
+	l2, err := mgr2.AcquireLockAndBind()
+	if err != nil {
+		t.Fatalf("second acquire failed to reuse existing lock file: %v", err)
+	}
+	defer func() { _ = mgr2.Close() }()
+	if l2 == nil {
+		t.Fatal("expected non-nil listener on second acquire")
 	}
 }
 
