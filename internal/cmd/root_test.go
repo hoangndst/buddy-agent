@@ -413,6 +413,7 @@ func TestRunTask_ForwardsParamsAndPreservesSpecialDB(t *testing.T) {
 					WorkspaceDir:     tempDir,
 					DBPath:           tc.configuredDB,
 					MaxOutputChars:   tc.configuredMaxChars,
+					WorkingTailSize:  7,
 					MaxContextTokens: 4096,
 				}, nil
 			}
@@ -432,6 +433,9 @@ func TestRunTask_ForwardsParamsAndPreservesSpecialDB(t *testing.T) {
 			}
 			if receivedParams.MaxOutputChars != tc.expectedMaxChars {
 				t.Errorf("expected MaxOutputChars %d, got %d", tc.expectedMaxChars, receivedParams.MaxOutputChars)
+			}
+			if receivedParams.WorkingTailSize != 7 {
+				t.Errorf("expected WorkingTailSize 7, got %d", receivedParams.WorkingTailSize)
 			}
 		})
 	}

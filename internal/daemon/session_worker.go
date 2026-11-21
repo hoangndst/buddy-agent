@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
@@ -136,13 +137,50 @@ func (w *SessionWorker) Start() {
 	}()
 }
 
+// maxNotificationFieldBytes defines the maximum byte size for individual large string fields
+// in event notifications to ensure the total JSON-RPC frame stays well within DefaultMaxMessageSize.
+const maxNotificationFieldBytes = 256 * 1024
+
+func truncateForEvent(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	const suffix = "\n... [output truncated for streaming]"
+	if maxBytes <= len(suffix) {
+		return s[:utf8SafePrefix(s, maxBytes)]
+	}
+	return s[:utf8SafePrefix(s, maxBytes-len(suffix))] + suffix
+}
+
+func utf8SafePrefix(s string, maxBytes int) int {
+	if maxBytes > len(s) {
+		maxBytes = len(s)
+	}
+	for maxBytes > 0 && maxBytes < len(s) && !utf8.RuneStart(s[maxBytes]) {
+		maxBytes--
+	}
+	return maxBytes
+}
+
 func createEventNotification(sessionID string, eventID uint64, evt agent.Event, terminal bool) (*protocol.JSONRPCMessage, error) {
 	content := evt.Content
 	if content == "" && evt.ToolResult != "" {
-		content = evt.ToolResult
+		if len(evt.ToolResult) > 1024 {
+			content = evt.ToolResult[:utf8SafePrefix(evt.ToolResult, 1024)] + "..."
+		} else {
+			content = evt.ToolResult
+		}
 	}
 	if content == "" && evt.Error != nil {
 		content = evt.Error.Error()
+	}
+	if len(content) > maxNotificationFieldBytes {
+		content = truncateForEvent(content, maxNotificationFieldBytes)
+	}
+
+	toolResult := evt.ToolResult
+	if len(toolResult) > maxNotificationFieldBytes {
+		toolResult = truncateForEvent(toolResult, maxNotificationFieldBytes)
 	}
 
 	data := map[string]any{
@@ -150,11 +188,11 @@ func createEventNotification(sessionID string, eventID uint64, evt agent.Event, 
 		"tool_name":    evt.ToolName,
 		"tool_call_id": evt.ToolCallID,
 		"exit_code":    evt.ToolExitCode,
-		"tool_result":  evt.ToolResult,
+		"tool_result":  toolResult,
 		"terminal":     terminal,
 	}
 	if evt.Error != nil {
-		data["error"] = evt.Error.Error()
+		data["error"] = truncateForEvent(evt.Error.Error(), maxNotificationFieldBytes)
 	}
 
 	return protocol.NewNotification(protocol.NotifySessionEvent, protocol.SessionEventNotification{

@@ -303,6 +303,11 @@ func buildEngineForSession(
 	})
 	reg.Register(subTool)
 
+	workingTailSize := cfg.WorkingTailSize
+	if params.WorkingTailSize > 0 {
+		workingTailSize = params.WorkingTailSize
+	}
+
 	eng := agent.NewEngine(
 		prov,
 		model,
@@ -311,7 +316,7 @@ func buildEngineForSession(
 		memMgr,
 		emitHandler,
 		agent.WithMaxContextTokens(maxCtx),
-		agent.WithWorkingTailSize(cfg.WorkingTailSize),
+		agent.WithWorkingTailSize(workingTailSize),
 		agent.WithIsLocal(isLocal),
 		agent.WithReasoningEffort(effort),
 		agent.WithStore(store),

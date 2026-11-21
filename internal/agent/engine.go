@@ -190,6 +190,11 @@ func (e *Engine) Registry() *tools.Registry {
 	return e.registry
 }
 
+// WorkingTailSize returns the configured unpruned active turn tail size.
+func (e *Engine) WorkingTailSize() int {
+	return e.workingTailSize
+}
+
 // NewEngine creates a new Agent Engine.
 func NewEngine(
 	prov provider.ModelProvider,

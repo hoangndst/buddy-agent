@@ -19,6 +19,7 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 		Task:             "run tests",
 		MaxContextTokens: 32000,
 		MaxOutputChars:   50000,
+		WorkingTailSize:  10,
 		APIType:          "responses",
 		ReasoningEffort:  &effort,
 		DBPath:           "/custom/path.db",
@@ -67,6 +68,9 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	}
 	if params.MaxOutputChars != 50000 {
 		t.Fatalf("expected max output chars 50000, got %d", params.MaxOutputChars)
+	}
+	if params.WorkingTailSize != 10 {
+		t.Fatalf("expected working tail size 10, got %d", params.WorkingTailSize)
 	}
 	if params.APIType != "responses" {
 		t.Fatalf("expected api type 'responses', got %q", params.APIType)

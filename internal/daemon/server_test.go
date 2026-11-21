@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -296,5 +297,58 @@ func TestServer_OversizedFrameClosesConnectionWithoutLoop(t *testing.T) {
 	}
 	if !cleaned {
 		t.Fatal("server did not clean up client connection after stream error")
+	}
+}
+
+func TestCreateEventNotification_OversizedToolResultBounded(t *testing.T) {
+	// Create a large tool result of 800 KB (which previously was duplicated to 1.6 MB)
+	largeResult := strings.Repeat("x", 800*1024)
+	evt := agent.Event{
+		Type:       agent.EventToolResult,
+		Step:       1,
+		ToolName:   "bash",
+		ToolResult: largeResult,
+	}
+
+	msg, err := createEventNotification("sess_test", 1, evt, false)
+	if err != nil {
+		t.Fatalf("createEventNotification failed: %v", err)
+	}
+
+	encoded, err := protocol.EncodeMessage(msg)
+	if err != nil {
+		t.Fatalf("EncodeMessage failed: %v", err)
+	}
+
+	if len(encoded) >= protocol.DefaultMaxMessageSize {
+		t.Fatalf("encoded message size %d bytes exceeds DefaultMaxMessageSize (%d)", len(encoded), protocol.DefaultMaxMessageSize)
+	}
+
+	// Must decode cleanly through stream codec scanner
+	decoded, err := protocol.DecodeMessage(encoded)
+	if err != nil {
+		t.Fatalf("DecodeMessage failed on bounded notification: %v", err)
+	}
+
+	var notify protocol.SessionEventNotification
+	if err := json.Unmarshal(decoded.Params, &notify); err != nil {
+		t.Fatalf("unmarshal params failed: %v", err)
+	}
+
+	// Verify Content was not duplicated to 800 KB
+	if len(notify.Content) > 2048 {
+		t.Errorf("expected Content to be a preview summary, got length %d", len(notify.Content))
+	}
+
+	// Verify tool_result was bounded
+	tr, ok := notify.Data["tool_result"].(string)
+	if !ok {
+		t.Fatalf("missing tool_result in Data: %+v", notify.Data)
+	}
+	if len(tr) > maxNotificationFieldBytes+128 {
+		t.Errorf("expected tool_result bounded to ~%d, got %d", maxNotificationFieldBytes, len(tr))
+	}
+	if !strings.Contains(tr, "[output truncated for streaming]") {
+		t.Errorf("expected truncation marker in tool_result")
 	}
 }

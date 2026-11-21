@@ -291,6 +291,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 			apiType := ""
 			dbPath := ""
 			maxOutputChars := 0
+			workingTailSize := 0
 			if cfg != nil {
 				workspaceDir = cfg.WorkspaceDir
 				model = cfg.Model
@@ -304,6 +305,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				apiType = cfg.APIType
 				dbPath = cfg.DBPath
 				maxOutputChars = cfg.MaxOutputChars
+				workingTailSize = cfg.WorkingTailSize
 			}
 			if dbPath != "" && dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") && !filepath.IsAbs(dbPath) {
 				if wd, err := f.WorkDir(); err == nil && wd != "" {
@@ -330,6 +332,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				MaxSteps:         maxSteps,
 				MaxContextTokens: maxContextTokens,
 				MaxOutputChars:   maxOutputChars,
+				WorkingTailSize:  workingTailSize,
 				ReasoningEffort:  reasoningEffort,
 				BaseURL:          baseURL,
 				APIKey:           apiKey,

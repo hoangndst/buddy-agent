@@ -503,6 +503,59 @@ func TestBuildEngineForSession_MaxOutputCharsForwarding(t *testing.T) {
 	}
 }
 
+func TestBuildEngineForSession_WorkingTailSizeForwarding(t *testing.T) {
+	tempDir := t.TempDir()
+	f := cmdutil.NewFactory()
+
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			Model:            "test-model",
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   10000,
+			WorkingTailSize:  3,
+			MaxSteps:         10,
+			MaxContextTokens: 64000,
+		}, nil
+	}
+
+	// 1. Session with caller-provided working tail size
+	paramsCustom := protocol.SessionStartParams{
+		Task:            "test tail size custom",
+		WorkspaceDir:    tempDir,
+		WorkingTailSize: 8,
+	}
+
+	eng1, cleanup1, err := buildEngineForSession(context.Background(), f, "sess_tail_1", paramsCustom, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup1 != nil {
+		defer cleanup1()
+	}
+
+	if eng1.WorkingTailSize() != 8 {
+		t.Errorf("expected working tail size 8, got %d", eng1.WorkingTailSize())
+	}
+
+	// 2. Session with default (0) working tail size falls back to daemon config (3)
+	paramsDefault := protocol.SessionStartParams{
+		Task:         "test tail size default",
+		WorkspaceDir: tempDir,
+	}
+
+	eng2, cleanup2, err := buildEngineForSession(context.Background(), f, "sess_tail_2", paramsDefault, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup2 != nil {
+		defer cleanup2()
+	}
+
+	if eng2.WorkingTailSize() != 3 {
+		t.Errorf("expected default working tail size 3 from daemon config, got %d", eng2.WorkingTailSize())
+	}
+}
+
 func TestBuildEngineForSession_CallerEnvironment(t *testing.T) {
 	tempDir := t.TempDir()
 	f := cmdutil.NewFactory()
