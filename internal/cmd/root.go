@@ -291,6 +291,15 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				apiKey = &k
 				apiType = cfg.APIType
 			}
+			effectiveDir := workspaceDir
+			if effectiveDir == "" {
+				effectiveDir, _ = f.WorkDir()
+			}
+			var mcpCfg *core.Config
+			if f.MCPConfigLoader != nil {
+				home, _ := f.UserHome()
+				mcpCfg, _ = f.MCPConfigLoader(effectiveDir, home)
+			}
 			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{
 				Task:             task,
 				WorkspaceDir:     workspaceDir,
@@ -301,6 +310,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				BaseURL:          baseURL,
 				APIKey:           apiKey,
 				APIType:          apiType,
+				MCPConfig:        mcpCfg,
 			})
 			if startErr != nil {
 				// Avoid ambiguous double-execution: if daemon connection succeeded but start failed, abort immediately

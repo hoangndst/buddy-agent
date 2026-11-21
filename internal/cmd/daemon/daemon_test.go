@@ -13,6 +13,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/config"
 	"github.com/hoangndst/buddy-agent/internal/daemon"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
+	core "github.com/hoangndst/buddy-agent/internal/mcp"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 	"github.com/openai/openai-go"
 )
@@ -263,5 +264,133 @@ func TestBuildEngineForSession_EmptyReasoningEffortOverride(t *testing.T) {
 	}
 	if observedConfig.ReasoningEffort != "" {
 		t.Errorf("expected empty ReasoningEffort when caller explicitly overrides with empty string, got %q", observedConfig.ReasoningEffort)
+	}
+}
+
+func TestBuildEngineForSession_CallerResolvedMCPConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	f := cmdutil.NewFactory()
+
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			Model:            "test-model",
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   10000,
+			MaxSteps:         10,
+			MaxContextTokens: 64000,
+		}, nil
+	}
+
+	loaderCalled := false
+	f.MCPConfigLoader = func(_, _ string) (*core.Config, error) {
+		loaderCalled = true
+		return &core.Config{
+			MCPServers: map[string]core.ServerConfig{
+				"daemon-default": {Command: "echo"},
+			},
+		}, nil
+	}
+
+	var observedMCPConfig *core.Config
+	f.NewClientManager = func(cfg *core.Config) *core.ClientManager {
+		observedMCPConfig = cfg
+		return core.NewClientManager(cfg)
+	}
+
+	callerMCPConfig := &core.Config{
+		MCPServers: map[string]core.ServerConfig{
+			"caller-server": {
+				Command: "node",
+				Headers: map[string]string{
+					"Authorization": "Bearer caller-secret-token",
+				},
+			},
+		},
+	}
+
+	params := protocol.SessionStartParams{
+		Task:         "task with caller mcp",
+		WorkspaceDir: tempDir,
+		MCPConfig:    callerMCPConfig,
+	}
+
+	eng, cleanup, err := buildEngineForSession(context.Background(), f, "sess_mcp_test", params, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+
+	if loaderCalled {
+		t.Error("expected f.MCPConfigLoader NOT to be called when caller supplies MCPConfig")
+	}
+	if observedMCPConfig == nil {
+		t.Fatal("expected NewClientManager to be invoked with caller's MCPConfig")
+	}
+	srv, ok := observedMCPConfig.MCPServers["caller-server"]
+	if !ok {
+		t.Fatal("expected caller-server in observed MCPConfig")
+	}
+	if srv.Headers["Authorization"] != "Bearer caller-secret-token" {
+		t.Errorf("expected caller token in headers, got %q", srv.Headers["Authorization"])
+	}
+}
+
+func TestBuildEngineForSession_MCPConfigFallback(t *testing.T) {
+	tempDir := t.TempDir()
+	f := cmdutil.NewFactory()
+
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			Model:            "test-model",
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   10000,
+			MaxSteps:         10,
+			MaxContextTokens: 64000,
+		}, nil
+	}
+
+	loaderCalled := false
+	f.MCPConfigLoader = func(_, _ string) (*core.Config, error) {
+		loaderCalled = true
+		return &core.Config{
+			MCPServers: map[string]core.ServerConfig{
+				"fallback-server": {Command: "echo"},
+			},
+		}, nil
+	}
+
+	var observedMCPConfig *core.Config
+	f.NewClientManager = func(cfg *core.Config) *core.ClientManager {
+		observedMCPConfig = cfg
+		return core.NewClientManager(cfg)
+	}
+
+	params := protocol.SessionStartParams{
+		Task:         "task without mcp config",
+		WorkspaceDir: tempDir,
+		MCPConfig:    nil,
+	}
+
+	eng, cleanup, err := buildEngineForSession(context.Background(), f, "sess_mcp_fallback", params, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+
+	if !loaderCalled {
+		t.Error("expected f.MCPConfigLoader to be called when params.MCPConfig is nil")
+	}
+	if observedMCPConfig == nil || observedMCPConfig.MCPServers["fallback-server"].Command != "echo" {
+		t.Errorf("expected fallback server in observed MCPConfig, got %+v", observedMCPConfig)
 	}
 }

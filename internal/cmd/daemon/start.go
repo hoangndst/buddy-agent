@@ -219,8 +219,14 @@ func buildEngineForSession(
 
 	var cleanups []func()
 
-	home, _ := f.UserHome()
-	mcpCfg, mcpErr := f.MCPConfigLoader(wsDir, home)
+	var mcpCfg *core.Config
+	var mcpErr error
+	if params.MCPConfig != nil {
+		mcpCfg = params.MCPConfig
+	} else if f.MCPConfigLoader != nil {
+		home, _ := f.UserHome()
+		mcpCfg, mcpErr = f.MCPConfigLoader(wsDir, home)
+	}
 	if mcpErr == nil && mcpCfg != nil && len(mcpCfg.MCPServers) > 0 {
 		for name, srv := range mcpCfg.MCPServers {
 			if srv.WorkDir == "" && srv.Cwd == "" && wsDir != "" {

@@ -1,6 +1,10 @@
 package protocol
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/hoangndst/buddy-agent/internal/mcp"
+)
 
 // Canonical JSON-RPC 2.0 Error Codes.
 const (
@@ -55,15 +59,16 @@ func (e *JSONRPCError) Error() string {
 
 // SessionStartParams specifies options for session.start.
 type SessionStartParams struct {
-	Task             string `json:"task"`
-	WorkspaceDir     string `json:"workspace_dir,omitempty"`
-	Model            string  `json:"model,omitempty"`
-	ReasoningEffort  *string `json:"reasoning_effort,omitempty"`
-	MaxSteps         int     `json:"max_steps,omitempty"`
-	MaxContextTokens int    `json:"max_context_tokens,omitempty"`
-	BaseURL          string  `json:"base_url,omitempty"`
-	APIKey           *string `json:"api_key,omitempty"`
-	APIType          string  `json:"api_type,omitempty"`
+	Task             string      `json:"task"`
+	WorkspaceDir     string      `json:"workspace_dir,omitempty"`
+	Model            string      `json:"model,omitempty"`
+	ReasoningEffort  *string     `json:"reasoning_effort,omitempty"`
+	MaxSteps         int         `json:"max_steps,omitempty"`
+	MaxContextTokens int         `json:"max_context_tokens,omitempty"`
+	BaseURL          string      `json:"base_url,omitempty"`
+	APIKey           *string     `json:"api_key,omitempty"`
+	APIType          string      `json:"api_type,omitempty"`
+	MCPConfig        *mcp.Config `json:"mcp_config,omitempty"`
 }
 
 // SessionStartResult returns the created session identifier.

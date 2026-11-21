@@ -6,6 +6,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/hoangndst/buddy-agent/internal/mcp"
 )
 
 func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
@@ -16,6 +18,17 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 		MaxContextTokens: 32000,
 		APIType:          "responses",
 		ReasoningEffort:  &effort,
+		MCPConfig: &mcp.Config{
+			MCPServers: map[string]mcp.ServerConfig{
+				"test-mcp": {
+					Command: "node",
+					Args:    []string{"server.js"},
+					Headers: map[string]string{
+						"Authorization": "Bearer secret-token",
+					},
+				},
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
@@ -52,6 +65,12 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	}
 	if params.ReasoningEffort == nil || *params.ReasoningEffort != "medium" {
 		t.Fatalf("expected reasoning effort 'medium', got %+v", params.ReasoningEffort)
+	}
+	if params.MCPConfig == nil || len(params.MCPConfig.MCPServers) != 1 {
+		t.Fatalf("expected mcp config with 1 server, got %+v", params.MCPConfig)
+	}
+	if srv, ok := params.MCPConfig.MCPServers["test-mcp"]; !ok || srv.Headers["Authorization"] != "Bearer secret-token" {
+		t.Fatalf("expected resolved test-mcp server header, got %+v", srv)
 	}
 
 	// 2. Response roundtrip
