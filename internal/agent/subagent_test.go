@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hoangndst/buddy-agent/internal/history"
+	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 	"github.com/openai/openai-go"
@@ -282,5 +283,215 @@ func TestEngine_ReserveStepSynthesisOnMaxSteps(t *testing.T) {
 	}
 	if !strings.Contains(output, "Synthesized partial findings") {
 		t.Errorf("expected partial findings in output, got: %s", output)
+	}
+}
+
+func TestEngine_RejectChildSessionResume(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := persistence.NewSQLiteStore(fmt.Sprintf("file:memdb_reject_child_%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	parentID := "parent-sess-1"
+	childID := "child-sess-1"
+
+	// Create root session
+	rootRec := &persistence.SessionRecord{
+		ID:         parentID,
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+		Status:     persistence.StatusInterrupted,
+		Task:       "Root task",
+		Model:      "gpt-4o",
+		WorkingDir: tmpDir,
+		MaxSteps:   5,
+		Role:       "root",
+		Depth:      0,
+	}
+	if err := store.CreateSession(ctx, rootRec); err != nil {
+		t.Fatalf("failed to create root session: %v", err)
+	}
+
+	// Create child session
+	childRec := &persistence.SessionRecord{
+		ID:              childID,
+		CreatedAt:       time.Now().UTC(),
+		UpdatedAt:       time.Now().UTC(),
+		Status:          persistence.StatusInterrupted,
+		Task:            "Child sub-task",
+		Model:           "gpt-4o",
+		WorkingDir:      tmpDir,
+		MaxSteps:        5,
+		ParentSessionID: &parentID,
+		Role:            "researcher",
+		Depth:           1,
+	}
+	if err := store.CreateSession(ctx, childRec); err != nil {
+		t.Fatalf("failed to create child session: %v", err)
+	}
+
+	memMgr := memory.NewManager(tmpDir)
+	eng := NewEngine(
+		&mockChatClient{},
+		"gpt-4o",
+		5,
+		tools.NewRegistry(1000),
+		memMgr,
+		nil,
+		WithStore(store),
+		WithWorkspaceDir(tmpDir),
+	)
+
+	_, err = eng.Resume(ctx, childID, 0)
+	if err == nil {
+		t.Fatal("expected error resuming child session directly, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot directly resume child subagent session") {
+		t.Errorf("expected error to mention child subagent session restriction, got: %v", err)
+	}
+}
+
+func TestEngine_ResumeRestoresDelegationQuota(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := persistence.NewSQLiteStore(fmt.Sprintf("file:memdb_quota_resume_%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	parentID := "parent-quota-sess"
+
+	// Create root session
+	rootRec := &persistence.SessionRecord{
+		ID:         parentID,
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+		Status:     persistence.StatusInterrupted,
+		Task:       "Parent task with 5 subagents",
+		Model:      "gpt-4o",
+		WorkingDir: tmpDir,
+		MaxSteps:   10,
+		Role:       "root",
+		Depth:      0,
+	}
+	if err := store.CreateSession(ctx, rootRec); err != nil {
+		t.Fatalf("failed to create root session: %v", err)
+	}
+
+	// Insert 1 turn in root session so resume can reconstruct trailing turns
+	turnRec := &persistence.TurnRecord{
+		SessionID:  parentID,
+		StepNumber: 1,
+		Role:       "assistant",
+		Content:    "Ran initial step",
+		CreatedAt:  time.Now().UTC(),
+	}
+	if err := store.CommitTurn(ctx, turnRec, 1, persistence.TokenUsage{PromptTokens: 10, TotalTokens: 10}); err != nil {
+		t.Fatalf("failed to commit turn: %v", err)
+	}
+
+	// Insert 5 child sessions for this parent
+	for i := 1; i <= 5; i++ {
+		cID := fmt.Sprintf("child-%d", i)
+		cRec := &persistence.SessionRecord{
+			ID:              cID,
+			CreatedAt:       time.Now().UTC().Add(time.Duration(i) * time.Second),
+			UpdatedAt:       time.Now().UTC().Add(time.Duration(i) * time.Second),
+			Status:          persistence.StatusCompleted,
+			Task:            fmt.Sprintf("Child task %d", i),
+			Model:           "gpt-4o",
+			WorkingDir:      tmpDir,
+			MaxSteps:        5,
+			ParentSessionID: &parentID,
+			Role:            "researcher",
+			Depth:           1,
+		}
+		if err := store.CreateSession(ctx, cRec); err != nil {
+			t.Fatalf("failed to create child session %d: %v", i, err)
+		}
+	}
+
+	reg := tools.NewRegistry(1000)
+	subTool := NewInvokeSubagentTool(SubagentToolConfig{
+		Depth: 0,
+		Store: store,
+	})
+	reg.Register(subTool)
+
+	mockClient := &mockChatClient{
+		responses: []*openai.ChatCompletion{
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Resume completed directly",
+						},
+					},
+				},
+				Usage: openai.CompletionUsage{TotalTokens: 20},
+			},
+		},
+	}
+
+	memMgr := memory.NewManager(tmpDir)
+	eng := NewEngine(
+		mockClient,
+		"gpt-4o",
+		5,
+		reg,
+		memMgr,
+		nil,
+		WithStore(store),
+		WithWorkspaceDir(tmpDir),
+	)
+
+	_, err = eng.Resume(ctx, parentID, 0)
+	if err != nil {
+		t.Fatalf("unexpected error resuming session: %v", err)
+	}
+
+	// Verify call count was restored to 5 from the 5 persisted child sessions
+	if subTool.CallCount() != 5 {
+		t.Errorf("expected subTool.CallCount() == 5, got %d", subTool.CallCount())
+	}
+
+	// Attempting a 6th subagent execution must now fail with quota exhaustion
+	res, err := subTool.Execute(ctx, json.RawMessage(`{"task": "sub-task 6"}`))
+	if err != nil {
+		t.Fatalf("unexpected tool error: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(res), "maximum subagent delegation quota reached (5/5)") {
+		t.Errorf("expected quota exhaustion message, got: %s", res)
+	}
+}
+
+func TestSubagentTool_ChildUsageTracking(t *testing.T) {
+	subTool := NewInvokeSubagentTool(SubagentToolConfig{
+		Depth: 0,
+	})
+
+	if subTool.ChildUsage().TotalTokens != 0 {
+		t.Errorf("expected 0 initial child tokens, got %d", subTool.ChildUsage().TotalTokens)
+	}
+
+	subTool.mu.Lock()
+	subTool.childUsage.PromptTokens += 30
+	subTool.childUsage.CompletionTokens += 20
+	subTool.childUsage.TotalTokens += 50
+	subTool.mu.Unlock()
+
+	usage := subTool.ChildUsage()
+	if usage.PromptTokens != 30 || usage.CompletionTokens != 20 || usage.TotalTokens != 50 {
+		t.Errorf("unexpected child usage: %+v", usage)
+	}
+
+	subTool.Reset()
+	if subTool.ChildUsage().TotalTokens != 0 {
+		t.Errorf("expected 0 child tokens after reset, got %d", subTool.ChildUsage().TotalTokens)
 	}
 }

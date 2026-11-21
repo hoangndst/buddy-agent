@@ -249,12 +249,10 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 	sessionID := generateSessionID()
 	if e.registry != nil {
 		if t, ok := e.registry.Get("invoke_subagent"); ok {
-			if subTool, ok := t.(interface {
-				SetParentSessionID(string)
-				SetParentTracker(*history.StateTracker)
-			}); ok {
+			if subTool, ok := t.(*InvokeSubagentTool); ok {
 				subTool.SetParentSessionID(sessionID)
 				subTool.SetParentTracker(session.Tracker())
+				subTool.Reset()
 			}
 		}
 	}
@@ -324,6 +322,10 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 
 	if sessionRec.Status == persistence.StatusCompleted {
 		return "", persistence.ErrSessionCompleted
+	}
+
+	if sessionRec.Depth > 0 || (sessionRec.ParentSessionID != nil && *sessionRec.ParentSessionID != "") {
+		return "", fmt.Errorf("cannot directly resume child subagent session %q (depth=%d, role=%q)", sessionID, sessionRec.Depth, sessionRec.Role)
 	}
 
 	activeDir := e.workspaceDir
@@ -413,12 +415,15 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 
 	if e.registry != nil {
 		if t, ok := e.registry.Get("invoke_subagent"); ok {
-			if subTool, ok := t.(interface {
-				SetParentSessionID(string)
-				SetParentTracker(*history.StateTracker)
-			}); ok {
+			if subTool, ok := t.(*InvokeSubagentTool); ok {
 				subTool.SetParentSessionID(sessionRec.ID)
 				subTool.SetParentTracker(session.Tracker())
+				subTool.Reset()
+				if e.store != nil {
+					if children, err := e.store.GetChildSessions(ctx, sessionRec.ID); err == nil {
+						subTool.SetCallCount(len(children))
+					}
+				}
 			}
 		}
 	}
@@ -476,6 +481,22 @@ func (e *Engine) executeLoop(
 	const maxTurnRetries = 2
 	cumulativeUsage := initialUsage
 
+	getBillingUsage := func() persistence.TokenUsage {
+		usage := cumulativeUsage
+		if e.registry != nil {
+			if t, ok := e.registry.Get("invoke_subagent"); ok {
+				if subTool, ok := t.(*InvokeSubagentTool); ok {
+					cUsage := subTool.ChildUsage()
+					usage.PromptTokens += cUsage.PromptTokens
+					usage.CompletionTokens += cUsage.CompletionTokens
+					usage.ReasoningTokens += cUsage.ReasoningTokens
+					usage.TotalTokens += cUsage.TotalTokens
+				}
+			}
+		}
+		return usage
+	}
+
 	for step := startStep; step <= totalMaxSteps; step++ {
 		session.SetCurrentStep(step)
 		select {
@@ -483,7 +504,7 @@ func (e *Engine) executeLoop(
 			if e.store != nil && sessionID != "" {
 				shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				defer cancel()
-				_ = e.store.UpdateSessionStatus(shutdownCtx, sessionID, persistence.StatusInterrupted, step-1, cumulativeUsage, "Process interrupted by signal or user")
+				_ = e.store.UpdateSessionStatus(shutdownCtx, sessionID, persistence.StatusInterrupted, step-1, getBillingUsage(), "Process interrupted by signal or user")
 			}
 			return "", ctx.Err()
 		default:
@@ -532,7 +553,7 @@ func (e *Engine) executeLoop(
 						status = persistence.StatusFailed
 						errMsg = "Execution timeout reached"
 					}
-					_ = e.store.UpdateSessionStatus(context.Background(), sessionID, status, step-1, cumulativeUsage, errMsg)
+					_ = e.store.UpdateSessionStatus(context.Background(), sessionID, status, step-1, getBillingUsage(), errMsg)
 				}
 				return "", err
 			}
@@ -540,7 +561,7 @@ func (e *Engine) executeLoop(
 			if !matched || retry == maxTurnRetries {
 				e.eventHandler(Event{Type: EventError, Step: step, Duration: callDuration, Error: err})
 				if e.store != nil && sessionID != "" {
-					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, getBillingUsage(), err.Error())
 				}
 				return "", fmt.Errorf("step %d LLM call failed: %w", step, err)
 			}
@@ -557,13 +578,13 @@ func (e *Engine) executeLoop(
 				if errors.Is(err, history.ErrContextExhausted) {
 					e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
 					if e.store != nil && sessionID != "" {
-						_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
+						_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, getBillingUsage(), err.Error())
 					}
 					return "", err
 				}
 				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
 				if e.store != nil && sessionID != "" {
-					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, getBillingUsage(), err.Error())
 				}
 				return "", fmt.Errorf("downscale watermark failed: %w", err)
 			}
@@ -573,7 +594,7 @@ func (e *Engine) executeLoop(
 				if errors.Is(err, history.ErrContextExhausted) {
 					e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
 					if e.store != nil && sessionID != "" {
-						_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
+						_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, getBillingUsage(), err.Error())
 					}
 					return "", err
 				}
@@ -582,7 +603,7 @@ func (e *Engine) executeLoop(
 				}
 				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
 				if e.store != nil && sessionID != "" {
-					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, getBillingUsage(), err.Error())
 				}
 				return "", fmt.Errorf("force compaction failed: %w", err)
 			}
@@ -624,8 +645,8 @@ func (e *Engine) executeLoop(
 					DurationMs: time.Since(stepStartTime).Milliseconds(),
 					CreatedAt:  time.Now().UTC(),
 				}
-				_ = e.store.CommitTurn(ctx, turnRec, step, cumulativeUsage)
-				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusCompleted, step, cumulativeUsage, "")
+				_ = e.store.CommitTurn(ctx, turnRec, step, getBillingUsage())
+				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusCompleted, step, getBillingUsage(), "")
 			}
 			e.eventHandler(Event{
 				Type:      EventTextComplete,
@@ -648,7 +669,7 @@ func (e *Engine) executeLoop(
 				Status:        persistence.StatusCompleted,
 				Summary:       genResp.Content,
 				ModifiedFiles: session.Tracker().ExportData().ModifiedFiles,
-				TokenUsage:    cumulativeUsage,
+				TokenUsage:    getBillingUsage(),
 			}
 			return genResp.Content, nil
 		}
@@ -777,14 +798,14 @@ func (e *Engine) executeLoop(
 				CreatedAt:  time.Now().UTC(),
 			}
 			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			_ = e.store.CommitTurn(persistCtx, turnRec, step, cumulativeUsage)
+			_ = e.store.CommitTurn(persistCtx, turnRec, step, getBillingUsage())
 			cancel()
 		}
 
 		if ctx.Err() != nil {
 			if e.store != nil && sessionID != "" {
 				shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				_ = e.store.UpdateSessionStatus(shutdownCtx, sessionID, persistence.StatusInterrupted, step, cumulativeUsage, "Process interrupted by signal or user")
+				_ = e.store.UpdateSessionStatus(shutdownCtx, sessionID, persistence.StatusInterrupted, step, getBillingUsage(), "Process interrupted by signal or user")
 				cancel()
 			}
 			return "", ctx.Err()
@@ -799,7 +820,7 @@ func (e *Engine) executeLoop(
 			if errors.Is(err, history.ErrContextExhausted) {
 				e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
 				if e.store != nil && sessionID != "" {
-					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step, cumulativeUsage, err.Error())
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step, getBillingUsage(), err.Error())
 				}
 				return "", err
 			}
@@ -808,7 +829,7 @@ func (e *Engine) executeLoop(
 			}
 			e.eventHandler(Event{Type: EventError, Step: step, Error: err})
 			if e.store != nil && sessionID != "" {
-				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step, cumulativeUsage, err.Error())
+				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step, getBillingUsage(), err.Error())
 			}
 			return "", fmt.Errorf("context compaction failed: %w", err)
 		}
@@ -865,15 +886,15 @@ func (e *Engine) executeLoop(
 					DurationMs: 0,
 					CreatedAt:  time.Now().UTC(),
 				}
-				_ = e.store.CommitTurn(ctx, turnRec, synthStep, cumulativeUsage)
-				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, synthStep, cumulativeUsage, "maximum step budget reached (synthesized)")
+				_ = e.store.CommitTurn(ctx, turnRec, synthStep, getBillingUsage())
+				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, synthStep, getBillingUsage(), "maximum step budget reached (synthesized)")
 			}
 			e.lastExecutionResult = &ExecutionResult{
 				SessionID:     sessionID,
 				Status:        persistence.StatusFailed,
 				Summary:       synthResp.Content,
 				ModifiedFiles: session.Tracker().ExportData().ModifiedFiles,
-				TokenUsage:    cumulativeUsage,
+				TokenUsage:    getBillingUsage(),
 			}
 			return fmt.Sprintf("[Subagent: budget_exhausted] %s", synthResp.Content), nil
 		}
@@ -881,14 +902,14 @@ func (e *Engine) executeLoop(
 
 	maxStepErr := fmt.Errorf("reached maximum step budget (%d) without finishing", totalMaxSteps)
 	if e.store != nil && sessionID != "" {
-		_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, totalMaxSteps, cumulativeUsage, maxStepErr.Error())
+		_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, totalMaxSteps, getBillingUsage(), maxStepErr.Error())
 	}
 	e.lastExecutionResult = &ExecutionResult{
 		SessionID:     sessionID,
 		Status:        persistence.StatusFailed,
 		Summary:       maxStepErr.Error(),
 		ModifiedFiles: session.Tracker().ExportData().ModifiedFiles,
-		TokenUsage:    cumulativeUsage,
+		TokenUsage:    getBillingUsage(),
 	}
 	e.eventHandler(Event{Type: EventError, Error: maxStepErr})
 	return "", maxStepErr

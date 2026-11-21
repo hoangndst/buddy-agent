@@ -34,6 +34,7 @@ type InvokeSubagentTool struct {
 	depth           int
 	callCount       int
 	maxCalls        int
+	childUsage      persistence.TokenUsage
 	parentSessionID string
 	parentTracker   *history.StateTracker
 	parentRegistry  *tools.Registry
@@ -131,6 +132,35 @@ func (t *InvokeSubagentTool) SetParentTracker(tracker *history.StateTracker) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.parentTracker = tracker
+}
+
+// Reset clears session-scoped delegation count and accumulated child token usage.
+func (t *InvokeSubagentTool) Reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.callCount = 0
+	t.childUsage = persistence.TokenUsage{}
+}
+
+// SetCallCount sets the current number of subagent invocations (used during session resume).
+func (t *InvokeSubagentTool) SetCallCount(count int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.callCount = count
+}
+
+// CallCount returns the current count of subagent invocations.
+func (t *InvokeSubagentTool) CallCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.callCount
+}
+
+// ChildUsage returns the cumulative token usage of all child subagents executed by this tool.
+func (t *InvokeSubagentTool) ChildUsage() persistence.TokenUsage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.childUsage
 }
 
 // Execute runs the delegated subagent task synchronously with panic isolation and budget bounds.
@@ -272,6 +302,29 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 		return fmt.Sprintf("Status: budget_exhausted\nError: subagent exceeded execution timeout (%v)\nPartial output: %s", DefaultChildTimeout, summary), nil
 	}
 
+	// 12. State & Metric Rollup
+	execResult := childEngine.LastExecutionResult()
+	if execResult != nil {
+		t.mu.Lock()
+		t.childUsage.PromptTokens += execResult.TokenUsage.PromptTokens
+		t.childUsage.CompletionTokens += execResult.TokenUsage.CompletionTokens
+		t.childUsage.ReasoningTokens += execResult.TokenUsage.ReasoningTokens
+		t.childUsage.TotalTokens += execResult.TokenUsage.TotalTokens
+		t.mu.Unlock()
+
+		// A. Token usage billing rollup to parent session record
+		if t.store != nil && parentSessionID != "" {
+			_ = t.store.IncrementSessionTokens(context.Background(), parentSessionID, execResult.TokenUsage)
+		}
+
+		// B. State tracker modified files rollup for successful worker subagents
+		if role == "worker" && childErr == nil && parentTracker != nil {
+			for path, rec := range execResult.ModifiedFiles {
+				parentTracker.RecordFileAccess(path, rec.Action)
+			}
+		}
+	}
+
 	if childErr != nil {
 		if strings.Contains(summary, "[Subagent: budget_exhausted]") {
 			return fmt.Sprintf("Status: budget_exhausted\n%s", summary), nil
@@ -280,22 +333,6 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 	}
 	if strings.Contains(summary, "[Subagent: budget_exhausted]") {
 		return fmt.Sprintf("Status: budget_exhausted\n%s", summary), nil
-	}
-
-	// 12. State & Metric Rollup
-	execResult := childEngine.LastExecutionResult()
-	if execResult != nil {
-		// A. Token usage billing rollup to parent session record
-		if t.store != nil && parentSessionID != "" {
-			_ = t.store.IncrementSessionTokens(context.Background(), parentSessionID, execResult.TokenUsage)
-		}
-
-		// B. State tracker modified files rollup for successful worker subagents
-		if role == "worker" && parentTracker != nil {
-			for path, rec := range execResult.ModifiedFiles {
-				parentTracker.RecordFileAccess(path, rec.Action)
-			}
-		}
 	}
 
 	return fmt.Sprintf("Status: success\nRole: %s\nSummary:\n%s", role, summary), nil
