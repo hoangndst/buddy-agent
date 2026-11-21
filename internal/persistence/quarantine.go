@@ -42,8 +42,10 @@ func CheckOrQuarantine(dbPath string) error {
 	}
 	if result != "ok" {
 		resLower := strings.ToLower(result)
-		if strings.Contains(resLower, "lock") || strings.Contains(resLower, "busy") || strings.Contains(resLower, "timeout") {
-			return fmt.Errorf("database is temporarily locked: %s", result)
+		if strings.Contains(resLower, "lock") || strings.Contains(resLower, "busy") ||
+			strings.Contains(resLower, "timeout") || strings.Contains(resLower, "permission") ||
+			strings.Contains(resLower, "denied") {
+			return fmt.Errorf("database quick_check operational error: %s", result)
 		}
 		_ = db.Close()
 		return quarantineFiles(dbPath)

@@ -27,7 +27,11 @@ type SQLiteStore struct {
 
 // NewSQLiteStore initializes and connects the SQLite persistence engine.
 func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
-	isMemory := dbPath == ":memory:" || strings.Contains(dbPath, "mode=memory")
+	if dbPath == ":memory:" {
+		dbPath = fmt.Sprintf("file:buddy_mem_%x?mode=memory&cache=shared", time.Now().UnixNano())
+	}
+
+	isMemory := strings.Contains(dbPath, "mode=memory") || strings.HasPrefix(dbPath, "file:mem")
 
 	if !isMemory {
 		if err := CheckOrQuarantine(dbPath); err != nil {
@@ -59,8 +63,22 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 
 	var writerDSN, readerDSN string
 	if isMemory {
+		if !strings.Contains(dbPath, "cache=shared") && strings.HasPrefix(dbPath, "file:") {
+			if strings.Contains(dbPath, "?") {
+				dbPath += "&cache=shared"
+			} else {
+				dbPath += "?cache=shared"
+			}
+		}
 		writerDSN = dbPath
 		readerDSN = dbPath
+		if !strings.Contains(readerDSN, "query_only") {
+			if strings.Contains(readerDSN, "?") {
+				readerDSN += "&_pragma=query_only(ON)"
+			} else {
+				readerDSN += "?_pragma=query_only(ON)"
+			}
+		}
 	} else {
 		writerDSN = fmt.Sprintf(
 			"file:%s?_pragma=busy_timeout(2500)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=auto_vacuum(INCREMENTAL)&_txlock=immediate",

@@ -236,13 +236,19 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 		return "", persistence.ErrSessionCompleted
 	}
 
-	if e.workspaceDir != "" && sessionRec.WorkingDir != "" {
-		cleanCurrent, err1 := filepath.Abs(filepath.Clean(e.workspaceDir))
-		cleanRecorded, err2 := filepath.Abs(filepath.Clean(sessionRec.WorkingDir))
-		if err1 == nil && err2 == nil && cleanCurrent != cleanRecorded {
-			return "", fmt.Errorf("cannot resume session %q: working directory mismatch (session: %s, active workspace: %s)",
-				sessionID, sessionRec.WorkingDir, e.workspaceDir)
-		}
+	activeDir := e.workspaceDir
+	if activeDir == "" {
+		activeDir = "."
+	}
+	recordedDir := sessionRec.WorkingDir
+	if recordedDir == "" {
+		recordedDir = "."
+	}
+	cleanCurrent, err1 := filepath.Abs(filepath.Clean(activeDir))
+	cleanRecorded, err2 := filepath.Abs(filepath.Clean(recordedDir))
+	if err1 == nil && err2 == nil && cleanCurrent != cleanRecorded {
+		return "", fmt.Errorf("cannot resume session %q: working directory mismatch (session: %s, active workspace: %s)",
+			sessionID, sessionRec.WorkingDir, activeDir)
 	}
 
 	// 1. Build initial system prompt
@@ -304,8 +310,14 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 		return "", fmt.Errorf("failed to restore history session: %w", err)
 	}
 
+	maxStep := 0
 	allTurns, _ := e.store.GetAllTurns(ctx, sessionRec.ID)
-	startStep := len(allTurns) + 1
+	for _, t := range allTurns {
+		if t.StepNumber > maxStep {
+			maxStep = t.StepNumber
+		}
+	}
+	startStep := maxStep + 1
 
 	totalMaxSteps := sessionRec.MaxSteps
 	if maxStepsOverride > 0 {
@@ -610,7 +622,18 @@ func (e *Engine) executeLoop(
 				DurationMs: time.Since(stepStartTime).Milliseconds(),
 				CreatedAt:  time.Now().UTC(),
 			}
-			_ = e.store.CommitTurn(ctx, turnRec, step, cumulativeUsage)
+			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_ = e.store.CommitTurn(persistCtx, turnRec, step, cumulativeUsage)
+			cancel()
+		}
+
+		if ctx.Err() != nil {
+			if e.store != nil && sessionID != "" {
+				shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				_ = e.store.UpdateSessionStatus(shutdownCtx, sessionID, persistence.StatusInterrupted, step, cumulativeUsage, "Process interrupted by signal or user")
+				cancel()
+			}
+			return "", ctx.Err()
 		}
 
 		// Watermark check: execute staged micro-pruning or macro-distillation

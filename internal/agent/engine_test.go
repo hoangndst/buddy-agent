@@ -936,3 +936,83 @@ func TestEngine_ResetCumulativeUsage(t *testing.T) {
 	}
 }
 
+func TestEngine_ResumeWithTurnGaps(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := persistence.NewSQLiteStore(fmt.Sprintf("file:memdb_gap_%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	sess := &persistence.SessionRecord{
+		ID:         "sess_gap_test",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Status:     persistence.StatusInterrupted,
+		Task:       "Task with step gaps",
+		Model:      "gpt-4o",
+		WorkingDir: tmpDir,
+		MaxSteps:   10,
+	}
+	_ = store.CreateSession(ctx, sess)
+
+	// Persist step 1 and step 3 (simulating a gap where step 2 failed to write)
+	_ = store.CommitTurn(ctx, &persistence.TurnRecord{
+		SessionID:  sess.ID,
+		StepNumber: 1,
+		Role:       "assistant",
+		Content:    "Step 1",
+		CreatedAt:  now,
+	}, 1, persistence.TokenUsage{TotalTokens: 10})
+	_ = store.CommitTurn(ctx, &persistence.TurnRecord{
+		SessionID:  sess.ID,
+		StepNumber: 3,
+		Role:       "assistant",
+		Content:    "Step 3",
+		CreatedAt:  now,
+	}, 3, persistence.TokenUsage{TotalTokens: 30})
+
+	memMgr := memory.NewManager(tmpDir)
+	reg := tools.NewRegistry(1000)
+	mockClient := &mockChatClient{
+		responses: []*openai.ChatCompletion{
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{Message: openai.ChatCompletionMessage{Role: "assistant", Content: "Finished at step 4"}},
+				},
+				Usage: openai.CompletionUsage{PromptTokens: 20, CompletionTokens: 10, TotalTokens: 30},
+			},
+		},
+	}
+
+	eng := NewEngine(
+		mockClient,
+		"gpt-4o",
+		10,
+		reg,
+		memMgr,
+		nil,
+		WithStore(store),
+		WithWorkspaceDir(tmpDir),
+	)
+
+	_, err = eng.Resume(ctx, sess.ID, 0)
+	if err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+
+	// Verify that step 4 was committed (not step 3 conflicting)
+	turns, err := store.GetAllTurns(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("GetAllTurns failed: %v", err)
+	}
+	if len(turns) != 3 {
+		t.Fatalf("expected 3 turns, got %d", len(turns))
+	}
+	if turns[2].StepNumber != 4 {
+		t.Errorf("expected last turn to be step 4, got %d", turns[2].StepNumber)
+	}
+}
+

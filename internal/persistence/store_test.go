@@ -453,3 +453,36 @@ func TestSecretRedaction_SessionAndSnapshot(t *testing.T) {
 		t.Errorf("expected state tracker json to be redacted, got: %s", loadedSnap.StateTrackerJSON)
 	}
 }
+
+func TestMemoryStoreSharedBetweenPools(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open :memory: store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	sess := &SessionRecord{
+		ID:         "sess_pure_mem",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Status:     StatusRunning,
+		Task:       "Test in-memory pool sharing",
+		Model:      "gpt-4o",
+		WorkingDir: "/test/workspace",
+	}
+
+	err = store.CreateSession(ctx, sess)
+	if err != nil {
+		t.Fatalf("CreateSession failed on :memory: store: %v", err)
+	}
+
+	loaded, err := store.GetSession(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed on readerDB for :memory: store: %v", err)
+	}
+	if loaded.Task != sess.Task {
+		t.Errorf("expected task %q, got %q", sess.Task, loaded.Task)
+	}
+}
