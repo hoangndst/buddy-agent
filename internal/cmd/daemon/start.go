@@ -73,7 +73,7 @@ func newCmdStart(f *cmdutil.Factory) *cobra.Command {
 			// Foreground execution mode
 			sockMgr := daemon.NewSocketManager(socketPath)
 
-			engineFactory := func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, error) {
+			engineFactory := func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
 				return buildEngineForSession(c.Context(), f, sessionID, params, emitHandler)
 			}
 
@@ -86,13 +86,17 @@ func newCmdStart(f *cmdutil.Factory) *cobra.Command {
 
 			_, _ = fmt.Fprintf(f.IOStreams.Out, "Daemon listening on %s (PID: %d)\n", socketPath, os.Getpid())
 
-			// Wait for termination signal
+			// Wait for termination signal or programmatic server shutdown
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-			sig := <-sigCh
-
-			_, _ = fmt.Fprintf(f.IOStreams.Out, "\nReceived signal %s; shutting down daemon...\n", sig)
-			return server.Stop()
+			select {
+			case sig := <-sigCh:
+				_, _ = fmt.Fprintf(f.IOStreams.Out, "\nReceived signal %s; shutting down daemon...\n", sig)
+				return server.Stop()
+			case <-server.Done():
+				_, _ = fmt.Fprintln(f.IOStreams.Out, "Daemon stopped via RPC.")
+				return nil
+			}
 		},
 	}
 
@@ -109,10 +113,10 @@ func buildEngineForSession(
 	sessionID string,
 	params protocol.SessionStartParams,
 	emitHandler agent.EventHandler,
-) (*agent.Engine, error) {
+) (*agent.Engine, func(), error) {
 	cfg, err := f.ConfigLoader()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load configuration: %w", err)
+		return nil, nil, fmt.Errorf("failed to load configuration: %w", err)
 	}
 
 	opts := []option.RequestOption{
@@ -152,12 +156,17 @@ func buildEngineForSession(
 	reg.Register(tools.NewSaveMemoryTool(memMgr))
 	reg.Register(tools.NewCreateSkillTool(memMgr))
 
+	var cleanups []func()
+
 	wd, _ := f.WorkDir()
 	home, _ := f.UserHome()
 	mcpCfg, mcpErr := f.MCPConfigLoader(wd, home)
 	if mcpErr == nil && mcpCfg != nil && len(mcpCfg.MCPServers) > 0 {
 		mcpMgr := f.NewClientManager(mcpCfg)
 		_ = mcpMgr.StartAll(ctx)
+		cleanups = append(cleanups, func() {
+			_ = mcpMgr.Close()
+		})
 		for _, t := range mcpMgr.Tools() {
 			reg.Register(t)
 		}
@@ -167,9 +176,14 @@ func buildEngineForSession(
 
 	var store persistence.Store
 	if f.Store != nil {
-		s, _, sErr := f.Store()
+		s, closer, sErr := f.Store()
 		if sErr == nil && s != nil {
 			store = s
+			if closer != nil {
+				cleanups = append(cleanups, func() {
+					closer()
+				})
+			}
 		}
 	}
 
@@ -216,5 +230,11 @@ func buildEngineForSession(
 		agent.WithWorkspaceDir(wsDir),
 	)
 
-	return eng, nil
+	cleanup := func() {
+		for _, c := range cleanups {
+			c()
+		}
+	}
+
+	return eng, cleanup, nil
 }

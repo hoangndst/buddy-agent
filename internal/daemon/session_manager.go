@@ -12,8 +12,8 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 )
 
-// EngineFactory defines a constructor function that builds an agent.Engine for a session.
-type EngineFactory func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, error)
+// EngineFactory defines a constructor function that builds an agent.Engine and cleanup closure for a session.
+type EngineFactory func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error)
 
 // SessionManager tracks all active daemon sessions and manages headless execution lifecycles.
 type SessionManager struct {
@@ -55,12 +55,12 @@ func (sm *SessionManager) StartSession(
 		}
 	}
 
-	eng, err := sm.engineFactory(sessionID, params, emitHandler)
+	eng, cleanup, err := sm.engineFactory(sessionID, params, emitHandler)
 	if err != nil {
 		return nil, fmt.Errorf("failed to instantiate engine for session %s: %w", sessionID, err)
 	}
 
-	worker = NewSessionWorker(ctx, sessionID, params.Task, eng, controller)
+	worker = NewSessionWorker(ctx, sessionID, params.Task, eng, controller, cleanup)
 	sm.sessions[sessionID] = worker
 
 	worker.Start()

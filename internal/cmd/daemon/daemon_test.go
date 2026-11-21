@@ -38,7 +38,7 @@ func TestCmdDaemon_StatusAndStopActive(t *testing.T) {
 	sockPath := filepath.Join(tempDir, "active_daemon.sock")
 
 	sockMgr := daemon.NewSocketManager(sockPath)
-	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, error) {
+	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
 		eng := agent.NewEngine(
 			nil,
 			"test-model",
@@ -48,7 +48,7 @@ func TestCmdDaemon_StatusAndStopActive(t *testing.T) {
 			emitHandler,
 			agent.WithSystemPromptOverride("mock prompt"),
 		)
-		return eng, nil
+		return eng, nil, nil
 	}
 
 	sessionMgr := daemon.NewSessionManager(factory)

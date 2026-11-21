@@ -71,7 +71,11 @@ func ConnectOrSpawn(sockPath string) (*Client, error) {
 		execPath = os.Args[0]
 	}
 
-	cmd := exec.Command(execPath, "daemon", "start", "--detach")
+	cmdArgs := []string{"daemon", "start", "--detach"}
+	if sockPath != "" {
+		cmdArgs = append(cmdArgs, "--socket", sockPath)
+	}
+	cmd := exec.Command(execPath, cmdArgs...)
 	SetDetachedProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to auto-spawn daemon: %w", err)

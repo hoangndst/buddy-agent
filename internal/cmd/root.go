@@ -270,7 +270,15 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 		cl, err := client.ConnectOrSpawn(socketPath)
 		if err == nil {
 			defer func() { _ = cl.Close() }()
-			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{Task: task})
+			cfg, _ := f.ConfigLoader()
+			workspaceDir := ""
+			if cfg != nil {
+				workspaceDir = cfg.WorkspaceDir
+			}
+			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{
+				Task:         task,
+				WorkspaceDir: workspaceDir,
+			})
 			if startErr == nil {
 				_, _ = fmt.Fprintf(f.IOStreams.Out, "Dispatched task to daemon (Session ID: %s)\n", sessionID)
 				return streamClientEvents(ctx, f, cl, sessionID)

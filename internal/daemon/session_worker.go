@@ -35,6 +35,7 @@ type SessionWorker struct {
 	approvalChan     chan string
 	pendingRequestID string
 	pendingMu        sync.Mutex
+	cleanup          func()
 }
 
 // NewSessionWorker constructs a new SessionWorker bound to a ReAct engine.
@@ -44,6 +45,7 @@ func NewSessionWorker(
 	task string,
 	engine *agent.Engine,
 	controller ClientConn,
+	cleanup func(),
 ) *SessionWorker {
 	ctx, cancel := context.WithCancel(parentCtx)
 	w := &SessionWorker{
@@ -56,6 +58,7 @@ func NewSessionWorker(
 		controller:   controller,
 		subscribers:  make(map[ClientConn]struct{}),
 		approvalChan: make(chan string, 1),
+		cleanup:      cleanup,
 	}
 	if controller != nil {
 		w.subscribers[controller] = struct{}{}
@@ -89,6 +92,12 @@ func (w *SessionWorker) Start() {
 	w.mu.Unlock()
 
 	go func() {
+		defer func() {
+			if w.cleanup != nil {
+				w.cleanup()
+			}
+		}()
+
 		res, err := w.engine.Run(w.ctx, w.task)
 
 		w.mu.Lock()
@@ -141,11 +150,9 @@ func (w *SessionWorker) EmitEvent(evt agent.Event) {
 	w.mu.RUnlock()
 
 	for _, conn := range subs {
-		go func(c ClientConn) {
-			if sendErr := c.Send(notify); sendErr != nil {
-				w.Detach(c)
-			}
-		}(conn)
+		if sendErr := conn.Send(notify); sendErr != nil {
+			w.Detach(conn)
+		}
 	}
 }
 
@@ -199,6 +206,13 @@ func (w *SessionWorker) Detach(conn ClientConn) {
 // Cancel immediately triggers context cancellation for the running engine.
 func (w *SessionWorker) Cancel() {
 	w.cancelFunc()
+}
+
+// IsController reports whether the given client is the current primary controller of the session.
+func (w *SessionWorker) IsController(conn ClientConn) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.controller == conn
 }
 
 // RequestPermission requests human-in-the-loop approval from the primary controller.

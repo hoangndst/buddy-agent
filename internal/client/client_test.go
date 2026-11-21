@@ -33,7 +33,7 @@ func TestClient_DaemonLifecycleAndStreaming(t *testing.T) {
 
 	sockMgr := daemon.NewSocketManager(sockPath)
 
-	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, error) {
+	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
 		eng := agent.NewEngine(
 			nil,
 			"test-model",
@@ -43,7 +43,7 @@ func TestClient_DaemonLifecycleAndStreaming(t *testing.T) {
 			emitHandler,
 			agent.WithSystemPromptOverride("mock prompt"),
 		)
-		return eng, nil
+		return eng, nil, nil
 	}
 
 	sessionMgr := daemon.NewSessionManager(factory)
@@ -102,7 +102,7 @@ func TestClient_SessionStreamingAndReattach(t *testing.T) {
 	sockMgr := daemon.NewSocketManager(sockPath)
 
 	var workerEmitter agent.EventHandler
-	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, error) {
+	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
 		workerEmitter = emitHandler
 		eng := agent.NewEngine(
 			&mockProvider{},
@@ -113,7 +113,7 @@ func TestClient_SessionStreamingAndReattach(t *testing.T) {
 			emitHandler,
 			agent.WithSystemPromptOverride("mock prompt"),
 		)
-		return eng, nil
+		return eng, nil, nil
 	}
 
 	sessionMgr := daemon.NewSessionManager(factory)
@@ -213,7 +213,12 @@ func TestClient_SessionStreamingAndReattach(t *testing.T) {
 		t.Fatalf("timed out waiting for replayed reasoning on c2")
 	}
 
-	// Cancel Session from c1
+	// Verify non-controller (c2, which joined with takeControl: false) cannot cancel session
+	if err := c2.CancelSession(sessionID); err == nil {
+		t.Fatalf("expected permission error when non-controller attempts to cancel session")
+	}
+
+	// Cancel Session from c1 (the primary controller)
 	if err := c1.CancelSession(sessionID); err != nil {
 		t.Fatalf("c1 failed to cancel session: %v", err)
 	}
@@ -226,7 +231,7 @@ func TestClient_PermissionRequestAndResponse(t *testing.T) {
 	sockMgr := daemon.NewSocketManager(sockPath)
 
 	var activeWorker *daemon.SessionWorker
-	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, error) {
+	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
 		eng := agent.NewEngine(
 			&mockProvider{},
 			"test-model",
@@ -236,7 +241,7 @@ func TestClient_PermissionRequestAndResponse(t *testing.T) {
 			emitHandler,
 			agent.WithSystemPromptOverride("mock prompt"),
 		)
-		return eng, nil
+		return eng, nil, nil
 	}
 
 	sessionMgr := daemon.NewSessionManager(factory)

@@ -17,7 +17,7 @@ func TestServer_LifecycleAndIPC(t *testing.T) {
 	sockMgr := NewSocketManager(sockPath)
 
 	// Mock engine factory that creates a test engine that emits simulated events
-	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, error) {
+	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
 		// Use a mock engine
 		eng := agent.NewEngine(
 			nil,
@@ -28,7 +28,7 @@ func TestServer_LifecycleAndIPC(t *testing.T) {
 			emitHandler,
 			agent.WithSystemPromptOverride("test prompt"),
 		)
-		return eng, nil
+		return eng, nil, nil
 	}
 
 	sessionMgr := NewSessionManager(factory)

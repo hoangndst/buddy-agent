@@ -36,6 +36,7 @@ type clientConnection struct {
 	conn       net.Conn
 	codec      *protocol.StreamCodec
 	outbound   chan *protocol.JSONRPCMessage
+	outboundMu sync.RWMutex
 	server     *Server
 	activeSess map[string]*SessionWorker
 	sessMu     sync.Mutex
@@ -47,6 +48,9 @@ func (c *clientConnection) ID() string {
 }
 
 func (c *clientConnection) Send(msg *protocol.JSONRPCMessage) error {
+	c.outboundMu.RLock()
+	defer c.outboundMu.RUnlock()
+
 	if c.closed.Load() {
 		return fmt.Errorf("connection closed")
 	}
@@ -60,7 +64,9 @@ func (c *clientConnection) Send(msg *protocol.JSONRPCMessage) error {
 
 func (c *clientConnection) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
+		c.outboundMu.Lock()
 		close(c.outbound)
+		c.outboundMu.Unlock()
 		return c.conn.Close()
 	}
 	return nil
@@ -276,11 +282,20 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 			return
 		}
 
-		if err := s.sessionMgr.CancelSession(params.SessionID); err != nil {
-			errRes := protocol.NewErrorResponse(msg.ID, protocol.ErrCodeSessionNotFound, err.Error(), nil)
+		worker, ok := s.sessionMgr.GetSession(params.SessionID)
+		if !ok {
+			errRes := protocol.NewErrorResponse(msg.ID, protocol.ErrCodeSessionNotFound, fmt.Sprintf("session %s not found", params.SessionID), nil)
 			_ = client.Send(errRes)
 			return
 		}
+
+		if !worker.IsController(client) {
+			errRes := protocol.NewErrorResponse(msg.ID, protocol.ErrCodePermissionDenied, "permission denied: only the primary controller can cancel this session", nil)
+			_ = client.Send(errRes)
+			return
+		}
+
+		worker.Cancel()
 
 		if msg.ID != nil {
 			res, _ := protocol.NewResponse(*msg.ID, map[string]string{"status": "canceled"})
@@ -324,6 +339,11 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 	}
 }
 
+// Done returns a channel that is closed when the daemon server terminates.
+func (s *Server) Done() <-chan struct{} {
+	return s.shutdownCh
+}
+
 // Stop initiates a disciplined two-phase graceful shutdown:
 // Phase 1: Notify clients and close socket listener.
 // Phase 2: Drain active sessions up to 5 seconds and release file locks.
@@ -333,6 +353,7 @@ func (s *Server) Stop() error {
 	}
 
 	s.cancel()
+	close(s.shutdownCh)
 
 	// Broadcast shutdown notice to all active clients
 	shuttingDownNotify, _ := protocol.NewNotification(protocol.NotifyDaemonShuttingDown, map[string]string{
