@@ -22,7 +22,7 @@ type Factory struct {
 	NewClientManager func(cfg *mcp.Config) *mcp.ClientManager
 	NewModelProvider  func(cfg *config.Config, client *openai.Client) provider.ModelProvider
 	Store             func() (persistence.Store, func(), error)
-	StoreForWorkspace func(wsDir string) (persistence.Store, func(), error)
+	StoreForWorkspace func(wsDir string, dbPath ...string) (persistence.Store, func(), error)
 }
 
 // NewFactory constructs a default production command factory.
@@ -76,17 +76,16 @@ func NewFactory() *Factory {
 			}
 			return store, cleanup, nil
 		},
-		StoreForWorkspace: func(wsDir string) (persistence.Store, func(), error) {
-			cfg, err := config.Load()
-			if err != nil {
-				return nil, nil, err
+		StoreForWorkspace: func(wsDir string, customDBPath ...string) (persistence.Store, func(), error) {
+			var dbPath string
+			if len(customDBPath) > 0 && customDBPath[0] != "" {
+				dbPath = customDBPath[0]
+				if !filepath.IsAbs(dbPath) && wsDir != "" {
+					dbPath = filepath.Clean(filepath.Join(wsDir, dbPath))
+				}
 			}
-			dbPath := cfg.DBPath
 			if dbPath == "" {
 				ws := wsDir
-				if ws == "" {
-					ws = cfg.WorkspaceDir
-				}
 				if ws == "" {
 					ws = "."
 				}

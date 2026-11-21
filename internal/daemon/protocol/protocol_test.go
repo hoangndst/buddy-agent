@@ -18,6 +18,7 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 		MaxContextTokens: 32000,
 		APIType:          "responses",
 		ReasoningEffort:  &effort,
+		DBPath:           "/custom/path.db",
 		MCPConfig: &mcp.Config{
 			MCPServers: map[string]mcp.ServerConfig{
 				"test-mcp": {
@@ -65,6 +66,9 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	}
 	if params.ReasoningEffort == nil || *params.ReasoningEffort != "medium" {
 		t.Fatalf("expected reasoning effort 'medium', got %+v", params.ReasoningEffort)
+	}
+	if params.DBPath != "/custom/path.db" {
+		t.Fatalf("expected db path '/custom/path.db', got %q", params.DBPath)
 	}
 	if params.MCPConfig == nil || len(params.MCPConfig.MCPServers) != 1 {
 		t.Fatalf("expected mcp config with 1 server, got %+v", params.MCPConfig)

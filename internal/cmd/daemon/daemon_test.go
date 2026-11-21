@@ -14,6 +14,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/daemon"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	core "github.com/hoangndst/buddy-agent/internal/mcp"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 	"github.com/openai/openai-go"
 )
@@ -392,5 +393,54 @@ func TestBuildEngineForSession_MCPConfigFallback(t *testing.T) {
 	}
 	if observedMCPConfig == nil || observedMCPConfig.MCPServers["fallback-server"].Command != "echo" {
 		t.Errorf("expected fallback server in observed MCPConfig, got %+v", observedMCPConfig)
+	}
+}
+
+func TestBuildEngineForSession_ExplicitDBPathForwarding(t *testing.T) {
+	tempDir := t.TempDir()
+	f := cmdutil.NewFactory()
+
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			Model:            "test-model",
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   10000,
+			MaxSteps:         10,
+			MaxContextTokens: 64000,
+		}, nil
+	}
+
+	var observedWsDir, observedDBPath string
+	f.StoreForWorkspace = func(wsDir string, customDBPath ...string) (persistence.Store, func(), error) {
+		observedWsDir = wsDir
+		if len(customDBPath) > 0 {
+			observedDBPath = customDBPath[0]
+		}
+		return nil, nil, nil
+	}
+
+	customDB := filepath.Join(tempDir, "caller_custom.db")
+	params := protocol.SessionStartParams{
+		Task:         "task with custom db",
+		WorkspaceDir: tempDir,
+		DBPath:       customDB,
+	}
+
+	eng, cleanup, err := buildEngineForSession(context.Background(), f, "sess_db_test", params, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+
+	if observedWsDir != tempDir {
+		t.Errorf("expected observed wsDir %q, got %q", tempDir, observedWsDir)
+	}
+	if observedDBPath != customDB {
+		t.Errorf("expected observed DBPath %q, got %q", customDB, observedDBPath)
 	}
 }

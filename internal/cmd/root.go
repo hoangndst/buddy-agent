@@ -279,6 +279,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 			baseURL := ""
 			var apiKey *string
 			apiType := ""
+			dbPath := ""
 			if cfg != nil {
 				workspaceDir = cfg.WorkspaceDir
 				model = cfg.Model
@@ -290,6 +291,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				k := cfg.APIKey
 				apiKey = &k
 				apiType = cfg.APIType
+				dbPath = cfg.DBPath
 			}
 			effectiveDir := workspaceDir
 			if effectiveDir == "" {
@@ -311,6 +313,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				APIKey:           apiKey,
 				APIType:          apiType,
 				MCPConfig:        mcpCfg,
+				DBPath:           dbPath,
 			})
 			if startErr != nil {
 				// Avoid ambiguous double-execution: if daemon connection succeeded but start failed, abort immediately

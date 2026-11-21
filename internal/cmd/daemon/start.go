@@ -258,7 +258,7 @@ func buildEngineForSession(
 
 	var store persistence.Store
 	if f.StoreForWorkspace != nil {
-		s, closer, sErr := f.StoreForWorkspace(wsDir)
+		s, closer, sErr := f.StoreForWorkspace(wsDir, params.DBPath)
 		if sErr == nil && s != nil {
 			store = s
 			if closer != nil {
