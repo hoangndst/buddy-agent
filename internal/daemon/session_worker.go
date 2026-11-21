@@ -113,7 +113,7 @@ func (w *SessionWorker) Start() {
 			finalType = agent.EventError
 			finalContent = err.Error()
 		}
-		w.EmitEvent(agent.Event{
+		w.EmitTerminalEvent(agent.Event{
 			Type:      finalType,
 			Content:   finalContent,
 			Timestamp: time.Now(),
@@ -121,7 +121,7 @@ func (w *SessionWorker) Start() {
 	}()
 }
 
-func createEventNotification(sessionID string, eventID uint64, evt agent.Event) (*protocol.JSONRPCMessage, error) {
+func createEventNotification(sessionID string, eventID uint64, evt agent.Event, terminal bool) (*protocol.JSONRPCMessage, error) {
 	content := evt.Content
 	if content == "" && evt.ToolResult != "" {
 		content = evt.ToolResult
@@ -136,6 +136,7 @@ func createEventNotification(sessionID string, eventID uint64, evt agent.Event) 
 		"tool_call_id": evt.ToolCallID,
 		"exit_code":    evt.ToolExitCode,
 		"tool_result":  evt.ToolResult,
+		"terminal":     terminal,
 	}
 	if evt.Error != nil {
 		data["error"] = evt.Error.Error()
@@ -152,9 +153,18 @@ func createEventNotification(sessionID string, eventID uint64, evt agent.Event) 
 
 // EmitEvent appends an event to the ring buffer and broadcasts it to all subscribers.
 func (w *SessionWorker) EmitEvent(evt agent.Event) {
-	eventID := w.ringBuffer.Push(evt)
+	w.emitEvent(evt, false)
+}
 
-	notify, err := createEventNotification(w.sessionID, eventID, evt)
+// EmitTerminalEvent appends a terminal completion or error event to the ring buffer and broadcasts it.
+func (w *SessionWorker) EmitTerminalEvent(evt agent.Event) {
+	w.emitEvent(evt, true)
+}
+
+func (w *SessionWorker) emitEvent(evt agent.Event, terminal bool) {
+	eventID := w.ringBuffer.PushWithTerminal(evt, terminal)
+
+	notify, err := createEventNotification(w.sessionID, eventID, evt, terminal)
 	if err != nil {
 		return
 	}
@@ -187,7 +197,7 @@ func (w *SessionWorker) Attach(conn ClientConn, lastEventID uint64, takeControl 
 	// Replay buffered events after lastEventID
 	missed := w.ringBuffer.ReplayAfter(lastEventID)
 	for _, item := range missed {
-		notify, err := createEventNotification(w.sessionID, item.EventID, item.Event)
+		notify, err := createEventNotification(w.sessionID, item.EventID, item.Event, item.Terminal)
 		if err != nil {
 			continue
 		}

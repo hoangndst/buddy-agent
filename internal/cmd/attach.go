@@ -81,8 +81,13 @@ func NewCmdAttach(f *cmdutil.Factory) *cobra.Command {
 						return nil
 					}
 					renderEvent(f, evt)
-					if evt.Type == string(agent.EventFinished) || evt.Type == string(agent.EventError) {
+					if evt.Type == string(agent.EventFinished) {
 						return nil
+					}
+					if evt.Type == string(agent.EventError) {
+						if term, _ := evt.Data["terminal"].(bool); term {
+							return nil
+						}
 					}
 				}
 			}
@@ -121,6 +126,11 @@ func renderEvent(f *cmdutil.Factory, evt protocol.SessionEventNotification) {
 				errMsg = e
 			}
 		}
-		_, _ = fmt.Fprintf(f.IOStreams.Out, "\n%s %s\n", errStyle.Render("✗ Execution failed:"), errMsg)
+		isTerminal, _ := evt.Data["terminal"].(bool)
+		if isTerminal {
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "\n%s %s\n", errStyle.Render("✗ Execution failed:"), errMsg)
+		} else {
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "%s %s\n", thoughtStyle.Render("⚠ Subagent notice:"), errMsg)
+		}
 	}
 }

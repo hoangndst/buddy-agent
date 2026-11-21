@@ -93,4 +93,23 @@ func TestServer_LifecycleAndIPC(t *testing.T) {
 	if cancelRes.Error == nil || cancelRes.Error.Code != protocol.ErrCodeSessionNotFound {
 		t.Fatalf("expected ErrCodeSessionNotFound, got %+v", cancelRes)
 	}
+
+	// 4. Test ID-less notification (must not panic the server)
+	pingNotify, _ := protocol.NewNotification(protocol.MethodDaemonPing, nil)
+	if err := codec.WriteMessage(pingNotify); err != nil {
+		t.Fatalf("failed to send notification: %v", err)
+	}
+
+	// Follow-up request must succeed without connection disruption
+	pingReq2, _ := protocol.NewRequest("ping-2", protocol.MethodDaemonPing, nil)
+	if err := codec.WriteMessage(pingReq2); err != nil {
+		t.Fatalf("failed to send second ping: %v", err)
+	}
+	pingRes2, err := codec.ReadMessage()
+	if err != nil {
+		t.Fatalf("failed to read second ping response: %v", err)
+	}
+	if pingRes2.ID == nil || *pingRes2.ID != "ping-2" {
+		t.Fatalf("expected ID ping-2, got %+v", pingRes2)
+	}
 }

@@ -15,6 +15,7 @@ type BufferedEvent struct {
 	EventID   uint64      `json:"event_id"`
 	Timestamp time.Time   `json:"timestamp"`
 	Event     agent.Event `json:"event"`
+	Terminal  bool        `json:"terminal"`
 }
 
 // EventRingBuffer provides thread-safe, memory-bounded circular storage for intra-session events.
@@ -42,6 +43,11 @@ func NewEventRingBuffer(capacity int) *EventRingBuffer {
 
 // Push appends an event to the ring buffer, overwriting the oldest element if full.
 func (rb *EventRingBuffer) Push(evt agent.Event) uint64 {
+	return rb.PushWithTerminal(evt, false)
+}
+
+// PushWithTerminal appends an event to the ring buffer with terminal flag.
+func (rb *EventRingBuffer) PushWithTerminal(evt agent.Event, terminal bool) uint64 {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
@@ -52,6 +58,7 @@ func (rb *EventRingBuffer) Push(evt agent.Event) uint64 {
 		EventID:   id,
 		Timestamp: time.Now(),
 		Event:     evt,
+		Terminal:  terminal,
 	}
 
 	rb.buffer[rb.tail] = item

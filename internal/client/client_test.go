@@ -156,6 +156,7 @@ func TestClient_SessionStreamingAndReattach(t *testing.T) {
 	workerEmitter(agent.Event{Type: agent.EventReasoning, Content: "analyzing project structure"})
 	workerEmitter(agent.Event{Type: agent.EventToolCall, ToolName: "list_directory"})
 	workerEmitter(agent.Event{Type: agent.EventToolResult, ToolName: "list_directory", ToolResult: "file1.go\nfile2.go"})
+	workerEmitter(agent.Event{Type: agent.EventError, Content: "subagent child step error"})
 
 	// Verify c1 receives reasoning event
 	select {
@@ -183,6 +184,15 @@ func TestClient_SessionStreamingAndReattach(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for event 3 on c1")
+	}
+
+	select {
+	case evt := <-c1.Events():
+		if evt.Type != "error" || evt.Content != "subagent child step error" || evt.Data["terminal"] == true {
+			t.Fatalf("unexpected non-terminal error event: %+v", evt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for intermediate error on c1")
 	}
 
 	// Connect Client 2 (Observer) and attach to existing session

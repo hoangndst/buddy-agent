@@ -45,7 +45,7 @@ func Connect(sockPath string) (*Client, error) {
 		conn:         conn,
 		codec:        protocol.NewStreamCodec(conn, conn),
 		pendingReqs:  make(map[string]chan *protocol.JSONRPCMessage),
-		eventsCh:     make(chan protocol.SessionEventNotification, 512),
+		eventsCh:     make(chan protocol.SessionEventNotification, 2048),
 		permissionCh: make(chan protocol.PermissionRequestNotification, 32),
 	}
 
@@ -141,6 +141,15 @@ func (c *Client) readPump() {
 				select {
 				case c.eventsCh <- notify:
 				default:
+					// Evict oldest unconsumed event to make room for newest events (especially terminal completion)
+					select {
+					case <-c.eventsCh:
+					default:
+					}
+					select {
+					case c.eventsCh <- notify:
+					default:
+					}
 				}
 			}
 		case protocol.NotifyPermissionRequired:

@@ -272,12 +272,21 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 			defer func() { _ = cl.Close() }()
 			cfg, _ := f.ConfigLoader()
 			workspaceDir := ""
+			model := ""
+			maxSteps := 0
+			reasoningEffort := ""
 			if cfg != nil {
 				workspaceDir = cfg.WorkspaceDir
+				model = cfg.Model
+				maxSteps = cfg.MaxSteps
+				reasoningEffort = cfg.ReasoningEffort
 			}
 			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{
-				Task:         task,
-				WorkspaceDir: workspaceDir,
+				Task:            task,
+				WorkspaceDir:    workspaceDir,
+				Model:           model,
+				MaxSteps:        maxSteps,
+				ReasoningEffort: reasoningEffort,
 			})
 			if startErr == nil {
 				_, _ = fmt.Fprintf(f.IOStreams.Out, "Dispatched task to daemon (Session ID: %s)\n", sessionID)
@@ -341,13 +350,16 @@ func streamClientEvents(ctx context.Context, f *cmdutil.Factory, cl *client.Clie
 				return nil
 			}
 			if evt.Type == string(agent.EventError) {
-				errMsg := evt.Content
-				if errMsg == "" && evt.Data != nil {
-					if e, ok := evt.Data["error"].(string); ok {
-						errMsg = e
+				isTerminal, _ := evt.Data["terminal"].(bool)
+				if isTerminal {
+					errMsg := evt.Content
+					if errMsg == "" && evt.Data != nil {
+						if e, ok := evt.Data["error"].(string); ok {
+							errMsg = e
+						}
 					}
+					return fmt.Errorf("task failed: %s", errMsg)
 				}
-				return fmt.Errorf("task failed: %s", errMsg)
 			}
 		}
 	}

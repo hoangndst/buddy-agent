@@ -179,30 +179,39 @@ func (s *Server) handleConnection(conn net.Conn) {
 func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPCMessage) {
 	switch msg.Method {
 	case protocol.MethodDaemonPing:
-		res, _ := protocol.NewResponse(*msg.ID, map[string]string{"status": "pong"})
-		_ = client.Send(res)
+		if msg.ID != nil {
+			res, _ := protocol.NewResponse(*msg.ID, map[string]string{"status": "pong"})
+			_ = client.Send(res)
+		}
 
 	case protocol.MethodDaemonStatus:
-		active := s.sessionMgr.ListActiveSessions()
-		uptime := int64(time.Since(s.startTime).Seconds())
-		statusRes := protocol.DaemonStatusResult{
-			PID:            os.Getpid(),
-			UptimeSeconds:  uptime,
-			SocketPath:     s.socketMgr.SocketPath(),
-			ActiveSessions: active,
+		if msg.ID != nil {
+			active := s.sessionMgr.ListActiveSessions()
+			uptime := int64(time.Since(s.startTime).Seconds())
+			statusRes := protocol.DaemonStatusResult{
+				PID:            os.Getpid(),
+				UptimeSeconds:  uptime,
+				SocketPath:     s.socketMgr.SocketPath(),
+				ActiveSessions: active,
+			}
+			res, _ := protocol.NewResponse(*msg.ID, statusRes)
+			_ = client.Send(res)
 		}
-		res, _ := protocol.NewResponse(*msg.ID, statusRes)
-		_ = client.Send(res)
 
 	case protocol.MethodDaemonStop:
-		res, _ := protocol.NewResponse(*msg.ID, map[string]string{"status": "shutting_down"})
-		_ = client.Send(res)
+		if msg.ID != nil {
+			res, _ := protocol.NewResponse(*msg.ID, map[string]string{"status": "shutting_down"})
+			_ = client.Send(res)
+		}
 		go func() {
 			time.Sleep(50 * time.Millisecond)
 			_ = s.Stop()
 		}()
 
 	case protocol.MethodSessionStart:
+		if msg.ID == nil {
+			return
+		}
 		var params protocol.SessionStartParams
 		if err := json.Unmarshal(msg.Params, &params); err != nil {
 			errRes := protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid session.start params", err.Error())
@@ -227,6 +236,9 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 		_ = client.Send(res)
 
 	case protocol.MethodSessionAttach:
+		if msg.ID == nil {
+			return
+		}
 		var params protocol.SessionAttachParams
 		if err := json.Unmarshal(msg.Params, &params); err != nil {
 			errRes := protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid session.attach params", err.Error())
