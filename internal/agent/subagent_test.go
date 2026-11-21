@@ -36,6 +36,7 @@ func TestSubagentTool_RoleGating(t *testing.T) {
 	reg.Register(&dummyTestTool{name: "create_skill"})
 	reg.Register(&dummyTestTool{name: "invoke_subagent"})
 	reg.Register(&dummyTestTool{name: "mcp_list_files"})
+	reg.Register(&dummyTestTool{name: "mcp_postgres-db_list_tables"})
 	reg.Register(&dummyTestTool{name: "mcp_create_issue"})
 	reg.Register(&dummyTestTool{name: "mcp_write_data"})
 	reg.Register(&dummyTestTool{name: "mcp_unknown_action"})
@@ -52,6 +53,9 @@ func TestSubagentTool_RoleGating(t *testing.T) {
 	}
 	if _, ok := resReg.Get("mcp_list_files"); !ok {
 		t.Errorf("expected researcher to have mcp_list_files")
+	}
+	if _, ok := resReg.Get("mcp_postgres-db_list_tables"); !ok {
+		t.Errorf("expected researcher to have mcp_postgres-db_list_tables")
 	}
 	for _, forbidden := range []string{"bash", "write_file", "edit_file", "invoke_subagent", "save_memory", "create_skill", "mcp_create_issue", "mcp_write_data", "mcp_unknown_action"} {
 		if _, ok := resReg.Get(forbidden); ok {

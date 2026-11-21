@@ -873,6 +873,8 @@ func (e *Engine) executeLoop(
 			Messages:        msgs,
 			Tools:           nil, // No tools allowed during emergency synthesis
 			ReasoningEffort: e.reasoningEffort,
+			IsLocal:         e.isLocal,
+			LocalNumCtx:     session.MaxContextTokens(),
 		}
 		synthResp, err := e.provider.Generate(ctx, genReq)
 		if err == nil && synthResp.Content != "" {

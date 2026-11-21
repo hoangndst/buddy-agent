@@ -368,7 +368,7 @@ func (t *InvokeSubagentTool) buildChildRegistry(role string) *tools.Registry {
 				return true
 			}
 			if strings.HasPrefix(name, "mcp_") {
-				return isReadOnlyMCPTool(name)
+				return isReadOnlyMCPTool(tool)
 			}
 			return false
 		}
@@ -378,7 +378,8 @@ func (t *InvokeSubagentTool) buildChildRegistry(role string) *tools.Registry {
 }
 
 // isReadOnlyMCPTool validates whether an MCP tool is a safe read-only inspection tool.
-func isReadOnlyMCPTool(name string) bool {
+func isReadOnlyMCPTool(tool tools.Tool) bool {
+	name := tool.Name()
 	// Standard built-in MCP resource inspection tools
 	if name == "mcp_list_resources" || name == "mcp_read_resource" {
 		return true
@@ -387,7 +388,32 @@ func isReadOnlyMCPTool(name string) bool {
 		return false
 	}
 
-	lower := strings.ToLower(name)
+	trimmed := strings.TrimPrefix(name, "mcp_")
+
+	// 1. If it implements ToolName() (e.g. mcp.ToolAdapter), use the exact MCP tool name
+	actionName := ""
+	if adapter, ok := tool.(interface{ ToolName() string }); ok && adapter.ToolName() != "" {
+		actionName = adapter.ToolName()
+	} else {
+		// Fallback for tests or direct tool registrations:
+		// If trimmed starts with a read-only keyword (e.g. "list_files", "read_file"), use trimmed directly
+		actionName = trimmed
+		if idx := strings.Index(trimmed, "_"); idx != -1 {
+			prefix := trimmed[:idx]
+			isVerb := false
+			for _, v := range []string{"read", "list", "get", "search", "fetch", "find", "query", "inspect", "describe", "view", "show", "cat", "info", "status"} {
+				if prefix == v {
+					isVerb = true
+					break
+				}
+			}
+			if !isVerb {
+				actionName = trimmed[idx+1:]
+			}
+		}
+	}
+
+	lower := strings.ToLower(actionName)
 
 	// Block mutating actions immediately
 	mutatingKeywords := []string{
