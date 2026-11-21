@@ -413,3 +413,97 @@ func TestResponsesProvider_MessageTranslation(t *testing.T) {
 		t.Errorf("expected reasoning.effort 'none' to be forwarded, got: %+v", capturedReasoning)
 	}
 }
+
+func TestAutoProvider_ParamRejectedOmitsParameterAndPersistsAcrossTurns(t *testing.T) {
+	var capturedEffort []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var rawBody map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&rawBody)
+
+		effortStr, hasEffort := rawBody["reasoning_effort"].(string)
+		if hasEffort {
+			capturedEffort = append(capturedEffort, effortStr)
+			// Endpoint rejects reasoning_effort as unrecognized parameter
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": "400 Bad Request: unrecognized parameter: reasoning_effort",
+				},
+			})
+			return
+		}
+		capturedEffort = append(capturedEffort, "")
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chat_test",
+			"choices": []map[string]any{
+				{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "chat success without reasoning_effort",
+					},
+				},
+			},
+			"usage": map[string]any{
+				"prompt_tokens":     10,
+				"completion_tokens": 5,
+				"total_tokens":      15,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := openai.NewClient(option.WithBaseURL(server.URL), option.WithAPIKey("test"))
+	chat := NewChatCompletionsProvider(&client)
+	respProv := NewResponsesProvider(&client)
+
+	auto := NewAutoProvider(chat, respProv, false)
+
+	// Turn 1: Initial turn with configured BUDDY_REASONING_EFFORT="medium"
+	req1 := GenerateRequest{
+		Model:           "test-model",
+		Messages:        []openai.ChatCompletionMessageParamUnion{openai.UserMessage("turn 1")},
+		ReasoningEffort: "medium",
+	}
+
+	resp1, err := auto.Generate(context.Background(), req1)
+	if err != nil {
+		t.Fatalf("expected Turn 1 to recover by omitting reasoning_effort, got: %v", err)
+	}
+	if resp1.Content != "chat success without reasoning_effort" {
+		t.Errorf("expected success message, got: %s", resp1.Content)
+	}
+	if auto.Protocol() != "chat" {
+		t.Errorf("expected auto to latch 'chat', got %s", auto.Protocol())
+	}
+
+	// Turn 2: Subsequent turn with configured BUDDY_REASONING_EFFORT="medium"
+	// Invariant: The parameter rejection omission must persist so it doesn't fail with 400 again
+	req2 := GenerateRequest{
+		Model:           "test-model",
+		Messages:        []openai.ChatCompletionMessageParamUnion{openai.UserMessage("turn 2")},
+		ReasoningEffort: "medium",
+	}
+
+	resp2, err := auto.Generate(context.Background(), req2)
+	if err != nil {
+		t.Fatalf("expected Turn 2 to succeed by continuing to omit reasoning_effort, got: %v", err)
+	}
+	if resp2.Content != "chat success without reasoning_effort" {
+		t.Errorf("expected success message on Turn 2, got: %s", resp2.Content)
+	}
+
+	// Verify request history:
+	// 1st request had "medium" -> rejected with 400
+	// 2nd request (retry) had "" (omitted) -> succeeded
+	// 3rd request (Turn 2) had "" (omitted) directly without failure
+	if len(capturedEffort) != 3 {
+		t.Fatalf("expected 3 total requests, got %d (%v)", len(capturedEffort), capturedEffort)
+	}
+	if capturedEffort[0] != "medium" || capturedEffort[1] != "" || capturedEffort[2] != "" {
+		t.Errorf("expected efforts ['medium', '', ''], got: %v", capturedEffort)
+	}
+}

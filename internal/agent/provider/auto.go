@@ -11,14 +11,20 @@ const (
 	latchResponses int32 = 2
 )
 
+const (
+	reasoningModeNormal int32 = 0
+	reasoningModeNone   int32 = 1 // Endpoint requires explicit reasoning_effort: "none" for tools
+	reasoningModeOmit   int32 = 2 // Endpoint rejects reasoning_effort as unknown parameter; omit entirely
+)
+
 // AutoProvider manages automatic capability negotiation and diagnostic escalation between
 // ChatCompletionsProvider and ResponsesProvider.
 type AutoProvider struct {
-	chat      *ChatCompletionsProvider
-	responses *ResponsesProvider
-	isLocal   bool
-	latch     int32
-	forceNone int32
+	chat          *ChatCompletionsProvider
+	responses     *ResponsesProvider
+	isLocal       bool
+	latch         int32
+	reasoningMode int32
 }
 
 // NewAutoProvider creates an AutoProvider instance.
@@ -56,9 +62,13 @@ func (p *AutoProvider) Generate(ctx context.Context, req GenerateRequest) (*Gene
 		return p.responses.Generate(ctx, req)
 	}
 
-	// If reasoning downgrade was previously latched, enforce reasoning_effort: "none"
-	if atomic.LoadInt32(&p.forceNone) == 1 {
+	// Apply persisted reasoning sanitization if previously latched
+	mode := atomic.LoadInt32(&p.reasoningMode)
+	switch mode {
+	case reasoningModeNone:
 		req.ReasoningEffort = "none"
+	case reasoningModeOmit:
+		req.ReasoningEffort = ""
 	}
 
 	// If already latched to chat, delegate directly
@@ -66,11 +76,16 @@ func (p *AutoProvider) Generate(ctx context.Context, req GenerateRequest) (*Gene
 		resp, err := p.chat.Generate(ctx, req)
 		if err != nil {
 			kind := ParseCapabilityError(err)
-			if kind == CapabilityErrorReasoningConflict || kind == CapabilityErrorParamRejected {
-				// Retry with sanitized reasoning_effort and latch the downgrade
-				atomic.StoreInt32(&p.forceNone, 1)
+			if kind == CapabilityErrorReasoningConflict {
+				atomic.StoreInt32(&p.reasoningMode, reasoningModeNone)
 				sanitizedReq := req
 				sanitizedReq.ReasoningEffort = "none"
+				return p.chat.Generate(ctx, sanitizedReq)
+			}
+			if kind == CapabilityErrorParamRejected {
+				atomic.StoreInt32(&p.reasoningMode, reasoningModeOmit)
+				sanitizedReq := req
+				sanitizedReq.ReasoningEffort = ""
 				return p.chat.Generate(ctx, sanitizedReq)
 			}
 		}
@@ -90,7 +105,7 @@ func (p *AutoProvider) Generate(ctx context.Context, req GenerateRequest) (*Gene
 
 	// Check for capability conflict
 	kind := ParseCapabilityError(err)
-	if kind == CapabilityErrorReasoningConflict || kind == CapabilityErrorParamRejected {
+	if kind == CapabilityErrorReasoningConflict {
 		// Diagnostic escalation to Responses API
 		respResp, respErr := p.responses.Generate(ctx, req)
 		if respErr == nil {
@@ -100,12 +115,21 @@ func (p *AutoProvider) Generate(ctx context.Context, req GenerateRequest) (*Gene
 		// If Responses API is unsupported (404/405), downgrade to chat with reasoning_effort: "none"
 		if ParseCapabilityError(respErr) == CapabilityErrorEndpointUnsupported {
 			atomic.StoreInt32(&p.latch, latchChat)
-			atomic.StoreInt32(&p.forceNone, 1)
+			atomic.StoreInt32(&p.reasoningMode, reasoningModeNone)
 			sanitizedReq := req
 			sanitizedReq.ReasoningEffort = "none"
 			return p.chat.Generate(ctx, sanitizedReq)
 		}
 		return nil, respErr
+	}
+
+	if kind == CapabilityErrorParamRejected {
+		// Endpoint rejects reasoning_effort as unknown parameter: omit parameter entirely
+		atomic.StoreInt32(&p.latch, latchChat)
+		atomic.StoreInt32(&p.reasoningMode, reasoningModeOmit)
+		sanitizedReq := req
+		sanitizedReq.ReasoningEffort = ""
+		return p.chat.Generate(ctx, sanitizedReq)
 	}
 
 	// Other operational error (401, 403, 429, 5xx, or network timeout) - fail fast immediately without latching
