@@ -113,6 +113,10 @@ func renderEvent(f *cmdutil.Factory, evt protocol.SessionEventNotification) {
 		if evt.Content != "" {
 			_, _ = fmt.Fprintf(f.IOStreams.Out, "%s\n", thoughtStyle.Render(evt.Content))
 		}
+	case agent.EventTextComplete:
+		if evt.Content != "" {
+			_, _ = fmt.Fprintln(f.IOStreams.Out, evt.Content)
+		}
 	case agent.EventToolCall:
 		toolName, _ := evt.Data["tool_name"].(string)
 		_, _ = fmt.Fprintf(f.IOStreams.Out, "%s\n", toolStyle.Render(fmt.Sprintf("⚙ %s", toolName)))

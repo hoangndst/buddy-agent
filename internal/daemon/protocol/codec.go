@@ -107,6 +107,19 @@ func DecodeMessage(data []byte) (*JSONRPCMessage, error) {
 	return &msg, nil
 }
 
+// StreamReadError indicates an unrecoverable transport or scanner framing error.
+type StreamReadError struct {
+	Err error
+}
+
+func (e *StreamReadError) Error() string {
+	return fmt.Sprintf("stream read error: %v", e.Err)
+}
+
+func (e *StreamReadError) Unwrap() error {
+	return e.Err
+}
+
 // StreamCodec provides line-delimited reading and thread-safe writing of JSON-RPC messages.
 type StreamCodec struct {
 	scanner *bufio.Scanner
@@ -129,7 +142,7 @@ func NewStreamCodec(r io.Reader, w io.Writer) *StreamCodec {
 func (c *StreamCodec) ReadMessage() (*JSONRPCMessage, error) {
 	if !c.scanner.Scan() {
 		if err := c.scanner.Err(); err != nil {
-			return nil, fmt.Errorf("stream read error: %w", err)
+			return nil, &StreamReadError{Err: err}
 		}
 		return nil, io.EOF
 	}

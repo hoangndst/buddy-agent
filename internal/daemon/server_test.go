@@ -219,3 +219,73 @@ func TestServer_DoneSignalsAfterDrain(t *testing.T) {
 		t.Fatal("timed out waiting for server.Done() to close")
 	}
 }
+
+func TestServer_OversizedFrameClosesConnectionWithoutLoop(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "oversized_test.sock")
+
+	sockMgr := NewSocketManager(sockPath)
+	sm := NewSessionManager(nil)
+	server := NewServer(sockMgr, sm)
+
+	if err := server.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer func() { _ = server.Stop() }()
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	codec := protocol.NewStreamCodec(conn, conn)
+	pingReq, _ := protocol.NewRequest("ping-oversized-1", protocol.MethodDaemonPing, nil)
+	if err := codec.WriteMessage(pingReq); err != nil {
+		t.Fatalf("ping failed: %v", err)
+	}
+
+	pingRes, err := codec.ReadMessage()
+	if err != nil {
+		t.Fatalf("ping response failed: %v", err)
+	}
+	if *pingRes.ID != "ping-oversized-1" {
+		t.Fatalf("unexpected ping response: %+v", pingRes)
+	}
+
+	// Send an oversized frame that exceeds DefaultMaxMessageSize
+	oversized := make([]byte, protocol.DefaultMaxMessageSize+4096)
+	for i := range oversized {
+		oversized[i] = 'x'
+	}
+	oversized[len(oversized)-1] = '\n'
+
+	if _, err := conn.Write(oversized); err != nil {
+		t.Fatalf("failed to write oversized frame: %v", err)
+	}
+
+	// Server should close the connection upon terminal scanner error, causing client read to yield EOF
+	buf := make([]byte, 128)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, readErr := conn.Read(buf)
+	if readErr == nil {
+		t.Fatal("expected read error/EOF after server closes connection on oversized frame")
+	}
+
+	// Verify server cleaned up the client from active clients map
+	deadline := time.Now().Add(1 * time.Second)
+	cleaned := false
+	for time.Now().Before(deadline) {
+		server.clientsMu.RLock()
+		clientCount := len(server.clients)
+		server.clientsMu.RUnlock()
+		if clientCount == 0 {
+			cleaned = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !cleaned {
+		t.Fatal("server did not clean up client connection after stream error")
+	}
+}

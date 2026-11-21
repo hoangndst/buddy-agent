@@ -1,8 +1,10 @@
 package protocol
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -177,5 +179,29 @@ func TestDecodeMessage_Validation(t *testing.T) {
 	// Wrong JSON-RPC version
 	if _, err := DecodeMessage([]byte(`{"jsonrpc":"1.0","method":"foo"}`)); err == nil {
 		t.Errorf("expected error on wrong jsonrpc version")
+	}
+}
+
+func TestStreamCodec_OversizedMessageReturnsStreamReadError(t *testing.T) {
+	// Generate payload exceeding DefaultMaxMessageSize (16MB)
+	oversized := make([]byte, DefaultMaxMessageSize+1024)
+	for i := range oversized {
+		oversized[i] = 'a'
+	}
+	oversized[len(oversized)-1] = '\n'
+
+	codec := NewStreamCodec(bytes.NewReader(oversized), &bytes.Buffer{})
+	_, err := codec.ReadMessage()
+	if err == nil {
+		t.Fatal("expected error reading oversized message, got nil")
+	}
+
+	var streamErr *StreamReadError
+	if !errors.As(err, &streamErr) {
+		t.Fatalf("expected *StreamReadError, got %T: %v", err, err)
+	}
+
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("expected underlying error to be bufio.ErrTooLong, got %v", streamErr.Unwrap())
 	}
 }

@@ -244,3 +244,20 @@ func TestRenderEvent_ToolResultDelegatedOutput(t *testing.T) {
 		t.Errorf("expected output to preserve subagent label, got:\n%s", out)
 	}
 }
+
+func TestRenderEvent_TextComplete(t *testing.T) {
+	f := cmdutil.NewFactory()
+	ioStreams, _, outBuf, _ := cmdutil.TestIOStreams()
+	f.IOStreams = ioStreams
+
+	evt := protocol.SessionEventNotification{
+		Type:    string(agent.EventTextComplete),
+		Content: "I have prepared the changes and will now execute the build.",
+	}
+	renderEvent(f, evt)
+
+	out := outBuf.String()
+	if !strings.Contains(out, "I have prepared the changes and will now execute the build.") {
+		t.Errorf("expected conversational text in output, got:\n%s", out)
+	}
+}

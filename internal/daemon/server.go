@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -185,9 +186,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 	for {
 		msg, err := client.codec.ReadMessage()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return
 			}
+			var streamErr *protocol.StreamReadError
+			if errors.As(err, &streamErr) {
+				return
+			}
+			// Malformed JSON on an otherwise intact scanned line: skip and continue
 			continue
 		}
 
