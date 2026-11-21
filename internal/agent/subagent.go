@@ -45,6 +45,8 @@ type InvokeSubagentTool struct {
 	compClient      history.CompletionClient
 	store           persistence.Store
 	eventHandler    EventHandler
+	isLocal         bool
+	maxContextTokens int
 }
 
 // SubagentToolConfig specifies dependencies required to instantiate InvokeSubagentTool.
@@ -61,6 +63,8 @@ type SubagentToolConfig struct {
 	Store           persistence.Store
 	EventHandler    EventHandler
 	MaxCalls        int
+	IsLocal         bool
+	MaxContextTokens int
 }
 
 // NewInvokeSubagentTool creates a new InvokeSubagentTool.
@@ -82,6 +86,8 @@ func NewInvokeSubagentTool(cfg SubagentToolConfig) *InvokeSubagentTool {
 		compClient:      cfg.CompClient,
 		store:           cfg.Store,
 		eventHandler:    cfg.EventHandler,
+		isLocal:         cfg.IsLocal,
+		maxContextTokens: cfg.MaxContextTokens,
 	}
 }
 
@@ -208,15 +214,15 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 	// 4. Build role-gated child tool registry via CloneWithFilter
 	childRegistry := t.buildChildRegistry(role)
 
-	// 5. Build isolated non-interactive system prompt
-	subagentPrompt := t.buildSubagentSystemPrompt(role, task)
-
-	// 6. Setup invariant inheritance from parent tracker
+	// 5. Setup invariant inheritance from parent tracker
 	var inheritedInvariants []string
 	if parentTracker != nil {
 		data := parentTracker.ExportData()
 		inheritedInvariants = data.Invariants
 	}
+
+	// 6. Build isolated non-interactive system prompt with inherited constraints
+	subagentPrompt := t.buildSubagentSystemPrompt(role, task, inheritedInvariants)
 
 	// 7. Scoped event handler for indented terminal output
 	wrappedHandler := func(ev Event) {
@@ -259,7 +265,7 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 	childCtx, cancel := context.WithTimeout(ctx, DefaultChildTimeout)
 	defer cancel()
 
-	// 9. Instantiate child engine with depth=1
+	// 9. Instantiate child engine with depth=1 and local context propagation
 	childEngine := NewEngine(
 		t.provider,
 		t.model,
@@ -276,6 +282,8 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 		WithWorkspaceDir(t.workspaceDir),
 		WithCompletionClient(t.compClient),
 		WithReasoningEffort(t.reasoningEffort),
+		WithIsLocal(t.isLocal),
+		WithMaxContextTokens(t.maxContextTokens),
 	)
 
 	// 10. Execute child engine inside panic isolation cushion
@@ -292,17 +300,7 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 		summary, childErr = childEngine.Run(childCtx, task)
 	}()
 
-	// 11. Handle child cancellation and timeout differentiation
-	if ctx.Err() != nil {
-		// Parent context was canceled (e.g. user SIGINT)
-		return "", ctx.Err()
-	}
-
-	if errors.Is(childCtx.Err(), context.DeadlineExceeded) {
-		return fmt.Sprintf("Status: budget_exhausted\nError: subagent exceeded execution timeout (%v)\nPartial output: %s", DefaultChildTimeout, summary), nil
-	}
-
-	// 12. State & Metric Rollup
+	// 11. State & Metric Rollup (always collect tokens, even on error or timeout)
 	execResult := childEngine.LastExecutionResult()
 	if execResult != nil {
 		t.mu.Lock()
@@ -323,6 +321,16 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 				parentTracker.RecordFileAccess(path, rec.Action)
 			}
 		}
+	}
+
+	// 12. Handle child cancellation and timeout differentiation
+	if ctx.Err() != nil {
+		// Parent context was canceled (e.g. user SIGINT)
+		return "", ctx.Err()
+	}
+
+	if errors.Is(childCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Sprintf("Status: budget_exhausted\nError: subagent exceeded execution timeout (%v)\nPartial output: %s", DefaultChildTimeout, summary), nil
 	}
 
 	if childErr != nil {
@@ -364,7 +372,7 @@ func (t *InvokeSubagentTool) buildChildRegistry(role string) *tools.Registry {
 }
 
 // buildSubagentSystemPrompt constructs a concise non-interactive prompt for subagents.
-func (t *InvokeSubagentTool) buildSubagentSystemPrompt(role, task string) string {
+func (t *InvokeSubagentTool) buildSubagentSystemPrompt(role, task string, invariants []string) string {
 	var roleRules string
 	if role == "researcher" {
 		roleRules = "- You have read-only access. You can read files and inspect project structure, but cannot run shell commands or modify files."
@@ -372,14 +380,24 @@ func (t *InvokeSubagentTool) buildSubagentSystemPrompt(role, task string) string
 		roleRules = "- You have full development access to write code, edit files, and execute shell commands to accomplish the sub-task."
 	}
 
+	var invSection string
+	if len(invariants) > 0 {
+		var sb strings.Builder
+		sb.WriteString("\nInherited Invariants (Strict Constraints):\n")
+		for _, inv := range invariants {
+			sb.WriteString(fmt.Sprintf("- %s\n", inv))
+		}
+		invSection = sb.String()
+	}
+
 	return fmt.Sprintf(`You are a specialized subagent operating under the supervision of a primary agent.
 Your role: %s
 Your assigned task: %s
-
+%s
 Operational Directives:
 %s
 - Focus strictly on completing the assigned task using your available tools.
 - Do not use conversational filler, pleasantries, or ask clarifying questions.
 - When finished, provide a concise, factual synthesis of your findings, actions taken, and touched files.
-- If you encounter blockers or cannot complete the task, state the exact reason clearly.`, role, task, roleRules)
+- If you encounter blockers or cannot complete the task, state the exact reason clearly.`, role, task, invSection, roleRules)
 }

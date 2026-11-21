@@ -495,3 +495,45 @@ func TestSubagentTool_ChildUsageTracking(t *testing.T) {
 		t.Errorf("expected 0 child tokens after reset, got %d", subTool.ChildUsage().TotalTokens)
 	}
 }
+
+func TestSubagentTool_InheritedInvariantsInSystemPrompt(t *testing.T) {
+	subTool := NewInvokeSubagentTool(SubagentToolConfig{Depth: 0})
+	invariants := []string{"Do not touch main.go", "All tests must pass"}
+	prompt := subTool.buildSubagentSystemPrompt("researcher", "Investigate code", invariants)
+
+	for _, inv := range invariants {
+		if !strings.Contains(prompt, inv) {
+			t.Errorf("expected prompt to contain invariant %q, got:\n%s", inv, prompt)
+		}
+	}
+	if !strings.Contains(prompt, "Inherited Invariants (Strict Constraints)") {
+		t.Errorf("expected header for invariants, got:\n%s", prompt)
+	}
+}
+
+func TestStateTracker_HasDynamicUpdatesWithInvariants(t *testing.T) {
+	tracker := history.NewStateTracker("Test task", nil)
+	if tracker.HasDynamicUpdates() {
+		t.Fatal("expected empty tracker to have no dynamic updates")
+	}
+
+	tracker.AddInvariant("Always preserve backwards compatibility")
+	if !tracker.HasDynamicUpdates() {
+		t.Fatal("expected tracker with invariants to have dynamic updates")
+	}
+}
+
+func TestSubagentTool_LocalProviderPropagation(t *testing.T) {
+	subTool := NewInvokeSubagentTool(SubagentToolConfig{
+		Depth:            0,
+		IsLocal:          true,
+		MaxContextTokens: 32000,
+	})
+
+	if !subTool.isLocal {
+		t.Errorf("expected subTool.isLocal == true")
+	}
+	if subTool.maxContextTokens != 32000 {
+		t.Errorf("expected subTool.maxContextTokens == 32000, got %d", subTool.maxContextTokens)
+	}
+}

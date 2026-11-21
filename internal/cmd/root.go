@@ -216,14 +216,16 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 
 	// Register InvokeSubagentTool on the root engine (depth = 0)
 	subTool := agent.NewInvokeSubagentTool(agent.SubagentToolConfig{
-		Depth:           0,
-		ParentRegistry:  reg,
-		Provider:        prov,
-		Model:           cfg.Model,
-		WorkspaceDir:    cfg.WorkspaceDir,
-		ReasoningEffort: cfg.ReasoningEffort,
-		Store:           store,
-		EventHandler:    eventHandler,
+		Depth:            0,
+		ParentRegistry:   reg,
+		Provider:         prov,
+		Model:            cfg.Model,
+		WorkspaceDir:     cfg.WorkspaceDir,
+		ReasoningEffort:  cfg.ReasoningEffort,
+		Store:            store,
+		EventHandler:     eventHandler,
+		IsLocal:          cfg.IsLocal,
+		MaxContextTokens: cfg.MaxContextTokens,
 	})
 	reg.Register(subTool)
 

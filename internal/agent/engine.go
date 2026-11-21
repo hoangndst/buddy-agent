@@ -497,6 +497,17 @@ func (e *Engine) executeLoop(
 		return usage
 	}
 
+	defer func() {
+		if e.lastExecutionResult == nil {
+			e.lastExecutionResult = &ExecutionResult{
+				SessionID:     sessionID,
+				Status:        persistence.StatusFailed,
+				ModifiedFiles: session.Tracker().ExportData().ModifiedFiles,
+				TokenUsage:    getBillingUsage(),
+			}
+		}
+	}()
+
 	for step := startStep; step <= totalMaxSteps; step++ {
 		session.SetCurrentStep(step)
 		select {
