@@ -121,23 +121,40 @@ func (w *SessionWorker) Start() {
 	}()
 }
 
-// EmitEvent appends an event to the ring buffer and broadcasts it to all subscribers.
-func (w *SessionWorker) EmitEvent(evt agent.Event) {
-	eventID := w.ringBuffer.Push(evt)
+func createEventNotification(sessionID string, eventID uint64, evt agent.Event) (*protocol.JSONRPCMessage, error) {
+	content := evt.Content
+	if content == "" && evt.ToolResult != "" {
+		content = evt.ToolResult
+	}
+	if content == "" && evt.Error != nil {
+		content = evt.Error.Error()
+	}
 
 	data := map[string]any{
 		"step":         evt.Step,
 		"tool_name":    evt.ToolName,
 		"tool_call_id": evt.ToolCallID,
 		"exit_code":    evt.ToolExitCode,
+		"tool_result":  evt.ToolResult,
 	}
-	notify, err := protocol.NewNotification(protocol.NotifySessionEvent, protocol.SessionEventNotification{
-		SessionID: w.sessionID,
+	if evt.Error != nil {
+		data["error"] = evt.Error.Error()
+	}
+
+	return protocol.NewNotification(protocol.NotifySessionEvent, protocol.SessionEventNotification{
+		SessionID: sessionID,
 		EventID:   eventID,
 		Type:      string(evt.Type),
-		Content:   evt.Content,
+		Content:   content,
 		Data:      data,
 	})
+}
+
+// EmitEvent appends an event to the ring buffer and broadcasts it to all subscribers.
+func (w *SessionWorker) EmitEvent(evt agent.Event) {
+	eventID := w.ringBuffer.Push(evt)
+
+	notify, err := createEventNotification(w.sessionID, eventID, evt)
 	if err != nil {
 		return
 	}
@@ -170,19 +187,10 @@ func (w *SessionWorker) Attach(conn ClientConn, lastEventID uint64, takeControl 
 	// Replay buffered events after lastEventID
 	missed := w.ringBuffer.ReplayAfter(lastEventID)
 	for _, item := range missed {
-		data := map[string]any{
-			"step":         item.Event.Step,
-			"tool_name":    item.Event.ToolName,
-			"tool_call_id": item.Event.ToolCallID,
-			"exit_code":    item.Event.ToolExitCode,
+		notify, err := createEventNotification(w.sessionID, item.EventID, item.Event)
+		if err != nil {
+			continue
 		}
-		notify, _ := protocol.NewNotification(protocol.NotifySessionEvent, protocol.SessionEventNotification{
-			SessionID: w.sessionID,
-			EventID:   item.EventID,
-			Type:      string(item.Event.Type),
-			Content:   item.Event.Content,
-			Data:      data,
-		})
 		if err := conn.Send(notify); err != nil {
 			w.Detach(conn)
 			return role, err

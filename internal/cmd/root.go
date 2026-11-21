@@ -341,7 +341,13 @@ func streamClientEvents(ctx context.Context, f *cmdutil.Factory, cl *client.Clie
 				return nil
 			}
 			if evt.Type == string(agent.EventError) {
-				return fmt.Errorf("task failed: %s", evt.Content)
+				errMsg := evt.Content
+				if errMsg == "" && evt.Data != nil {
+					if e, ok := evt.Data["error"].(string); ok {
+						errMsg = e
+					}
+				}
+				return fmt.Errorf("task failed: %s", errMsg)
 			}
 		}
 	}

@@ -103,12 +103,24 @@ func renderEvent(f *cmdutil.Factory, evt protocol.SessionEventNotification) {
 		toolName, _ := evt.Data["tool_name"].(string)
 		_, _ = fmt.Fprintf(f.IOStreams.Out, "%s\n", toolStyle.Render(fmt.Sprintf("⚙ %s", toolName)))
 	case agent.EventToolResult:
-		if evt.Content != "" {
-			_, _ = fmt.Fprintf(f.IOStreams.Out, "%s\n", resultStyle.Render(evt.Content))
+		res := evt.Content
+		if res == "" && evt.Data != nil {
+			if tr, ok := evt.Data["tool_result"].(string); ok {
+				res = tr
+			}
+		}
+		if res != "" {
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "%s\n", resultStyle.Render(res))
 		}
 	case agent.EventFinished:
 		_, _ = fmt.Fprintf(f.IOStreams.Out, "\n%s %s\n", doneStyle.Render("✓ Execution completed:"), evt.Content)
 	case agent.EventError:
-		_, _ = fmt.Fprintf(f.IOStreams.Out, "\n%s %s\n", errStyle.Render("✗ Execution failed:"), evt.Content)
+		errMsg := evt.Content
+		if errMsg == "" && evt.Data != nil {
+			if e, ok := evt.Data["error"].(string); ok {
+				errMsg = e
+			}
+		}
+		_, _ = fmt.Fprintf(f.IOStreams.Out, "\n%s %s\n", errStyle.Render("✗ Execution failed:"), errMsg)
 	}
 }

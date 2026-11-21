@@ -155,6 +155,7 @@ func TestClient_SessionStreamingAndReattach(t *testing.T) {
 	// Emit custom events from daemon
 	workerEmitter(agent.Event{Type: agent.EventReasoning, Content: "analyzing project structure"})
 	workerEmitter(agent.Event{Type: agent.EventToolCall, ToolName: "list_directory"})
+	workerEmitter(agent.Event{Type: agent.EventToolResult, ToolName: "list_directory", ToolResult: "file1.go\nfile2.go"})
 
 	// Verify c1 receives reasoning event
 	select {
@@ -173,6 +174,15 @@ func TestClient_SessionStreamingAndReattach(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for event 2 on c1")
+	}
+
+	select {
+	case evt := <-c1.Events():
+		if evt.Type != "tool_result" || evt.Content != "file1.go\nfile2.go" || evt.Data["tool_result"] != "file1.go\nfile2.go" {
+			t.Fatalf("unexpected event 3 (tool_result): %+v", evt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for event 3 on c1")
 	}
 
 	// Connect Client 2 (Observer) and attach to existing session
@@ -194,7 +204,7 @@ func TestClient_SessionStreamingAndReattach(t *testing.T) {
 		t.Fatalf("unexpected attach result: %+v", attachRes)
 	}
 
-	// Verify c2 receives replayed events (step_start, then reasoning, then tool_call)
+	// Verify c2 receives replayed events (step_start, then reasoning, then tool_call, then tool_result)
 	select {
 	case evt := <-c2.Events():
 		if evt.Type != "step_start" {
@@ -211,6 +221,24 @@ func TestClient_SessionStreamingAndReattach(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for replayed reasoning on c2")
+	}
+
+	select {
+	case evt := <-c2.Events():
+		if evt.Type != "tool_call" {
+			t.Fatalf("c2 replay event 3 mismatch: expected tool_call, got %+v", evt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for replayed tool_call on c2")
+	}
+
+	select {
+	case evt := <-c2.Events():
+		if evt.Type != "tool_result" || evt.Content != "file1.go\nfile2.go" {
+			t.Fatalf("c2 replay event 4 mismatch: expected tool_result, got %+v", evt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for replayed tool_result on c2")
 	}
 
 	// Verify non-controller (c2, which joined with takeControl: false) cannot cancel session
