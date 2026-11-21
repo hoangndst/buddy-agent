@@ -10,6 +10,15 @@ import (
 	"testing"
 )
 
+func testExecutable(t *testing.T) string {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable failed: %v", err)
+	}
+	return executable
+}
+
 func TestStdioTransport_BaseEnvironment(t *testing.T) {
 	t.Run("CustomBaseEnv_WithOverrides", func(t *testing.T) {
 		baseEnv := []string{
@@ -18,7 +27,7 @@ func TestStdioTransport_BaseEnvironment(t *testing.T) {
 			"PATH=/custom/bin",
 		}
 		srv := ServerConfig{
-			Command: "echo",
+			Command: testExecutable(t),
 			Args:    []string{"hello"},
 			Env: map[string]string{
 				"SHARED_VAR": "server_override",
@@ -125,7 +134,7 @@ func TestStdioTransport_BaseEnvironment(t *testing.T) {
 
 	t.Run("EmptyBaseEnv_PreservedWithoutOsEnviron", func(t *testing.T) {
 		srv := ServerConfig{
-			Command: "echo",
+			Command: testExecutable(t),
 			Env: map[string]string{
 				"ONLY_KEY": "only_val",
 			},
@@ -258,6 +267,31 @@ func TestStdioTransport_CustomPATH_PrecedenceOverHost(t *testing.T) {
 	}
 	if cmd.Path != expectedAbs {
 		t.Errorf("expected cmd.Path to resolve to custom directory %q, got %q", expectedAbs, cmd.Path)
+	}
+}
+
+func TestStdioTransport_BareCommandMustResolveInEffectivePATH(t *testing.T) {
+	hostExecutable, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go executable is not available on the host PATH")
+	}
+	command := filepath.Base(hostExecutable)
+	emptyPath := t.TempDir()
+
+	_, err = NewStdioTransport(ServerConfig{Command: command}, []string{"PATH=" + emptyPath})
+	if err == nil {
+		t.Fatalf("expected %q to fail when absent from the effective session PATH", command)
+	}
+	if !strings.Contains(err.Error(), "effective session PATH") {
+		t.Fatalf("expected session PATH resolution error, got: %v", err)
+	}
+
+	_, err = NewStdioTransport(ServerConfig{Command: command}, []string{"SESSION_ONLY=value"})
+	if err == nil {
+		t.Fatalf("expected %q to fail when PATH is absent from the effective session environment", command)
+	}
+	if !strings.Contains(err.Error(), "PATH is not set") {
+		t.Fatalf("expected missing PATH error, got: %v", err)
 	}
 }
 

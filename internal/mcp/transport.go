@@ -163,11 +163,14 @@ func buildStdioCommand(srv ServerConfig, baseEnv ...[]string) (*exec.Cmd, subpro
 				}
 			}
 		}
-		if ok {
-			if lp, err := lookPathIn(srv.Command, pathVal); err == nil {
-				resolvedPath = lp
-			}
+		if !ok || pathVal == "" {
+			return nil, nil, nil, fmt.Errorf("cannot resolve MCP command %q: PATH is not set in the effective session environment", srv.Command)
 		}
+		lp, err := lookPathIn(srv.Command, pathVal)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("cannot resolve MCP command %q in the effective session PATH: %w", srv.Command, err)
+		}
+		resolvedPath = lp
 	}
 
 	cmd := exec.Command(resolvedPath, srv.Args...)
