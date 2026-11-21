@@ -301,8 +301,9 @@ func TestServer_OversizedFrameClosesConnectionWithoutLoop(t *testing.T) {
 }
 
 func TestCreateEventNotification_OversizedToolResultBounded(t *testing.T) {
-	// Create a large tool result of 800 KB (which previously was duplicated to 1.6 MB)
-	largeResult := strings.Repeat("x", 800*1024)
+	// HTML-escaped characters expand sixfold during JSON encoding; the encoded
+	// notification must remain bounded after escaping, not just before it.
+	largeResult := strings.Repeat("&", 800*1024)
 	evt := agent.Event{
 		Type:       agent.EventToolResult,
 		Step:       1,

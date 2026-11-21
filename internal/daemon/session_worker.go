@@ -137,8 +137,7 @@ func (w *SessionWorker) Start() {
 	}()
 }
 
-// maxNotificationFieldBytes defines the maximum byte size for individual large string fields
-// in event notifications to ensure the total JSON-RPC frame stays well within DefaultMaxMessageSize.
+// maxNotificationFieldBytes limits unescaped event fields before the final encoded frame-size check.
 const maxNotificationFieldBytes = 256 * 1024
 
 func truncateForEvent(s string, maxBytes int) string {
@@ -163,6 +162,10 @@ func utf8SafePrefix(s string, maxBytes int) int {
 }
 
 func createEventNotification(sessionID string, eventID uint64, evt agent.Event, terminal bool) (*protocol.JSONRPCMessage, error) {
+	sessionID = truncateForEvent(sessionID, maxNotificationFieldBytes)
+	eventType := truncateForEvent(string(evt.Type), maxNotificationFieldBytes)
+	toolName := truncateForEvent(evt.ToolName, maxNotificationFieldBytes)
+	toolCallID := truncateForEvent(evt.ToolCallID, maxNotificationFieldBytes)
 	content := evt.Content
 	if content == "" && evt.ToolResult != "" {
 		if len(evt.ToolResult) > 1024 {
@@ -183,25 +186,54 @@ func createEventNotification(sessionID string, eventID uint64, evt agent.Event, 
 		toolResult = truncateForEvent(toolResult, maxNotificationFieldBytes)
 	}
 
-	data := map[string]any{
-		"step":         evt.Step,
-		"tool_name":    evt.ToolName,
-		"tool_call_id": evt.ToolCallID,
-		"exit_code":    evt.ToolExitCode,
-		"tool_result":  toolResult,
-		"terminal":     terminal,
-	}
+	errorText := ""
 	if evt.Error != nil {
-		data["error"] = truncateForEvent(evt.Error.Error(), maxNotificationFieldBytes)
+		errorText = truncateForEvent(evt.Error.Error(), maxNotificationFieldBytes)
 	}
 
-	return protocol.NewNotification(protocol.NotifySessionEvent, protocol.SessionEventNotification{
-		SessionID: sessionID,
-		EventID:   eventID,
-		Type:      string(evt.Type),
-		Content:   content,
-		Data:      data,
-	})
+	for {
+		data := map[string]any{
+			"step":         evt.Step,
+			"tool_name":    toolName,
+			"tool_call_id": toolCallID,
+			"exit_code":    evt.ToolExitCode,
+			"tool_result":  toolResult,
+			"terminal":     terminal,
+		}
+		if evt.Error != nil {
+			data["error"] = errorText
+		}
+
+		msg, err := protocol.NewNotification(protocol.NotifySessionEvent, protocol.SessionEventNotification{
+			SessionID: sessionID,
+			EventID:   eventID,
+			Type:      eventType,
+			Content:   content,
+			Data:      data,
+		})
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := protocol.EncodeMessage(msg)
+		if err != nil {
+			return nil, err
+		}
+		if len(encoded) <= protocol.DefaultMaxMessageSize {
+			return msg, nil
+		}
+
+		fields := []*string{&sessionID, &eventType, &toolName, &toolCallID, &content, &toolResult, &errorText}
+		largest := fields[0]
+		for _, field := range fields[1:] {
+			if len(*field) > len(*largest) {
+				largest = field
+			}
+		}
+		if len(*largest) == 0 {
+			return nil, fmt.Errorf("event notification exceeds maximum frame size (%d bytes)", protocol.DefaultMaxMessageSize)
+		}
+		*largest = truncateForEvent(*largest, len(*largest)/2)
+	}
 }
 
 // EmitEvent appends an event to the ring buffer and broadcasts it to all subscribers.
