@@ -278,6 +278,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 			reasoningEffort := ""
 			baseURL := ""
 			apiKey := ""
+			apiType := ""
 			if cfg != nil {
 				workspaceDir = cfg.WorkspaceDir
 				model = cfg.Model
@@ -286,6 +287,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				reasoningEffort = cfg.ReasoningEffort
 				baseURL = cfg.BaseURL
 				apiKey = cfg.APIKey
+				apiType = cfg.APIType
 			}
 			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{
 				Task:             task,
@@ -296,6 +298,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				ReasoningEffort:  reasoningEffort,
 				BaseURL:          baseURL,
 				APIKey:           apiKey,
+				APIType:          apiType,
 			})
 			if startErr != nil {
 				// Avoid ambiguous double-execution: if daemon connection succeeded but start failed, abort immediately

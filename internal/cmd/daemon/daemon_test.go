@@ -124,11 +124,12 @@ func TestBuildEngineForSession_EffectiveLocality(t *testing.T) {
 		return provider.NewAutoProvider(nil, nil, cfg.IsLocal)
 	}
 
-	// Client session specifies remote base URL
+	// Client session specifies remote base URL and APIType
 	params := protocol.SessionStartParams{
 		Task:         "analyze code",
 		BaseURL:      "https://api.openai.com/v1",
 		Model:        "gpt-4o",
+		APIType:      "responses",
 		WorkspaceDir: tempDir,
 	}
 
@@ -154,5 +155,8 @@ func TestBuildEngineForSession_EffectiveLocality(t *testing.T) {
 	}
 	if observedConfig.BaseURL != "https://api.openai.com/v1" {
 		t.Errorf("expected observedConfig.BaseURL to be 'https://api.openai.com/v1', got %q", observedConfig.BaseURL)
+	}
+	if observedConfig.APIType != "responses" {
+		t.Errorf("expected observedConfig.APIType to be 'responses', got %q", observedConfig.APIType)
 	}
 }

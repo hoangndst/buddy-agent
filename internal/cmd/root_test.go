@@ -5,9 +5,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
 	"github.com/hoangndst/buddy-agent/internal/config"
+	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	"github.com/openai/openai-go"
 )
 
@@ -217,5 +219,28 @@ func TestRootCmd_TaskExecution_FormattingAndNoRawStepHeaders(t *testing.T) {
 	// Done banner
 	if !strings.Contains(out, "✓ Done") {
 		t.Errorf("expected Done banner in output, got:\n%s", out)
+	}
+}
+
+func TestRenderEvent_ToolResultDelegatedOutput(t *testing.T) {
+	f := cmdutil.NewFactory()
+	ioStreams, _, outBuf, _ := cmdutil.TestIOStreams()
+	f.IOStreams = ioStreams
+
+	evt := protocol.SessionEventNotification{
+		Type:    string(agent.EventToolResult),
+		Content: "  [subagent:researcher] ",
+		Data: map[string]any{
+			"tool_result": "found 4 matches in src/main.go",
+		},
+	}
+	renderEvent(f, evt)
+
+	out := outBuf.String()
+	if !strings.Contains(out, "found 4 matches in src/main.go") {
+		t.Errorf("expected output to contain delegated tool result, got:\n%s", out)
+	}
+	if !strings.Contains(out, "[subagent:researcher]") {
+		t.Errorf("expected output to preserve subagent label, got:\n%s", out)
 	}
 }

@@ -132,6 +132,10 @@ func buildEngineForSession(
 	if params.BaseURL != "" {
 		isLocal = config.IsLocalEndpoint(baseURL)
 	}
+	apiType := cfg.APIType
+	if params.APIType != "" {
+		apiType = params.APIType
+	}
 
 	model := cfg.Model
 	if params.Model != "" {
@@ -170,6 +174,7 @@ func buildEngineForSession(
 	sessionCfg.ReasoningEffort = effort
 	sessionCfg.MaxContextTokens = maxCtx
 	sessionCfg.WorkspaceDir = wsDir
+	sessionCfg.APIType = apiType
 
 	opts := []option.RequestOption{
 		option.WithAPIKey(apiKey),
@@ -184,11 +189,18 @@ func buildEngineForSession(
 	if f.NewModelProvider != nil {
 		prov = f.NewModelProvider(&sessionCfg, &llmClient)
 	} else {
-		prov = provider.NewAutoProvider(
-			provider.NewChatCompletionsProvider(&llmClient),
-			provider.NewResponsesProvider(&llmClient),
-			isLocal,
-		)
+		switch apiType {
+		case "chat":
+			prov = provider.NewChatCompletionsProvider(&llmClient)
+		case "responses":
+			prov = provider.NewResponsesProvider(&llmClient)
+		default:
+			prov = provider.NewAutoProvider(
+				provider.NewChatCompletionsProvider(&llmClient),
+				provider.NewResponsesProvider(&llmClient),
+				isLocal,
+			)
+		}
 	}
 
 	memMgr := memory.NewManager(wsDir)
