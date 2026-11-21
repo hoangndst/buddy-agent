@@ -85,6 +85,11 @@ func TestParseCapabilityError(t *testing.T) {
 			expected: CapabilityErrorParamRejected,
 		},
 		{
+			name:     "Unsupported parameter error without tool conflict",
+			err:      errors.New("400 Bad Request: unsupported parameter: reasoning_effort is not supported with this model"),
+			expected: CapabilityErrorParamRejected,
+		},
+		{
 			name:     "Generic operational error",
 			err:      errors.New("500 Internal Server Error"),
 			expected: CapabilityErrorNone,

@@ -36,15 +36,16 @@ func ParseCapabilityError(err error) CapabilityErrorKind {
 		}
 		if apiErr.StatusCode == http.StatusBadRequest {
 			msg := strings.ToLower(apiErr.Message)
-			if strings.Contains(msg, "reasoning_effort") &&
-				(strings.Contains(msg, "function tools") ||
-					strings.Contains(msg, "responses") ||
-					strings.Contains(msg, "not supported")) {
+			if strings.Contains(msg, "function tools") ||
+				strings.Contains(msg, "use /v1/responses") ||
+				(strings.Contains(msg, "reasoning_effort") && strings.Contains(msg, "tools")) {
 				return CapabilityErrorReasoningConflict
 			}
 			if strings.Contains(msg, "unrecognized parameter") ||
+				strings.Contains(msg, "unknown parameter") ||
+				strings.Contains(msg, "unsupported parameter") ||
 				strings.Contains(msg, "extra_forbidden") ||
-				strings.Contains(msg, "unknown parameter") {
+				(strings.Contains(msg, "reasoning_effort") && (strings.Contains(msg, "not supported") || strings.Contains(msg, "invalid parameter"))) {
 				return CapabilityErrorParamRejected
 			}
 		}
@@ -54,13 +55,16 @@ func ParseCapabilityError(err error) CapabilityErrorKind {
 	if strings.Contains(errStr, "404") || strings.Contains(errStr, "not found") || strings.Contains(errStr, "405") {
 		return CapabilityErrorEndpointUnsupported
 	}
-	if strings.Contains(errStr, "reasoning_effort") &&
-		(strings.Contains(errStr, "function tools") ||
-			strings.Contains(errStr, "responses") ||
-			strings.Contains(errStr, "not supported")) {
+	if strings.Contains(errStr, "function tools") ||
+		strings.Contains(errStr, "use /v1/responses") ||
+		(strings.Contains(errStr, "reasoning_effort") && strings.Contains(errStr, "tools")) {
 		return CapabilityErrorReasoningConflict
 	}
-	if strings.Contains(errStr, "unrecognized parameter") || strings.Contains(errStr, "extra_forbidden") {
+	if strings.Contains(errStr, "unrecognized parameter") ||
+		strings.Contains(errStr, "unknown parameter") ||
+		strings.Contains(errStr, "unsupported parameter") ||
+		strings.Contains(errStr, "extra_forbidden") ||
+		(strings.Contains(errStr, "reasoning_effort") && (strings.Contains(errStr, "not supported") || strings.Contains(errStr, "invalid parameter"))) {
 		return CapabilityErrorParamRejected
 	}
 
