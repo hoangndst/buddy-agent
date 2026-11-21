@@ -1,14 +1,30 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/hoangndst/buddy-agent/internal/agent"
+	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
+	"github.com/hoangndst/buddy-agent/internal/tools"
 )
+
+type mockProvider struct{}
+
+func (m *mockProvider) Protocol() string {
+	return "chat"
+}
+
+func (m *mockProvider) Generate(_ context.Context, _ provider.GenerateRequest) (*provider.GenerateResponse, error) {
+	return &provider.GenerateResponse{
+		Content: "Task completed",
+	}, nil
+}
 
 func TestServer_LifecycleAndIPC(t *testing.T) {
 	tempDir := t.TempDir()
@@ -111,5 +127,47 @@ func TestServer_LifecycleAndIPC(t *testing.T) {
 	}
 	if pingRes2.ID == nil || *pingRes2.ID != "ping-2" {
 		t.Fatalf("expected ID ping-2, got %+v", pingRes2)
+	}
+}
+
+func TestSessionManager_BoundCompletedRetention(t *testing.T) {
+	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		eng := agent.NewEngine(
+			&mockProvider{},
+			"test-model",
+			1,
+			tools.NewRegistry(1000),
+			nil,
+			emitHandler,
+			agent.WithSystemPromptOverride("prompt"),
+		)
+		return eng, nil, nil
+	}
+
+	sm := NewSessionManager(factory)
+	sm.SetMaxCompletedSessions(2)
+
+	// Start and complete 3 sessions sequentially
+	var workers []*SessionWorker
+	for i := 0; i < 3; i++ {
+		w, err := sm.StartSession(t.Context(), protocol.SessionStartParams{Task: "task"}, nil)
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+		workers = append(workers, w)
+		for w.IsActive() {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// First session should have been evicted; last 2 should remain
+	if _, ok := sm.GetSession(workers[0].SessionID()); ok {
+		t.Errorf("expected session 0 (%s) to be evicted from manager retention", workers[0].SessionID())
+	}
+	if _, ok := sm.GetSession(workers[1].SessionID()); !ok {
+		t.Errorf("expected session 1 (%s) to be retained", workers[1].SessionID())
+	}
+	if _, ok := sm.GetSession(workers[2].SessionID()); !ok {
+		t.Errorf("expected session 2 (%s) to be retained", workers[2].SessionID())
 	}
 }

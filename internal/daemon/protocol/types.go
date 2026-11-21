@@ -61,9 +61,9 @@ type SessionStartParams struct {
 	ReasoningEffort  string `json:"reasoning_effort,omitempty"`
 	MaxSteps         int    `json:"max_steps,omitempty"`
 	MaxContextTokens int    `json:"max_context_tokens,omitempty"`
-	BaseURL          string `json:"base_url,omitempty"`
-	APIKey           string `json:"api_key,omitempty"`
-	APIType          string `json:"api_type,omitempty"`
+	BaseURL          string  `json:"base_url,omitempty"`
+	APIKey           *string `json:"api_key,omitempty"`
+	APIType          string  `json:"api_type,omitempty"`
 }
 
 // SessionStartResult returns the created session identifier.

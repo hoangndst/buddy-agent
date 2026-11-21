@@ -12,21 +12,58 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 )
 
+const (
+	// DefaultMaxCompletedSessions limits retention of completed session workers to prevent memory growth.
+	DefaultMaxCompletedSessions = 50
+)
+
 // EngineFactory defines a constructor function that builds an agent.Engine and cleanup closure for a session.
 type EngineFactory func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error)
 
 // SessionManager tracks all active daemon sessions and manages headless execution lifecycles.
 type SessionManager struct {
-	mu            sync.RWMutex
-	sessions      map[string]*SessionWorker
-	engineFactory EngineFactory
+	mu                   sync.RWMutex
+	sessions             map[string]*SessionWorker
+	completedOrder       []string
+	maxCompletedSessions int
+	engineFactory        EngineFactory
 }
 
 // NewSessionManager creates a new SessionManager.
 func NewSessionManager(factory EngineFactory) *SessionManager {
 	return &SessionManager{
-		sessions:      make(map[string]*SessionWorker),
-		engineFactory: factory,
+		sessions:             make(map[string]*SessionWorker),
+		completedOrder:       make([]string, 0),
+		maxCompletedSessions: DefaultMaxCompletedSessions,
+		engineFactory:        factory,
+	}
+}
+
+// SetMaxCompletedSessions overrides the maximum number of completed sessions retained in memory.
+func (sm *SessionManager) SetMaxCompletedSessions(limit int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if limit > 0 {
+		sm.maxCompletedSessions = limit
+		sm.pruneCompletedLocked()
+	}
+}
+
+func (sm *SessionManager) onSessionCompleted(sessionID string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.completedOrder = append(sm.completedOrder, sessionID)
+	sm.pruneCompletedLocked()
+}
+
+func (sm *SessionManager) pruneCompletedLocked() {
+	for len(sm.completedOrder) > sm.maxCompletedSessions {
+		evictID := sm.completedOrder[0]
+		sm.completedOrder = sm.completedOrder[1:]
+		if w, ok := sm.sessions[evictID]; ok && !w.IsActive() {
+			delete(sm.sessions, evictID)
+		}
 	}
 }
 
@@ -58,6 +95,9 @@ func (sm *SessionManager) StartSession(
 	}
 
 	worker = NewSessionWorker(ctx, sessionID, params.Task, eng, controller, cleanup)
+	worker.SetOnComplete(func() {
+		sm.onSessionCompleted(sessionID)
+	})
 
 	sm.mu.Lock()
 	sm.sessions[sessionID] = worker

@@ -37,6 +37,7 @@ type SessionWorker struct {
 	pendingRequestID string
 	pendingMu        sync.Mutex
 	cleanup          func()
+	onComplete       func()
 }
 
 // NewSessionWorker constructs a new SessionWorker bound to a ReAct engine.
@@ -79,6 +80,13 @@ func (w *SessionWorker) IsActive() bool {
 	return w.active
 }
 
+// SetOnComplete configures a completion hook invoked after worker execution finishes.
+func (w *SessionWorker) SetOnComplete(fn func()) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.onComplete = fn
+}
+
 // Result returns the execution output and error once completed.
 func (w *SessionWorker) Result() (string, error) {
 	w.mu.RLock()
@@ -96,6 +104,12 @@ func (w *SessionWorker) Start() {
 		defer func() {
 			if w.cleanup != nil {
 				w.cleanup()
+			}
+			w.mu.Lock()
+			w.engine = nil
+			w.mu.Unlock()
+			if w.onComplete != nil {
+				w.onComplete()
 			}
 		}()
 

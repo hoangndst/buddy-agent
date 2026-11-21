@@ -121,8 +121,10 @@ func buildEngineForSession(
 	}
 
 	apiKey := cfg.APIKey
-	if params.APIKey != "" {
-		apiKey = params.APIKey
+	if params.APIKey != nil {
+		apiKey = *params.APIKey
+	} else if params.BaseURL != "" && params.BaseURL != cfg.BaseURL {
+		apiKey = ""
 	}
 	baseURL := cfg.BaseURL
 	if params.BaseURL != "" {

@@ -277,7 +277,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 			maxContextTokens := 0
 			reasoningEffort := ""
 			baseURL := ""
-			apiKey := ""
+			var apiKey *string
 			apiType := ""
 			if cfg != nil {
 				workspaceDir = cfg.WorkspaceDir
@@ -286,7 +286,8 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				maxContextTokens = cfg.MaxContextTokens
 				reasoningEffort = cfg.ReasoningEffort
 				baseURL = cfg.BaseURL
-				apiKey = cfg.APIKey
+				k := cfg.APIKey
+				apiKey = &k
 				apiType = cfg.APIType
 			}
 			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{

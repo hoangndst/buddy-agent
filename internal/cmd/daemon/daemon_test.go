@@ -160,3 +160,57 @@ func TestBuildEngineForSession_EffectiveLocality(t *testing.T) {
 		t.Errorf("expected observedConfig.APIType to be 'responses', got %q", observedConfig.APIType)
 	}
 }
+
+func TestBuildEngineForSession_EmptyKeyEndpointSwitch(t *testing.T) {
+	tempDir := t.TempDir()
+	f := cmdutil.NewFactory()
+
+	// Initial daemon config: has secret API key and remote base URL
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			Model:            "gpt-4o",
+			BaseURL:          "https://api.openai.com/v1",
+			APIKey:           "sk-super-secret-key",
+			IsLocal:          false,
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   10000,
+			MaxSteps:         10,
+			MaxContextTokens: 64000,
+		}, nil
+	}
+
+	var observedConfig *config.Config
+	f.NewModelProvider = func(cfg *config.Config, _ *openai.Client) provider.ModelProvider {
+		c := *cfg
+		observedConfig = &c
+		return provider.NewAutoProvider(nil, nil, cfg.IsLocal)
+	}
+
+	// Client session targets local endpoint with explicitly empty key
+	emptyKey := ""
+	params := protocol.SessionStartParams{
+		Task:         "local task",
+		BaseURL:      "http://127.0.0.1:11434/v1",
+		APIKey:       &emptyKey,
+		Model:        "qwen",
+		WorkspaceDir: tempDir,
+	}
+
+	eng, cleanup, err := buildEngineForSession(context.Background(), f, "sess_test_empty_key", params, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+
+	if observedConfig == nil {
+		t.Fatal("expected NewModelProvider to be invoked with session config")
+	}
+	if observedConfig.APIKey != "" {
+		t.Errorf("expected empty APIKey when caller explicitly overrides with empty key, got %q", observedConfig.APIKey)
+	}
+}
