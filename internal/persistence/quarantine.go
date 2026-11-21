@@ -33,25 +33,34 @@ func CheckOrQuarantine(dbPath string) error {
 	var result string
 	err = db.QueryRow("PRAGMA quick_check(1);").Scan(&result)
 	if err != nil {
-		errStr := strings.ToLower(err.Error())
-		if strings.Contains(errStr, "corrupt") || strings.Contains(errStr, "malformed") || strings.Contains(errStr, "not a database") {
+		if isCorruptionError(err.Error()) {
 			_ = db.Close()
 			return quarantineFiles(dbPath)
 		}
 		return fmt.Errorf("database quick_check operational error: %w", err)
 	}
 	if result != "ok" {
-		resLower := strings.ToLower(result)
-		if strings.Contains(resLower, "lock") || strings.Contains(resLower, "busy") ||
-			strings.Contains(resLower, "timeout") || strings.Contains(resLower, "permission") ||
-			strings.Contains(resLower, "denied") {
-			return fmt.Errorf("database quick_check operational error: %s", result)
+		if isCorruptionError(result) {
+			_ = db.Close()
+			return quarantineFiles(dbPath)
 		}
-		_ = db.Close()
-		return quarantineFiles(dbPath)
+		return fmt.Errorf("database quick_check operational error: %s", result)
 	}
 
 	return nil
+}
+
+func isCorruptionError(msg string) bool {
+	s := strings.ToLower(msg)
+	return strings.Contains(s, "corrupt") ||
+		strings.Contains(s, "malformed") ||
+		strings.Contains(s, "not a database") ||
+		strings.Contains(s, "in database main") ||
+		strings.Contains(s, "freelist") ||
+		strings.Contains(s, "tree") ||
+		strings.Contains(s, "page ") ||
+		strings.Contains(s, "row ") ||
+		strings.Contains(s, "index ")
 }
 
 func quarantineFiles(dbPath string) error {

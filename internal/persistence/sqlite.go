@@ -63,22 +63,21 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 
 	var writerDSN, readerDSN string
 	if isMemory {
-		if !strings.Contains(dbPath, "cache=shared") && strings.HasPrefix(dbPath, "file:") {
+		if !strings.Contains(dbPath, "foreign_keys") {
 			if strings.Contains(dbPath, "?") {
-				dbPath += "&cache=shared"
+				dbPath += "&_pragma=foreign_keys(ON)"
 			} else {
-				dbPath += "?cache=shared"
+				dbPath += "?_pragma=foreign_keys(ON)"
 			}
+		}
+		if !strings.Contains(dbPath, "busy_timeout") {
+			dbPath += "&_pragma=busy_timeout(5000)"
+		}
+		if !strings.Contains(dbPath, "cache=shared") && strings.HasPrefix(dbPath, "file:") {
+			dbPath += "&cache=shared"
 		}
 		writerDSN = dbPath
 		readerDSN = dbPath
-		if !strings.Contains(readerDSN, "query_only") {
-			if strings.Contains(readerDSN, "?") {
-				readerDSN += "&_pragma=query_only(ON)"
-			} else {
-				readerDSN += "?_pragma=query_only(ON)"
-			}
-		}
 	} else {
 		writerDSN = fmt.Sprintf(
 			"file:%s?_pragma=busy_timeout(2500)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=auto_vacuum(INCREMENTAL)&_txlock=immediate",
@@ -98,14 +97,16 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	writer.SetMaxIdleConns(1)
 	writer.SetConnMaxLifetime(0)
 
-	reader, err := sql.Open("sqlite", readerDSN)
-	if err != nil {
-		_ = writer.Close()
-		return nil, fmt.Errorf("failed to open reader connection: %w", err)
-	}
+	var reader *sql.DB
 	if isMemory {
-		reader.SetMaxOpenConns(1)
+		reader = writer
 	} else {
+		var err error
+		reader, err = sql.Open("sqlite", readerDSN)
+		if err != nil {
+			_ = writer.Close()
+			return nil, fmt.Errorf("failed to open reader connection: %w", err)
+		}
 		reader.SetMaxOpenConns(4)
 		reader.SetMaxIdleConns(4)
 	}
@@ -222,7 +223,7 @@ func (s *SQLiteStore) Close() error {
 		_, _ = s.writerDB.Exec("PRAGMA incremental_vacuum(100);")
 	}
 
-	if s.readerDB != nil {
+	if s.readerDB != nil && s.readerDB != s.writerDB {
 		if err := s.readerDB.Close(); err != nil {
 			errs = append(errs, err)
 		}

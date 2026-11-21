@@ -289,6 +289,17 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 	trailingBlocks := make([]history.TurnBlock, len(turnRecords))
 	for i, tr := range turnRecords {
 		trailingBlocks[i] = mapTurnRecordToBlock(tr)
+		for _, tc := range tr.ToolCalls {
+			if tc.Name == "write_file" || tc.Name == "edit_file" {
+				var args struct{ Path string }
+				if json.Unmarshal([]byte(tc.Args), &args) == nil && args.Path != "" {
+					tracker.RecordFileAccess(args.Path, "modified")
+				}
+			}
+			if tc.ExitCode != 0 {
+				tracker.RecordError(fmt.Sprintf("%s: %s", tc.Name, tc.Result))
+			}
+		}
 	}
 
 	restoredState := history.RestoredState{
@@ -327,6 +338,28 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 	}
 
 	_ = e.store.UpdateSessionStatus(ctx, sessionRec.ID, persistence.StatusRunning, startStep-1, sessionRec.TokenUsage, "")
+
+	// Guard against oversized restored history exceeding context ceiling
+	if err := session.EnsureWatermarks(ctx, e.compClient, e.model); err != nil {
+		if errors.Is(err, history.ErrContextExhausted) {
+			e.eventHandler(Event{Type: EventContextExhausted, Step: startStep - 1, Error: err})
+			if e.store != nil {
+				_ = e.store.UpdateSessionStatus(context.Background(), sessionRec.ID, persistence.StatusFailed, startStep-1, sessionRec.TokenUsage, err.Error())
+			}
+			return "", err
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if e.store != nil {
+				_ = e.store.UpdateSessionStatus(context.Background(), sessionRec.ID, persistence.StatusInterrupted, startStep-1, sessionRec.TokenUsage, "Process interrupted by signal or user")
+			}
+			return "", err
+		}
+		e.eventHandler(Event{Type: EventError, Step: startStep - 1, Error: err})
+		if e.store != nil {
+			_ = e.store.UpdateSessionStatus(context.Background(), sessionRec.ID, persistence.StatusFailed, startStep-1, sessionRec.TokenUsage, err.Error())
+		}
+		return "", fmt.Errorf("resumed context validation failed: %w", err)
+	}
 
 	return e.executeLoop(ctx, sessionRec.ID, session, startStep, totalMaxSteps, sessionRec.TokenUsage)
 }
