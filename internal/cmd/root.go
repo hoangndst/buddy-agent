@@ -6,16 +6,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
+	"github.com/hoangndst/buddy-agent/internal/client"
+	daemoncmd "github.com/hoangndst/buddy-agent/internal/cmd/daemon"
 	"github.com/hoangndst/buddy-agent/internal/cmd/doc"
 	mcpcmd "github.com/hoangndst/buddy-agent/internal/cmd/mcp"
 	sessioncmd "github.com/hoangndst/buddy-agent/internal/cmd/session"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
+	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	core "github.com/hoangndst/buddy-agent/internal/mcp"
 	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/persistence"
@@ -35,6 +41,9 @@ var (
 
 // NewRootCmd constructs the primary buddy-agent root command tree.
 func NewRootCmd(f *cmdutil.Factory) *cobra.Command {
+	var standalone bool
+	var socketPath string
+
 	rootCmd := &cobra.Command{
 		Use:   "buddy [task]",
 		Short: "buddy-agent is an autonomous software engineering agent",
@@ -44,16 +53,21 @@ three-partition context memory compaction, and Model Context Protocol (MCP) inte
 		Args:         cobra.ArbitraryArgs,
 		RunE: func(c *cobra.Command, args []string) error {
 			if len(args) > 0 {
-				return runTask(c.Context(), f, args)
+				return runTask(c.Context(), f, args, standalone, socketPath)
 			}
 			return runREPL(c.Context(), f)
 		},
 	}
 
+	rootCmd.PersistentFlags().BoolVar(&standalone, "standalone", false, "Run task in-process without connecting to the background daemon")
+	rootCmd.PersistentFlags().StringVar(&socketPath, "socket", "", "Path to the Unix domain socket")
+
 	rootCmd.AddCommand(mcpcmd.NewCmdMCP(f))
 	rootCmd.AddCommand(doc.NewCmdDoc(f))
 	rootCmd.AddCommand(sessioncmd.NewCmdSession(f))
 	rootCmd.AddCommand(NewCmdResume(f))
+	rootCmd.AddCommand(daemoncmd.NewCmdDaemon(f))
+	rootCmd.AddCommand(NewCmdAttach(f))
 
 	return rootCmd
 }
@@ -249,17 +263,80 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 	return engine, combinedCleanup, nil
 }
 
-func runTask(ctx context.Context, f *cmdutil.Factory, args []string) error {
+func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone bool, socketPath string) error {
+	task := strings.Join(args, " ")
+	if !standalone {
+		// Attempt to execute via background daemon
+		cl, err := client.ConnectOrSpawn(socketPath)
+		if err == nil {
+			defer func() { _ = cl.Close() }()
+			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{Task: task})
+			if startErr == nil {
+				_, _ = fmt.Fprintf(f.IOStreams.Out, "Dispatched task to daemon (Session ID: %s)\n", sessionID)
+				return streamClientEvents(ctx, f, cl, sessionID)
+			}
+		}
+		// Graceful fallback to standalone if daemon connection fails
+		_, _ = fmt.Fprintln(f.IOStreams.Out, "Notice: Daemon unavailable; running task in-process.")
+	}
+
 	engine, cleanup, err := setupEngine(ctx, f)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	task := strings.Join(args, " ")
 	_, _ = fmt.Fprintf(f.IOStreams.Out, "Executing task: %s\n", task)
 	_, err = engine.Run(ctx, task)
 	return err
+}
+
+func streamClientEvents(ctx context.Context, f *cmdutil.Factory, cl *client.Client, sessionID string) error {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	inputScanner := bufio.NewScanner(f.IOStreams.In)
+
+	for {
+		select {
+		case <-ctx.Done():
+			_ = cl.CancelSession(sessionID)
+			return ctx.Err()
+
+		case <-sigCh:
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "\nDetaching from session %s. Task continues in background.\nRun 'buddy attach %s' to reconnect.\n", sessionID, sessionID)
+			_ = cl.DetachSession(sessionID)
+			return nil
+
+		case req, ok := <-cl.Permissions():
+			if !ok {
+				return nil
+			}
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "\n%s Tool %s requests permission with arguments: %+v\nAllow? [y/N]: ",
+				toolStyle.Render("⚡ [PERMISSION REQUIRED]"), req.Tool, req.Arguments)
+			decision := "deny"
+			if inputScanner.Scan() {
+				text := strings.TrimSpace(strings.ToLower(inputScanner.Text()))
+				if text == "y" || text == "yes" {
+					decision = "allow"
+				}
+			}
+			_ = cl.RespondPermission(req.RequestID, decision)
+
+		case evt, ok := <-cl.Events():
+			if !ok {
+				return nil
+			}
+			renderEvent(f, evt)
+			if evt.Type == string(agent.EventFinished) {
+				return nil
+			}
+			if evt.Type == string(agent.EventError) {
+				return fmt.Errorf("task failed: %s", evt.Content)
+			}
+		}
+	}
 }
 
 func runREPL(ctx context.Context, f *cmdutil.Factory) error {

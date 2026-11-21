@@ -33,6 +33,12 @@ func TestRootCmd_StructureAndSubcommands(t *testing.T) {
 	if !subcommands["doc"] {
 		t.Error("expected 'doc' subcommand to be attached")
 	}
+	if !subcommands["daemon"] {
+		t.Error("expected 'daemon' subcommand to be attached")
+	}
+	if !subcommands["attach"] {
+		t.Error("expected 'attach' subcommand to be attached")
+	}
 }
 
 func TestRootCmd_REPLExit(t *testing.T) {
