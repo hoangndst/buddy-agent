@@ -148,8 +148,8 @@ func buildEngineForSession(
 		maxSteps = params.MaxSteps
 	}
 	effort := cfg.ReasoningEffort
-	if params.ReasoningEffort != "" {
-		effort = params.ReasoningEffort
+	if params.ReasoningEffort != nil {
+		effort = *params.ReasoningEffort
 	}
 	maxCtx := cfg.MaxContextTokens
 	if params.MaxContextTokens > 0 {

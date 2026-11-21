@@ -214,3 +214,54 @@ func TestBuildEngineForSession_EmptyKeyEndpointSwitch(t *testing.T) {
 		t.Errorf("expected empty APIKey when caller explicitly overrides with empty key, got %q", observedConfig.APIKey)
 	}
 }
+
+func TestBuildEngineForSession_EmptyReasoningEffortOverride(t *testing.T) {
+	tempDir := t.TempDir()
+	f := cmdutil.NewFactory()
+
+	// Initial daemon config: configured with high reasoning effort
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			Model:            "o3-mini",
+			BaseURL:          "https://api.openai.com/v1",
+			ReasoningEffort:  "high",
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   10000,
+			MaxSteps:         10,
+			MaxContextTokens: 64000,
+		}, nil
+	}
+
+	var observedConfig *config.Config
+	f.NewModelProvider = func(cfg *config.Config, _ *openai.Client) provider.ModelProvider {
+		c := *cfg
+		observedConfig = &c
+		return provider.NewAutoProvider(nil, nil, cfg.IsLocal)
+	}
+
+	// Client session specifies explicitly empty reasoning effort
+	emptyEffort := ""
+	params := protocol.SessionStartParams{
+		Task:            "quick task",
+		ReasoningEffort: &emptyEffort,
+		WorkspaceDir:    tempDir,
+	}
+
+	eng, cleanup, err := buildEngineForSession(context.Background(), f, "sess_test_empty_effort", params, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+
+	if observedConfig == nil {
+		t.Fatal("expected NewModelProvider to be invoked with session config")
+	}
+	if observedConfig.ReasoningEffort != "" {
+		t.Errorf("expected empty ReasoningEffort when caller explicitly overrides with empty string, got %q", observedConfig.ReasoningEffort)
+	}
+}

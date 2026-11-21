@@ -275,7 +275,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 			model := ""
 			maxSteps := 0
 			maxContextTokens := 0
-			reasoningEffort := ""
+			var reasoningEffort *string
 			baseURL := ""
 			var apiKey *string
 			apiType := ""
@@ -284,7 +284,8 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				model = cfg.Model
 				maxSteps = cfg.MaxSteps
 				maxContextTokens = cfg.MaxContextTokens
-				reasoningEffort = cfg.ReasoningEffort
+				r := cfg.ReasoningEffort
+				reasoningEffort = &r
 				baseURL = cfg.BaseURL
 				k := cfg.APIKey
 				apiKey = &k

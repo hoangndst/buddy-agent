@@ -10,10 +10,12 @@ import (
 
 func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	// 1. Request roundtrip
+	effort := "medium"
 	req, err := NewRequest("req-1", MethodSessionStart, SessionStartParams{
 		Task:             "run tests",
 		MaxContextTokens: 32000,
 		APIType:          "responses",
+		ReasoningEffort:  &effort,
 	})
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
@@ -47,6 +49,9 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	}
 	if params.APIType != "responses" {
 		t.Fatalf("expected api type 'responses', got %q", params.APIType)
+	}
+	if params.ReasoningEffort == nil || *params.ReasoningEffort != "medium" {
+		t.Fatalf("expected reasoning effort 'medium', got %+v", params.ReasoningEffort)
 	}
 
 	// 2. Response roundtrip

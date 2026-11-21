@@ -57,9 +57,9 @@ func (e *JSONRPCError) Error() string {
 type SessionStartParams struct {
 	Task             string `json:"task"`
 	WorkspaceDir     string `json:"workspace_dir,omitempty"`
-	Model            string `json:"model,omitempty"`
-	ReasoningEffort  string `json:"reasoning_effort,omitempty"`
-	MaxSteps         int    `json:"max_steps,omitempty"`
+	Model            string  `json:"model,omitempty"`
+	ReasoningEffort  *string `json:"reasoning_effort,omitempty"`
+	MaxSteps         int     `json:"max_steps,omitempty"`
 	MaxContextTokens int    `json:"max_context_tokens,omitempty"`
 	BaseURL          string  `json:"base_url,omitempty"`
 	APIKey           *string `json:"api_key,omitempty"`
