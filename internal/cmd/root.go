@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -292,6 +293,11 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				apiKey = &k
 				apiType = cfg.APIType
 				dbPath = cfg.DBPath
+			}
+			if dbPath != "" && !filepath.IsAbs(dbPath) {
+				if wd, err := f.WorkDir(); err == nil && wd != "" {
+					dbPath = filepath.Clean(filepath.Join(wd, dbPath))
+				}
 			}
 			effectiveDir := workspaceDir
 			if effectiveDir == "" {

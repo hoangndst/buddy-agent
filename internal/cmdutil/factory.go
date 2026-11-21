@@ -80,9 +80,6 @@ func NewFactory() *Factory {
 			var dbPath string
 			if len(customDBPath) > 0 && customDBPath[0] != "" {
 				dbPath = customDBPath[0]
-				if !filepath.IsAbs(dbPath) && wsDir != "" {
-					dbPath = filepath.Clean(filepath.Join(wsDir, dbPath))
-				}
 			}
 			if dbPath == "" {
 				ws := wsDir

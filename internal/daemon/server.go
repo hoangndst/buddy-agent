@@ -382,9 +382,9 @@ func (s *Server) Stop() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	defer close(s.shutdownCh)
 
 	s.cancel()
-	close(s.shutdownCh)
 
 	// Broadcast shutdown notice to all active clients
 	shuttingDownNotify, _ := protocol.NewNotification(protocol.NotifyDaemonShuttingDown, map[string]string{

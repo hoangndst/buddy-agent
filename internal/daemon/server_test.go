@@ -171,3 +171,51 @@ func TestSessionManager_BoundCompletedRetention(t *testing.T) {
 		t.Errorf("expected session 2 (%s) to be retained", workers[2].SessionID())
 	}
 }
+
+func TestServer_DoneSignalsAfterDrain(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "drain_test.sock")
+
+	factory := func(_ string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		return agent.NewEngine(
+			nil,
+			"test-model",
+			5,
+			tools.NewRegistry(1000),
+			nil,
+			emitHandler,
+		), nil, nil
+	}
+
+	sockMgr := NewSocketManager(sockPath)
+	sm := NewSessionManager(factory)
+	server := NewServer(sockMgr, sm)
+
+	if err := server.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+
+	// Verify server.Done() is open while running
+	select {
+	case <-server.Done():
+		t.Fatal("expected server.Done() to be open while running")
+	default:
+	}
+
+	doneClosed := make(chan struct{})
+	go func() {
+		<-server.Done()
+		close(doneClosed)
+	}()
+
+	if err := server.Stop(); err != nil {
+		t.Fatalf("server.Stop failed: %v", err)
+	}
+
+	select {
+	case <-doneClosed:
+		// Done channel closed after Stop
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for server.Done() to close")
+	}
+}
