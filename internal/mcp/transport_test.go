@@ -225,6 +225,44 @@ func TestStdioTransport_ResolveBareCommandInCustomPATH(t *testing.T) {
 	}
 }
 
+func TestStdioTransport_ServerRelativePATHUsesWorkDir(t *testing.T) {
+	serverDir := t.TempDir()
+	binDir := filepath.Join(serverDir, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("failed to create server bin directory: %v", err)
+	}
+	binName := "server-runner"
+	targetPath := filepath.Join(binDir, binName)
+	if runtime.GOOS == "windows" {
+		targetPath += ".bat"
+		if err := os.WriteFile(targetPath, []byte("@echo off\r\n"), 0755); err != nil {
+			t.Fatalf("failed to create server executable: %v", err)
+		}
+	} else if err := os.WriteFile(targetPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("failed to create server executable: %v", err)
+	}
+
+	transport, err := NewStdioTransport(ServerConfig{
+		Command: binName,
+		WorkDir: serverDir,
+		Env:     map[string]string{"PATH": "./bin"},
+	}, []string{"PATH=/daemon/bin"})
+	if err != nil {
+		t.Fatalf("NewStdioTransport failed: %v", err)
+	}
+
+	expectedPath, err := filepath.Abs(targetPath)
+	if err != nil {
+		t.Fatalf("filepath.Abs failed: %v", err)
+	}
+	if transport.Cmd().Path != expectedPath {
+		t.Errorf("expected server-relative executable %q, got %q", expectedPath, transport.Cmd().Path)
+	}
+	if transport.Cmd().Dir != serverDir {
+		t.Errorf("expected working directory %q, got %q", serverDir, transport.Cmd().Dir)
+	}
+}
+
 func TestStdioTransport_CustomPATH_PrecedenceOverHost(t *testing.T) {
 	tempDir := t.TempDir()
 	binName := "node"

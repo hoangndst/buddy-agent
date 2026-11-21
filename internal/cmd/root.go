@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -111,6 +112,33 @@ func formatToolPreview(name, rawArgs string) string {
 		}
 	}
 	return fmt.Sprintf("⚙ %s(%s)", name, rawArgs)
+}
+
+func absolutizePATHEntries(env []string, baseDir string) ([]string, error) {
+	baseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return nil, err
+	}
+
+	resolved := append([]string(nil), env...)
+	for i, envVar := range resolved {
+		key, value, ok := strings.Cut(envVar, "=")
+		if !ok || key != "PATH" && (runtime.GOOS != "windows" || !strings.EqualFold(key, "PATH")) {
+			continue
+		}
+		entries := filepath.SplitList(value)
+		for j, entry := range entries {
+			if entry == "" {
+				entry = "."
+			}
+			if !filepath.IsAbs(entry) {
+				entry = filepath.Join(baseDir, entry)
+			}
+			entries[j] = filepath.Clean(entry)
+		}
+		resolved[i] = key + "=" + strings.Join(entries, string(filepath.ListSeparator))
+	}
+	return resolved, nil
 }
 
 func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func(), error) {
@@ -324,6 +352,21 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 			var callerEnv []string
 			if f.Environ != nil {
 				callerEnv = f.Environ()
+			}
+			callerDir := ""
+			if f.WorkDir != nil {
+				callerDir, _ = f.WorkDir()
+			}
+			if callerDir == "" {
+				var err error
+				callerDir, err = os.Getwd()
+				if err != nil {
+					return fmt.Errorf("failed to resolve caller working directory: %w", err)
+				}
+			}
+			callerEnv, err = absolutizePATHEntries(callerEnv, callerDir)
+			if err != nil {
+				return fmt.Errorf("failed to resolve caller PATH entries: %w", err)
 			}
 			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{
 				Task:             task,

@@ -125,6 +125,32 @@ func lookPathIn(file string, pathList string) (string, error) {
 	return "", exec.ErrNotFound
 }
 
+func absolutizePathList(pathList, baseDir string) (string, error) {
+	if baseDir == "" {
+		var err error
+		baseDir, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
+	}
+	baseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", err
+	}
+
+	entries := filepath.SplitList(pathList)
+	for i, entry := range entries {
+		if entry == "" {
+			entry = "."
+		}
+		if !filepath.IsAbs(entry) {
+			entry = filepath.Join(baseDir, entry)
+		}
+		entries[i] = filepath.Clean(entry)
+	}
+	return strings.Join(entries, string(filepath.ListSeparator)), nil
+}
+
 // buildStdioCommand prepares an exec.Cmd with environment merging,
 // process group supervisor preparation, and rolling stderr buffer attachment.
 func buildStdioCommand(srv ServerConfig, baseEnv ...[]string) (*exec.Cmd, subprocess.Supervisor, *RollingBuffer, error) {
@@ -148,6 +174,17 @@ func buildStdioCommand(srv ServerConfig, baseEnv ...[]string) (*exec.Cmd, subpro
 		}
 	}
 	for k, v := range srv.Env {
+		if k == "PATH" || runtime.GOOS == "windows" && strings.EqualFold(k, "PATH") {
+			pathBaseDir := srv.WorkDir
+			if pathBaseDir == "" {
+				pathBaseDir = srv.Cwd
+			}
+			absolutePath, err := absolutizePathList(v, pathBaseDir)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("failed to resolve MCP server PATH: %w", err)
+			}
+			v = absolutePath
+		}
 		envMap[k] = v
 	}
 

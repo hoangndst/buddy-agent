@@ -406,6 +406,9 @@ func TestRunTask_ForwardsParamsAndPreservesSpecialDB(t *testing.T) {
 			f.WorkDir = func() (string, error) {
 				return tempDir, nil
 			}
+			f.Environ = func() []string {
+				return []string{"PATH=./node_modules/.bin"}
+			}
 			f.ConfigLoader = func() (*config.Config, error) {
 				return &config.Config{
 					APIKey:           "key",
@@ -436,6 +439,17 @@ func TestRunTask_ForwardsParamsAndPreservesSpecialDB(t *testing.T) {
 			}
 			if receivedParams.WorkingTailSize != 7 {
 				t.Errorf("expected WorkingTailSize 7, got %d", receivedParams.WorkingTailSize)
+			}
+			wantPATH := "PATH=" + filepath.Join(tempDir, "node_modules", ".bin")
+			foundPATH := false
+			for _, env := range receivedParams.Env {
+				if env == wantPATH {
+					foundPATH = true
+					break
+				}
+			}
+			if !foundPATH {
+				t.Errorf("expected caller-relative PATH to be forwarded as %q, got %v", wantPATH, receivedParams.Env)
 			}
 		})
 	}
