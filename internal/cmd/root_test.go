@@ -2,6 +2,9 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
+	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -319,5 +322,117 @@ func TestSetupEngine_PassesCallerEnvToMCPManager(t *testing.T) {
 		if observedBaseEnv[i] != val {
 			t.Errorf("expected observedBaseEnv[%d] = %q, got %q", i, val, observedBaseEnv[i])
 		}
+	}
+}
+
+func TestRunTask_ForwardsParamsAndPreservesSpecialDB(t *testing.T) {
+	tempDir := t.TempDir()
+
+	tests := []struct {
+		name               string
+		configuredDB       string
+		expectedDB         string
+		configuredMaxChars int
+		expectedMaxChars   int
+	}{
+		{
+			name:               "exact memory special name preserved",
+			configuredDB:       ":memory:",
+			expectedDB:         ":memory:",
+			configuredMaxChars: 25000,
+			expectedMaxChars:   25000,
+		},
+		{
+			name:               "file URI in-memory preserved",
+			configuredDB:       "file:memdb?mode=memory&cache=shared",
+			expectedDB:         "file:memdb?mode=memory&cache=shared",
+			configuredMaxChars: 30000,
+			expectedMaxChars:   30000,
+		},
+		{
+			name:               "relative file path absolutized",
+			configuredDB:       "test_history.db",
+			expectedDB:         filepath.Join(tempDir, "test_history.db"),
+			configuredMaxChars: 15000,
+			expectedMaxChars:   15000,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sockDir := t.TempDir()
+			sockFile := filepath.Join(sockDir, "d.sock")
+			listener, err := net.Listen("unix", sockFile)
+			if err != nil {
+				t.Fatalf("failed to bind listener: %v", err)
+			}
+			defer func() { _ = listener.Close() }()
+
+			var receivedParams protocol.SessionStartParams
+			serverErrCh := make(chan error, 1)
+
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					serverErrCh <- err
+					return
+				}
+				defer func() { _ = conn.Close() }()
+
+				codec := protocol.NewStreamCodec(conn, conn)
+				msg, err := codec.ReadMessage()
+				if err != nil {
+					serverErrCh <- err
+					return
+				}
+
+				if msg.Method == protocol.MethodSessionStart {
+					_ = json.Unmarshal(msg.Params, &receivedParams)
+					res, _ := protocol.NewResponse(*msg.ID, protocol.SessionStartResult{SessionID: "sess-test"})
+					_ = codec.WriteMessage(res)
+
+					// Send finished notification to conclude the stream
+					notif, _ := protocol.NewNotification(protocol.NotifySessionEvent, protocol.SessionEventNotification{
+						Type: string(agent.EventFinished),
+					})
+					_ = codec.WriteMessage(notif)
+				}
+				serverErrCh <- nil
+			}()
+
+			f := cmdutil.NewFactory()
+			ioStreams, _, _, _ := cmdutil.TestIOStreams()
+			f.IOStreams = ioStreams
+			f.WorkDir = func() (string, error) {
+				return tempDir, nil
+			}
+			f.ConfigLoader = func() (*config.Config, error) {
+				return &config.Config{
+					APIKey:           "key",
+					Model:            "model",
+					WorkspaceDir:     tempDir,
+					DBPath:           tc.configuredDB,
+					MaxOutputChars:   tc.configuredMaxChars,
+					MaxContextTokens: 4096,
+				}, nil
+			}
+
+			rootCmd := NewRootCmd(f)
+			rootCmd.SetArgs([]string{"--socket", sockFile, "do something"})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("rootCmd.Execute failed: %v", err)
+			}
+
+			if err := <-serverErrCh; err != nil {
+				t.Fatalf("server mock error: %v", err)
+			}
+
+			if receivedParams.DBPath != tc.expectedDB {
+				t.Errorf("expected DBPath %q, got %q", tc.expectedDB, receivedParams.DBPath)
+			}
+			if receivedParams.MaxOutputChars != tc.expectedMaxChars {
+				t.Errorf("expected MaxOutputChars %d, got %d", tc.expectedMaxChars, receivedParams.MaxOutputChars)
+			}
+		})
 	}
 }

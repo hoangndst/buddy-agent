@@ -447,6 +447,62 @@ func TestBuildEngineForSession_ExplicitDBPathForwarding(t *testing.T) {
 	}
 }
 
+func TestBuildEngineForSession_MaxOutputCharsForwarding(t *testing.T) {
+	tempDir := t.TempDir()
+	f := cmdutil.NewFactory()
+
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			Model:            "test-model",
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   50,
+			MaxSteps:         10,
+			MaxContextTokens: 64000,
+		}, nil
+	}
+
+	longText := strings.Repeat("a", 100)
+
+	// 1. Session with caller-provided higher limit
+	paramsWithHighLimit := protocol.SessionStartParams{
+		Task:           "test output limit",
+		WorkspaceDir:   tempDir,
+		MaxOutputChars: 500,
+	}
+
+	eng1, cleanup1, err := buildEngineForSession(context.Background(), f, "sess_limit_1", paramsWithHighLimit, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup1 != nil {
+		defer cleanup1()
+	}
+
+	out1 := eng1.Registry().Dispatch(context.Background(), "bash", json.RawMessage(`{"command": "echo `+longText+`"}`))
+	if !strings.Contains(out1, longText) {
+		t.Errorf("expected caller higher limit 500 to retain all 100 chars, got:\n%s", out1)
+	}
+
+	// 2. Session with no limit (0) falls back to daemon's default 50 chars
+	paramsDefault := protocol.SessionStartParams{
+		Task:         "test output limit default",
+		WorkspaceDir: tempDir,
+	}
+
+	eng2, cleanup2, err := buildEngineForSession(context.Background(), f, "sess_limit_2", paramsDefault, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup2 != nil {
+		defer cleanup2()
+	}
+
+	out2 := eng2.Registry().Dispatch(context.Background(), "bash", json.RawMessage(`{"command": "echo `+longText+`"}`))
+	if strings.Contains(out2, longText) {
+		t.Errorf("expected daemon default limit 50 to truncate 100 chars, got:\n%s", out2)
+	}
+}
+
 func TestBuildEngineForSession_CallerEnvironment(t *testing.T) {
 	tempDir := t.TempDir()
 	f := cmdutil.NewFactory()

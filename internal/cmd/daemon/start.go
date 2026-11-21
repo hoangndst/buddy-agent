@@ -206,11 +206,15 @@ func buildEngineForSession(
 		}
 	}
 
+	outputLimit := cfg.MaxOutputChars
+	if params.MaxOutputChars > 0 {
+		outputLimit = params.MaxOutputChars
+	}
 	memMgr := memory.NewManager(wsDir)
-	reg := tools.NewRegistry(cfg.MaxOutputChars)
+	reg := tools.NewRegistry(outputLimit)
 
 	var bashOpts []tools.BashToolOption
-	bashOpts = append(bashOpts, tools.WithMaxOutputBytes(cfg.MaxOutputChars))
+	bashOpts = append(bashOpts, tools.WithMaxOutputBytes(outputLimit))
 	if len(params.Env) > 0 {
 		bashOpts = append(bashOpts, tools.WithEnv(params.Env))
 	}

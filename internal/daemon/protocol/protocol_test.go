@@ -18,6 +18,7 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	req, err := NewRequest("req-1", MethodSessionStart, SessionStartParams{
 		Task:             "run tests",
 		MaxContextTokens: 32000,
+		MaxOutputChars:   50000,
 		APIType:          "responses",
 		ReasoningEffort:  &effort,
 		DBPath:           "/custom/path.db",
@@ -63,6 +64,9 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	}
 	if params.MaxContextTokens != 32000 {
 		t.Fatalf("expected max context tokens 32000, got %d", params.MaxContextTokens)
+	}
+	if params.MaxOutputChars != 50000 {
+		t.Fatalf("expected max output chars 50000, got %d", params.MaxOutputChars)
 	}
 	if params.APIType != "responses" {
 		t.Fatalf("expected api type 'responses', got %q", params.APIType)
