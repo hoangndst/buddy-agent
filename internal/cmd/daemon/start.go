@@ -13,6 +13,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/client"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
+	"github.com/hoangndst/buddy-agent/internal/config"
 	"github.com/hoangndst/buddy-agent/internal/daemon"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	core "github.com/hoangndst/buddy-agent/internal/mcp"
@@ -119,12 +120,25 @@ func buildEngineForSession(
 		return nil, nil, fmt.Errorf("failed to load configuration: %w", err)
 	}
 
+	apiKey := cfg.APIKey
+	if params.APIKey != "" {
+		apiKey = params.APIKey
+	}
+	baseURL := cfg.BaseURL
+	if params.BaseURL != "" {
+		baseURL = params.BaseURL
+	}
+	isLocal := cfg.IsLocal
+	if params.BaseURL != "" {
+		isLocal = config.IsLocalEndpoint(baseURL)
+	}
+
 	opts := []option.RequestOption{
-		option.WithAPIKey(cfg.APIKey),
+		option.WithAPIKey(apiKey),
 		option.WithRequestTimeout(120 * time.Second),
 	}
-	if cfg.BaseURL != "" {
-		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
+	if baseURL != "" {
+		opts = append(opts, option.WithBaseURL(baseURL))
 	}
 	llmClient := openai.NewClient(opts...)
 
@@ -135,7 +149,7 @@ func buildEngineForSession(
 		prov = provider.NewAutoProvider(
 			provider.NewChatCompletionsProvider(&llmClient),
 			provider.NewResponsesProvider(&llmClient),
-			cfg.IsLocal,
+			isLocal,
 		)
 	}
 
@@ -209,7 +223,7 @@ func buildEngineForSession(
 		ReasoningEffort:  effort,
 		Store:            store,
 		EventHandler:     emitHandler,
-		IsLocal:          cfg.IsLocal,
+		IsLocal:          isLocal,
 		MaxContextTokens: cfg.MaxContextTokens,
 	})
 	reg.Register(subTool)
@@ -223,7 +237,7 @@ func buildEngineForSession(
 		emitHandler,
 		agent.WithMaxContextTokens(cfg.MaxContextTokens),
 		agent.WithWorkingTailSize(cfg.WorkingTailSize),
-		agent.WithIsLocal(cfg.IsLocal),
+		agent.WithIsLocal(isLocal),
 		agent.WithReasoningEffort(effort),
 		agent.WithStore(store),
 		agent.WithWorkspaceDir(wsDir),

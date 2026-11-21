@@ -275,11 +275,15 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 			model := ""
 			maxSteps := 0
 			reasoningEffort := ""
+			baseURL := ""
+			apiKey := ""
 			if cfg != nil {
 				workspaceDir = cfg.WorkspaceDir
 				model = cfg.Model
 				maxSteps = cfg.MaxSteps
 				reasoningEffort = cfg.ReasoningEffort
+				baseURL = cfg.BaseURL
+				apiKey = cfg.APIKey
 			}
 			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{
 				Task:            task,
@@ -287,13 +291,17 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				Model:           model,
 				MaxSteps:        maxSteps,
 				ReasoningEffort: reasoningEffort,
+				BaseURL:         baseURL,
+				APIKey:          apiKey,
 			})
-			if startErr == nil {
-				_, _ = fmt.Fprintf(f.IOStreams.Out, "Dispatched task to daemon (Session ID: %s)\n", sessionID)
-				return streamClientEvents(ctx, f, cl, sessionID)
+			if startErr != nil {
+				// Avoid ambiguous double-execution: if daemon connection succeeded but start failed, abort immediately
+				return fmt.Errorf("failed to start daemon session: %w", startErr)
 			}
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "Dispatched task to daemon (Session ID: %s)\n", sessionID)
+			return streamClientEvents(ctx, f, cl, sessionID)
 		}
-		// Graceful fallback to standalone if daemon connection fails
+		// Graceful fallback to standalone ONLY if daemon connection/spawn failed before request submission
 		_, _ = fmt.Fprintln(f.IOStreams.Out, "Notice: Daemon unavailable; running task in-process.")
 	}
 

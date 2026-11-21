@@ -89,7 +89,13 @@ func NewCmdAttach(f *cmdutil.Factory) *cobra.Command {
 					}
 					if evt.Type == string(agent.EventError) {
 						if term, _ := evt.Data["terminal"].(bool); term {
-							return nil
+							errMsg := evt.Content
+							if errMsg == "" && evt.Data != nil {
+								if e, ok := evt.Data["error"].(string); ok {
+									errMsg = e
+								}
+							}
+							return fmt.Errorf("task failed: %s", errMsg)
 						}
 					}
 				}

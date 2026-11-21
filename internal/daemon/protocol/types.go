@@ -60,6 +60,8 @@ type SessionStartParams struct {
 	Model           string `json:"model,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	MaxSteps        int    `json:"max_steps,omitempty"`
+	BaseURL         string `json:"base_url,omitempty"`
+	APIKey          string `json:"api_key,omitempty"`
 }
 
 // SessionStartResult returns the created session identifier.

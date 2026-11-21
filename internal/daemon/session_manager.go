@@ -42,9 +42,6 @@ func (sm *SessionManager) StartSession(
 	params protocol.SessionStartParams,
 	controller ClientConn,
 ) (*SessionWorker, error) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
 	sessionID := generateDaemonSessionID()
 
 	var worker *SessionWorker
@@ -61,7 +58,10 @@ func (sm *SessionManager) StartSession(
 	}
 
 	worker = NewSessionWorker(ctx, sessionID, params.Task, eng, controller, cleanup)
+
+	sm.mu.Lock()
 	sm.sessions[sessionID] = worker
+	sm.mu.Unlock()
 
 	worker.Start()
 	return worker, nil
