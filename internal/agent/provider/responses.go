@@ -53,7 +53,7 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 	}
 
 	var opts []option.RequestOption
-	if req.ReasoningEffort != "" && req.ReasoningEffort != "none" {
+	if req.ReasoningEffort != "" {
 		params.Reasoning = shared.ReasoningParam{
 			Effort: shared.ReasoningEffort(req.ReasoningEffort),
 		}

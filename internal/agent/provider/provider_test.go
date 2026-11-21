@@ -340,6 +340,7 @@ func TestAutoProvider_OperationalErrorFailFast(t *testing.T) {
 
 func TestResponsesProvider_MessageTranslation(t *testing.T) {
 	var inputCount int
+	var capturedReasoning map[string]any
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -347,6 +348,9 @@ func TestResponsesProvider_MessageTranslation(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&rawBody)
 		if inputList, ok := rawBody["input"].([]any); ok {
 			inputCount = len(inputList)
+		}
+		if reasoning, ok := rawBody["reasoning"].(map[string]any); ok {
+			capturedReasoning = reasoning
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -386,8 +390,9 @@ func TestResponsesProvider_MessageTranslation(t *testing.T) {
 	}
 
 	req := GenerateRequest{
-		Model:    "test-model",
-		Messages: msgs,
+		Model:           "test-model",
+		Messages:        msgs,
+		ReasoningEffort: "none",
 	}
 
 	resp, err := prov.Generate(context.Background(), req)
@@ -401,5 +406,10 @@ func TestResponsesProvider_MessageTranslation(t *testing.T) {
 
 	if inputCount != 3 {
 		t.Fatalf("expected 3 captured input items, got %d", inputCount)
+	}
+
+	// Verify that explicit "none" reasoning effort is forwarded rather than dropped
+	if capturedReasoning == nil || capturedReasoning["effort"] != "none" {
+		t.Errorf("expected reasoning.effort 'none' to be forwarded, got: %+v", capturedReasoning)
 	}
 }
