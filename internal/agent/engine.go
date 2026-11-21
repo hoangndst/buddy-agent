@@ -2,15 +2,18 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/history"
 	"github.com/hoangndst/buddy-agent/internal/memory"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -48,6 +51,20 @@ func WithIsLocal(isLocal bool) EngineOption {
 func WithReasoningEffort(effort string) EngineOption {
 	return func(e *Engine) {
 		e.reasoningEffort = effort
+	}
+}
+
+// WithStore configures persistent SQLite storage for the Agent Engine.
+func WithStore(s persistence.Store) EngineOption {
+	return func(e *Engine) {
+		e.store = s
+	}
+}
+
+// WithWorkspaceDir sets the active workspace directory for trajectory recording.
+func WithWorkspaceDir(dir string) EngineOption {
+	return func(e *Engine) {
+		e.workspaceDir = dir
 	}
 }
 
@@ -100,6 +117,8 @@ type Engine struct {
 	registry         *tools.Registry
 	memoryMgr        *memory.Manager
 	eventHandler     EventHandler
+	store            persistence.Store
+	workspaceDir     string
 }
 
 // NewEngine creates a new Agent Engine.
@@ -161,30 +180,215 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		history.WithWorkingTailSize(e.workingTailSize),
 	)
 
+	sessionID := generateSessionID()
+	if e.store != nil {
+		sessRec := &persistence.SessionRecord{
+			ID:         sessionID,
+			CreatedAt:  time.Now().UTC(),
+			UpdatedAt:  time.Now().UTC(),
+			Status:     persistence.StatusRunning,
+			Task:       task,
+			Model:      e.model,
+			WorkingDir: e.workspaceDir,
+			MaxSteps:   e.maxSteps,
+			TotalSteps: 0,
+		}
+		_ = e.store.CreateSession(context.Background(), sessRec)
+	}
+
 	// Guard against oversized initial task or system prompt exceeding context ceiling
 	if err := session.EnsureWatermarks(ctx, e.compClient, e.model); err != nil {
 		if errors.Is(err, history.ErrContextExhausted) {
 			e.eventHandler(Event{Type: EventContextExhausted, Step: 0, Error: err})
+			if e.store != nil {
+				_ = e.store.UpdateSessionStatus(context.Background(), sessionID, persistence.StatusFailed, 0, persistence.TokenUsage{}, err.Error())
+			}
 			return "", err
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if e.store != nil {
+				_ = e.store.UpdateSessionStatus(context.Background(), sessionID, persistence.StatusInterrupted, 0, persistence.TokenUsage{}, "Process interrupted by signal or user")
+			}
 			return "", err
 		}
 		e.eventHandler(Event{Type: EventError, Step: 0, Error: err})
+		if e.store != nil {
+			_ = e.store.UpdateSessionStatus(context.Background(), sessionID, persistence.StatusFailed, 0, persistence.TokenUsage{}, err.Error())
+		}
 		return "", fmt.Errorf("initial context validation failed: %w", err)
 	}
 
-	const maxTurnRetries = 2
+	return e.executeLoop(ctx, sessionID, session, 1, e.maxSteps, persistence.TokenUsage{})
+}
 
-	// 2. Main ReAct execution loop
-	for step := 1; step <= e.maxSteps; step++ {
+// Resume restores an interrupted or failed session from persistence and continues execution.
+func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride int) (string, error) {
+	if e.store == nil {
+		return "", errors.New("persistence store is required to resume session")
+	}
+
+	sessionRec, err := e.store.GetSession(ctx, sessionID)
+	if err != nil {
+		return "", fmt.Errorf("failed to load session %q: %w", sessionID, err)
+	}
+
+	if sessionRec.Status == persistence.StatusCompleted {
+		return "", persistence.ErrSessionCompleted
+	}
+
+	activeDir := e.workspaceDir
+	if activeDir == "" {
+		activeDir = "."
+	}
+	recordedDir := sessionRec.WorkingDir
+	if recordedDir == "" {
+		recordedDir = "."
+	}
+	cleanCurrent, err1 := filepath.Abs(filepath.Clean(activeDir))
+	cleanRecorded, err2 := filepath.Abs(filepath.Clean(recordedDir))
+	if err1 == nil && err2 == nil && cleanCurrent != cleanRecorded {
+		return "", fmt.Errorf("cannot resume session %q: working directory mismatch (session: %s, active workspace: %s)",
+			sessionID, sessionRec.WorkingDir, activeDir)
+	}
+
+	// 1. Build initial system prompt
+	systemPrompt, err := e.memoryMgr.LoadSystemPrompt()
+	if err != nil {
+		return "", fmt.Errorf("failed to load system prompt: %w", err)
+	}
+
+	// 2. Fetch latest snapshot
+	snap, err := e.store.GetLatestSnapshot(ctx, sessionRec.ID)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch snapshot: %w", err)
+	}
+
+	compactedStep := 0
+	narrative := ""
+	var tracker *history.StateTracker
+	if snap != nil {
+		compactedStep = snap.StepNumber
+		narrative = snap.DistilledNarrative
+		if snap.StateTrackerJSON != "" {
+			var trackerData history.StateTrackerData
+			if err := json.Unmarshal([]byte(snap.StateTrackerJSON), &trackerData); err == nil {
+				tracker = history.RestoreStateTracker(trackerData)
+			}
+		}
+	}
+	if tracker == nil {
+		tracker = history.NewStateTracker(sessionRec.Task, nil)
+	}
+
+	// 3. Fetch trailing turns after compactedStep
+	turnRecords, err := e.store.GetTurnsAfterStep(ctx, sessionRec.ID, compactedStep)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch trailing turns: %w", err)
+	}
+
+	trailingBlocks := make([]history.TurnBlock, len(turnRecords))
+	for i, tr := range turnRecords {
+		trailingBlocks[i] = mapTurnRecordToBlock(tr)
+		for _, tc := range tr.ToolCalls {
+			if tc.Name == "write_file" || tc.Name == "edit_file" {
+				var args struct{ Path string }
+				if json.Unmarshal([]byte(tc.Args), &args) == nil && args.Path != "" {
+					tracker.RecordFileAccess(args.Path, "modified")
+				}
+			}
+			if tc.ExitCode != 0 {
+				tracker.RecordError(fmt.Sprintf("%s: %s", tc.Name, tc.Result))
+			}
+		}
+	}
+
+	restoredState := history.RestoredState{
+		SessionID:         sessionRec.ID,
+		Task:              sessionRec.Task,
+		SystemAnchor:      systemPrompt,
+		CompactedStep:     compactedStep,
+		EpisodicNarrative: narrative,
+		StateTracker:      tracker,
+		TrailingTurns:     trailingBlocks,
+	}
+
+	session, err := history.RestoreSession(
+		restoredState,
+		history.WithMaxContextTokens(e.maxContextTokens),
+		history.WithWorkingTailSize(e.workingTailSize),
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to restore history session: %w", err)
+	}
+
+	maxStep := 0
+	allTurns, _ := e.store.GetAllTurns(ctx, sessionRec.ID)
+	for _, t := range allTurns {
+		if t.StepNumber > maxStep {
+			maxStep = t.StepNumber
+		}
+	}
+	startStep := maxStep + 1
+
+	totalMaxSteps := sessionRec.MaxSteps
+	if maxStepsOverride > 0 {
+		totalMaxSteps = startStep - 1 + maxStepsOverride
+	} else if startStep > totalMaxSteps {
+		totalMaxSteps = startStep + 10
+	}
+
+	_ = e.store.UpdateSessionStatus(ctx, sessionRec.ID, persistence.StatusRunning, startStep-1, sessionRec.TokenUsage, "")
+
+	// Guard against oversized restored history exceeding context ceiling
+	if err := session.EnsureWatermarks(ctx, e.compClient, e.model); err != nil {
+		if errors.Is(err, history.ErrContextExhausted) {
+			e.eventHandler(Event{Type: EventContextExhausted, Step: startStep - 1, Error: err})
+			if e.store != nil {
+				_ = e.store.UpdateSessionStatus(context.Background(), sessionRec.ID, persistence.StatusFailed, startStep-1, sessionRec.TokenUsage, err.Error())
+			}
+			return "", err
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if e.store != nil {
+				_ = e.store.UpdateSessionStatus(context.Background(), sessionRec.ID, persistence.StatusInterrupted, startStep-1, sessionRec.TokenUsage, "Process interrupted by signal or user")
+			}
+			return "", err
+		}
+		e.eventHandler(Event{Type: EventError, Step: startStep - 1, Error: err})
+		if e.store != nil {
+			_ = e.store.UpdateSessionStatus(context.Background(), sessionRec.ID, persistence.StatusFailed, startStep-1, sessionRec.TokenUsage, err.Error())
+		}
+		return "", fmt.Errorf("resumed context validation failed: %w", err)
+	}
+
+	return e.executeLoop(ctx, sessionRec.ID, session, startStep, totalMaxSteps, sessionRec.TokenUsage)
+}
+
+func (e *Engine) executeLoop(
+	ctx context.Context,
+	sessionID string,
+	session *history.Session,
+	startStep, totalMaxSteps int,
+	initialUsage persistence.TokenUsage,
+) (string, error) {
+	const maxTurnRetries = 2
+	cumulativeUsage := initialUsage
+
+	for step := startStep; step <= totalMaxSteps; step++ {
+		session.SetCurrentStep(step)
 		select {
 		case <-ctx.Done():
+			if e.store != nil && sessionID != "" {
+				shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				_ = e.store.UpdateSessionStatus(shutdownCtx, sessionID, persistence.StatusInterrupted, step-1, cumulativeUsage, "Process interrupted by signal or user")
+			}
 			return "", ctx.Err()
 		default:
 		}
 
-		e.eventHandler(Event{Type: EventStepStart, Step: step, Timestamp: time.Now()})
+		stepStartTime := time.Now()
+		e.eventHandler(Event{Type: EventStepStart, Step: step, Timestamp: stepStartTime})
 
 		var genResp *provider.GenerateResponse
 		var completionErr error
@@ -208,6 +412,10 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 				if resp.Usage.PromptTokens > 0 {
 					session.CalibrateUsage(resp.Usage.PromptTokens)
 				}
+				cumulativeUsage.PromptTokens += resp.Usage.PromptTokens
+				cumulativeUsage.CompletionTokens += resp.Usage.CompletionTokens
+				cumulativeUsage.ReasoningTokens += resp.Usage.ReasoningTokens
+				cumulativeUsage.TotalTokens += resp.Usage.TotalTokens
 				genResp = resp
 				completionErr = nil
 				break
@@ -217,6 +425,9 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 			targetTokens, matched := ParseContextLengthError(err)
 			if !matched || retry == maxTurnRetries {
 				e.eventHandler(Event{Type: EventError, Step: step, Duration: callDuration, Error: err})
+				if e.store != nil && sessionID != "" {
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
+				}
 				return "", fmt.Errorf("step %d LLM call failed: %w", step, err)
 			}
 
@@ -231,9 +442,15 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 			if err := session.DownscaleWatermark(targetTokens); err != nil {
 				if errors.Is(err, history.ErrContextExhausted) {
 					e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
+					if e.store != nil && sessionID != "" {
+						_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
+					}
 					return "", err
 				}
 				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
+				if e.store != nil && sessionID != "" {
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
+				}
 				return "", fmt.Errorf("downscale watermark failed: %w", err)
 			}
 
@@ -241,12 +458,18 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 			if err := session.ForceCompaction(ctx, e.compClient, e.model); err != nil {
 				if errors.Is(err, history.ErrContextExhausted) {
 					e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
+					if e.store != nil && sessionID != "" {
+						_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
+					}
 					return "", err
 				}
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return "", err
 				}
 				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
+				if e.store != nil && sessionID != "" {
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
+				}
 				return "", fmt.Errorf("force compaction failed: %w", err)
 			}
 			e.eventHandler(Event{Type: EventCompactionDone, Step: step})
@@ -271,6 +494,25 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		// If no tools called, task has concluded
 		if len(genResp.ToolCalls) == 0 {
 			session.CommitSimpleAssistant(genResp.ToChatMessage())
+			if e.store != nil && sessionID != "" {
+				turnRec := &persistence.TurnRecord{
+					SessionID:        sessionID,
+					StepNumber:       step,
+					Role:             "assistant",
+					Content:          genResp.Content,
+					ReasoningContent: genResp.ReasoningContent,
+					TokenUsage: persistence.TokenUsage{
+						PromptTokens:     genResp.Usage.PromptTokens,
+						CompletionTokens: genResp.Usage.CompletionTokens,
+						ReasoningTokens:  genResp.Usage.ReasoningTokens,
+						TotalTokens:      genResp.Usage.TotalTokens,
+					},
+					DurationMs: time.Since(stepStartTime).Milliseconds(),
+					CreatedAt:  time.Now().UTC(),
+				}
+				_ = e.store.CommitTurn(ctx, turnRec, step, cumulativeUsage)
+				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusCompleted, step, cumulativeUsage, "")
+			}
 			e.eventHandler(Event{
 				Type:      EventTextComplete,
 				Step:      step,
@@ -379,6 +621,54 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		// Atomic turn block commit
 		session.CommitToolTurn(genResp.ToChatMessage(), toolResults)
 
+		if e.store != nil && sessionID != "" {
+			toolCalls := make([]persistence.ToolCallRecord, len(toolResults))
+			for i, tr := range toolResults {
+				argsStr := ""
+				for _, tc := range genResp.ToolCalls {
+					if tc.ID == tr.ToolCallID {
+						argsStr = tc.Arguments
+						break
+					}
+				}
+				toolCalls[i] = persistence.ToolCallRecord{
+					ID:       tr.ToolCallID,
+					Name:     tr.Name,
+					Args:     argsStr,
+					Result:   tr.Content,
+					ExitCode: parseToolExitCode(tr.Content),
+				}
+			}
+			turnRec := &persistence.TurnRecord{
+				SessionID:        sessionID,
+				StepNumber:       step,
+				Role:             "assistant",
+				Content:          genResp.Content,
+				ReasoningContent: genResp.ReasoningContent,
+				ToolCalls:        toolCalls,
+				TokenUsage: persistence.TokenUsage{
+					PromptTokens:     genResp.Usage.PromptTokens,
+					CompletionTokens: genResp.Usage.CompletionTokens,
+					ReasoningTokens:  genResp.Usage.ReasoningTokens,
+					TotalTokens:      genResp.Usage.TotalTokens,
+				},
+				DurationMs: time.Since(stepStartTime).Milliseconds(),
+				CreatedAt:  time.Now().UTC(),
+			}
+			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_ = e.store.CommitTurn(persistCtx, turnRec, step, cumulativeUsage)
+			cancel()
+		}
+
+		if ctx.Err() != nil {
+			if e.store != nil && sessionID != "" {
+				shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				_ = e.store.UpdateSessionStatus(shutdownCtx, sessionID, persistence.StatusInterrupted, step, cumulativeUsage, "Process interrupted by signal or user")
+				cancel()
+			}
+			return "", ctx.Err()
+		}
+
 		// Watermark check: execute staged micro-pruning or macro-distillation
 		preTokens := session.CurrentTokens()
 		if preTokens >= int(float64(session.MaxContextTokens())*0.70) {
@@ -387,22 +677,89 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		if err := session.EnsureWatermarks(ctx, e.compClient, e.model); err != nil {
 			if errors.Is(err, history.ErrContextExhausted) {
 				e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
+				if e.store != nil && sessionID != "" {
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step, cumulativeUsage, err.Error())
+				}
 				return "", err
 			}
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return "", err
 			}
 			e.eventHandler(Event{Type: EventError, Step: step, Error: err})
+			if e.store != nil && sessionID != "" {
+				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step, cumulativeUsage, err.Error())
+			}
 			return "", fmt.Errorf("context compaction failed: %w", err)
 		}
 		if session.CurrentTokens() < preTokens {
 			e.eventHandler(Event{Type: EventCompactionDone, Step: step, Timestamp: time.Now()})
+			if e.store != nil && sessionID != "" && session.EpisodicNarrative() != "" {
+				narrative, trackerJSON, currentTokens := session.ExtractSnapshot()
+				snapRec := &persistence.SnapshotRecord{
+					SessionID:          sessionID,
+					StepNumber:         session.LastCompactedStep(),
+					DistilledNarrative: narrative,
+					StateTrackerJSON:   trackerJSON,
+					CurrentTokens:      currentTokens,
+					CreatedAt:          time.Now().UTC(),
+				}
+				_ = e.store.SaveSnapshot(ctx, snapRec)
+			}
 		}
 	}
 
-	maxStepErr := fmt.Errorf("reached maximum step budget (%d) without finishing", e.maxSteps)
+	maxStepErr := fmt.Errorf("reached maximum step budget (%d) without finishing", totalMaxSteps)
+	if e.store != nil && sessionID != "" {
+		_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, totalMaxSteps, cumulativeUsage, maxStepErr.Error())
+	}
 	e.eventHandler(Event{Type: EventError, Error: maxStepErr})
 	return "", maxStepErr
+}
+
+func generateSessionID() string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("sess_%s_%x", time.Now().UTC().Format("20060102150405"), b)
+}
+
+func mapTurnRecordToBlock(tr *persistence.TurnRecord) history.TurnBlock {
+	if tr.Role == "user" {
+		b := history.NewUserBlock(tr.Content)
+		b.StepNumber = tr.StepNumber
+		return b
+	}
+	if len(tr.ToolCalls) == 0 {
+		msg := openai.ChatCompletionMessage{Role: "assistant", Content: tr.Content}
+		b := history.NewAssistantSimpleBlock(msg)
+		b.StepNumber = tr.StepNumber
+		return b
+	}
+
+	toolCalls := make([]openai.ChatCompletionMessageToolCall, len(tr.ToolCalls))
+	results := make([]history.ToolResult, len(tr.ToolCalls))
+	for i, tc := range tr.ToolCalls {
+		toolCalls[i] = openai.ChatCompletionMessageToolCall{
+			ID:   tc.ID,
+			Type: "function",
+			Function: openai.ChatCompletionMessageToolCallFunction{
+				Name:      tc.Name,
+				Arguments: tc.Args,
+			},
+		}
+		results[i] = history.ToolResult{
+			ToolCallID: tc.ID,
+			Name:       tc.Name,
+			Content:    tc.Result,
+		}
+	}
+	msg := openai.ChatCompletionMessage{
+		Role:      "assistant",
+		Content:   tr.Content,
+		ToolCalls: toolCalls,
+	}
+	b := history.NewAssistantToolCallBlock(msg, results)
+	b.StepNumber = tr.StepNumber
+	return b
 }
 
 // parseToolExitCode extracts a process exit code from tool output or defaults to 0 on success.

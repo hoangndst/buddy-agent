@@ -866,3 +866,120 @@ func TestDistill_SingleParagraphRuneClamp(t *testing.T) {
 		t.Fatalf("expected summary tokens <= %d, got %d", MaxDistillTokens, EstimateContent(summary))
 	}
 }
+
+func TestRestoreSession_Uncompacted(t *testing.T) {
+	state := RestoredState{
+		SessionID:     "sess_restore_uncompacted",
+		Task:          "Refactor authentication module",
+		SystemAnchor:  "You are Buddy.",
+		CompactedStep: 0,
+		TrailingTurns: []TurnBlock{
+			NewAssistantSimpleBlock(openai.ChatCompletionMessage{Role: "assistant", Content: "Inspected auth.go"}),
+		},
+	}
+
+	session, err := RestoreSession(state)
+	if err != nil {
+		t.Fatalf("RestoreSession failed: %v", err)
+	}
+
+	// Because CompactedStep == 0, root user block must be injected at blocks[0]
+	if session.BlockCount() != 2 {
+		t.Fatalf("expected 2 blocks (1 user + 1 assistant), got %d", session.BlockCount())
+	}
+
+	msgs := session.CompileMessages()
+	// Should have: System message, User task message, Assistant message
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 compiled messages, got %d", len(msgs))
+	}
+	if msgs[1].OfUser == nil || !strings.Contains(msgs[1].OfUser.Content.OfString.Value, "Refactor authentication module") {
+		t.Errorf("expected root task prompt in user message, got: %+v", msgs[1])
+	}
+}
+
+func TestRestoreSession_WithCompactedSnapshot(t *testing.T) {
+	tracker := NewStateTracker("Goal", []string{"Keep safe"})
+	tracker.RecordFileAccess("auth.go", "modified")
+
+	state := RestoredState{
+		SessionID:         "sess_restore_compacted",
+		Task:              "Goal",
+		SystemAnchor:      "You are Buddy.",
+		CompactedStep:     5,
+		EpisodicNarrative: "Completed initial analysis.",
+		StateTracker:      tracker,
+		TrailingTurns: []TurnBlock{
+			NewAssistantSimpleBlock(openai.ChatCompletionMessage{Role: "assistant", Content: "Turn 6 done"}),
+		},
+	}
+
+	session, err := RestoreSession(state)
+	if err != nil {
+		t.Fatalf("RestoreSession failed: %v", err)
+	}
+
+	// Because CompactedStep > 0, Partition 2 holds episodic narrative and tracker.
+	// blocks only contains trailing turns.
+	if session.BlockCount() != 1 {
+		t.Fatalf("expected 1 trailing turn block, got %d", session.BlockCount())
+	}
+
+	msgs := session.CompileMessages()
+	// System message (P1), Episodic Anchor (P2), Turn 6 (P3)
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 compiled messages, got %d", len(msgs))
+	}
+	if msgs[1].OfUser == nil || !strings.Contains(msgs[1].OfUser.Content.OfString.Value, "Completed initial analysis") {
+		t.Errorf("expected episodic narrative in P2, got: %+v", msgs[1])
+	}
+}
+
+func TestCompaction_LastCompactedStepTracking(t *testing.T) {
+	session := NewSession(
+		"You are Buddy.",
+		"Root task",
+		WithMaxContextTokens(500),
+		WithWorkingTailSize(2),
+		WithWatermarkRatios(0.30, 0.40),
+	)
+
+	// Add 4 turns with step numbers
+	for step := 1; step <= 4; step++ {
+		session.SetCurrentStep(step)
+		session.CommitSimpleAssistant(openai.ChatCompletionMessage{
+			Role:    "assistant",
+			Content: fmt.Sprintf("Turn content %d %s", step, strings.Repeat("detail ", 60)),
+		})
+	}
+
+	mockClient := &mockCompletionClient{
+		response: &openai.ChatCompletion{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    "assistant",
+						Content: "Summary of intermediate turns.",
+					},
+				},
+			},
+		},
+	}
+
+	// Trigger compaction
+	err := session.EnsureWatermarks(context.Background(), mockClient, "gpt-4o")
+	if err != nil {
+		t.Fatalf("EnsureWatermarks failed: %v", err)
+	}
+
+	// With working tail size 2, turns 3 and 4 should be retained.
+	// Evicted blocks: root task (step 0), turn 1 (step 1), turn 2 (step 2).
+	// Therefore, lastCompactedStep should be 2!
+	if session.LastCompactedStep() != 2 {
+		t.Fatalf("expected lastCompactedStep 2, got %d", session.LastCompactedStep())
+	}
+	if session.BlockCount() != 2 {
+		t.Fatalf("expected 2 blocks in working tail, got %d", session.BlockCount())
+	}
+}
+

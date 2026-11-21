@@ -37,6 +37,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Debug {
 		t.Errorf("expected default Debug false, got true")
 	}
+	if cfg.DBPath != "" {
+		t.Errorf("expected default DBPath empty, got %s", cfg.DBPath)
+	}
 }
 
 func TestLoadCustom(t *testing.T) {

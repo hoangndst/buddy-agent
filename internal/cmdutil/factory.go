@@ -2,10 +2,12 @@ package cmdutil
 
 import (
 	"os"
+	"path/filepath"
 
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/config"
 	"github.com/hoangndst/buddy-agent/internal/mcp"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/openai/openai-go"
 )
 
@@ -19,6 +21,7 @@ type Factory struct {
 	UserHome         func() (string, error)
 	NewClientManager func(cfg *mcp.Config) *mcp.ClientManager
 	NewModelProvider func(cfg *config.Config, client *openai.Client) provider.ModelProvider
+	Store            func() (persistence.Store, func(), error)
 }
 
 // NewFactory constructs a default production command factory.
@@ -43,6 +46,34 @@ func NewFactory() *Factory {
 				resp := provider.NewResponsesProvider(client)
 				return provider.NewAutoProvider(chat, resp, cfg.IsLocal)
 			}
+		},
+		Store: func() (persistence.Store, func(), error) {
+			cfg, err := config.Load()
+			if err != nil {
+				return nil, nil, err
+			}
+			dbPath := cfg.DBPath
+			if dbPath == "" {
+				ws := cfg.WorkspaceDir
+				if ws == "" {
+					ws = "."
+				}
+				dbPath = filepath.Join(ws, ".buddy", "history.db")
+			}
+			store, err := persistence.NewSQLiteStore(dbPath)
+			if err != nil {
+				if home, homeErr := os.UserHomeDir(); homeErr == nil {
+					fallbackPath := filepath.Join(home, ".buddy", "history.db")
+					store, err = persistence.NewSQLiteStore(fallbackPath)
+				}
+				if err != nil {
+					return nil, nil, err
+				}
+			}
+			cleanup := func() {
+				_ = store.Close()
+			}
+			return store, cleanup, nil
 		},
 	}
 }

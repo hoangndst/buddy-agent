@@ -14,6 +14,7 @@ A robust, self-evolving autonomous agent harness built in pure Go, supporting bo
 - **Memory-Bounded Streaming Truncation**: Line-aware, streaming dual-buffer truncators (70% stdout / 30% stderr) with circular rolling tail ring buffers and delimiter-free UTF-8 rune fallback.
 - **Provider Agnostic**: OpenAI-compatible REST integration using official `openai-go` SDK supporting local inference runners and cloud providers.
 - **Durable Memory & Persona**: Context-aware memory layer using file-backed storage (`SOUL.md`, `MEMORY.md`, `USER.md`) alongside structured episodic records.
+- **Pure Go SQLite State Persistence & Crash Recovery**: Embedded pure Go SQLite trajectory ledger (`modernc.org/sqlite`) with dual connection pools, atomic turn persistence (`turns.tool_calls JSON`), secret redaction, and seamless session resumption (`buddy resume`).
 - **Self-Improving Skill System**: Dynamically captures discovered procedures and workflows into an extensible `skills/` library.
 - **Zero CGO**: Pure Go for fast, static single-binary compilation across platforms (`linux`, `darwin`, `windows`).
 
@@ -22,6 +23,9 @@ A robust, self-evolving autonomous agent harness built in pure Go, supporting bo
 Approved milestone design specifications are maintained under [`docs/designs/`](docs/designs/):
 - [`docs/designs/02_subprocess_safety.md`](docs/designs/02_subprocess_safety.md): Subprocess process group isolation, staged termination, and output safety.
 - [`docs/designs/03_context_compaction.md`](docs/designs/03_context_compaction.md): Context compaction pipeline, atomic turn blocks, dual token accounting, and episodic anchoring.
+- [`docs/designs/04_model_context_protocol.md`](docs/designs/04_model_context_protocol.md): Supervised MCP client integration and two-tier tool configuration.
+- [`docs/designs/05_universal_model_protocols_and_ux.md`](docs/designs/05_universal_model_protocols_and_ux.md): Dual protocol engine, reasoning visibility, and clean REPL UX.
+- [`docs/designs/06_sqlite_state_persistence.md`](docs/designs/06_sqlite_state_persistence.md): Pure Go SQLite episodic trajectory store, atomic turn persistence, secret redaction, and crash recovery.
 
 ## Getting Started
 

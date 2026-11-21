@@ -72,6 +72,7 @@ type TurnBlock struct {
 	ID        string
 	Kind      BlockKind
 	Timestamp time.Time
+	StepNumber int
 
 	// User block payload
 	UserPrompt string

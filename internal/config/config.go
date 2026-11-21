@@ -31,6 +31,7 @@ type Config struct {
 	MaxContextTokens int
 	WorkingTailSize  int
 	WorkspaceDir     string
+	DBPath           string
 	Debug            bool
 	IsLocal          bool
 }
@@ -80,6 +81,8 @@ func Load() (*Config, error) {
 		workingTailSize = 5
 	}
 
+	dbPath := strings.TrimSpace(getEnv("BUDDY_DB_PATH", ""))
+
 	debug, _ := strconv.ParseBool(getEnv("BUDDY_DEBUG", "false"))
 	isLocal := IsLocalEndpoint(baseURL)
 
@@ -94,6 +97,7 @@ func Load() (*Config, error) {
 		MaxContextTokens: maxContextTokens,
 		WorkingTailSize:  workingTailSize,
 		WorkspaceDir:     absWorkspace,
+		DBPath:           dbPath,
 		Debug:            debug,
 		IsLocal:          isLocal,
 	}, nil

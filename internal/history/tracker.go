@@ -171,3 +171,43 @@ func (st *StateTracker) Clone() *StateTracker {
 		RecentErrors:  errCopy,
 	}
 }
+
+// StateTrackerData holds serializable state for StateTracker.
+type StateTrackerData struct {
+	RootGoal      string                `json:"root_goal"`
+	Invariants    []string              `json:"invariants"`
+	ModifiedFiles map[string]FileRecord `json:"modified_files"`
+	RecentErrors  []string              `json:"recent_errors"`
+}
+
+// ExportData exports a thread-safe snapshot of the state tracker's contents.
+func (st *StateTracker) ExportData() StateTrackerData {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+
+	modCopy := make(map[string]FileRecord, len(st.ModifiedFiles))
+	for k, v := range st.ModifiedFiles {
+		modCopy[k] = v
+	}
+	invCopy := make([]string, len(st.Invariants))
+	copy(invCopy, st.Invariants)
+	errCopy := make([]string, len(st.RecentErrors))
+	copy(errCopy, st.RecentErrors)
+
+	return StateTrackerData{
+		RootGoal:      st.RootGoal,
+		Invariants:    invCopy,
+		ModifiedFiles: modCopy,
+		RecentErrors:  errCopy,
+	}
+}
+
+// RestoreStateTracker initializes a StateTracker from previously exported data.
+func RestoreStateTracker(data StateTrackerData) *StateTracker {
+	st := NewStateTracker(data.RootGoal, data.Invariants)
+	for k, v := range data.ModifiedFiles {
+		st.ModifiedFiles[k] = v
+	}
+	st.RecentErrors = append(st.RecentErrors, data.RecentErrors...)
+	return st
+}
