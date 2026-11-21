@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/history"
 	"github.com/hoangndst/buddy-agent/internal/memory"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -724,3 +726,150 @@ func TestParseToolExitCode(t *testing.T) {
 		})
 	}
 }
+
+func TestEngine_PersistenceAndResume(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := persistence.NewSQLiteStore(fmt.Sprintf("file:memdb_engine_%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	memMgr := memory.NewManager(tmpDir)
+	reg := tools.NewRegistry(1000)
+
+	// Session 1: executes step 1 with tool call, then fails/stops at step 2
+	mockClient := &mockChatClient{
+		responses: []*openai.ChatCompletion{
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: "assistant",
+							ToolCalls: []openai.ChatCompletionMessageToolCall{
+								{
+									ID:   "call_step1",
+									Type: "function",
+									Function: openai.ChatCompletionMessageToolCallFunction{
+										Name:      "save_memory",
+										Arguments: `{"topic": "learning", "content": "note"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+				Usage: openai.CompletionUsage{PromptTokens: 50, CompletionTokens: 20, TotalTokens: 70},
+			},
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "Task finished after resume",
+						},
+					},
+				},
+				Usage: openai.CompletionUsage{PromptTokens: 70, CompletionTokens: 10, TotalTokens: 80},
+			},
+		},
+	}
+	reg.Register(tools.NewSaveMemoryTool(memMgr))
+
+	eng := NewEngine(
+		mockClient,
+		"gpt-4o",
+		1, // limit to 1 step to simulate interruption/budget exhaustion
+		reg,
+		memMgr,
+		nil,
+		WithStore(store),
+		WithWorkspaceDir(tmpDir),
+	)
+
+	ctx := context.Background()
+	_, err = eng.Run(ctx, "Test persistence task")
+	if err == nil {
+		t.Fatal("expected engine to exhaust max steps (1), got nil error")
+	}
+
+	sessions, err := store.ListSessions(ctx, tmpDir, 1)
+	if err != nil || len(sessions) == 0 {
+		t.Fatalf("expected 1 session in store, got %v (err: %v)", sessions, err)
+	}
+	sessRecord := sessions[0]
+	if sessRecord.TotalSteps != 1 {
+		t.Errorf("expected 1 completed step, got %d", sessRecord.TotalSteps)
+	}
+
+	// Now resume the session with additional budget
+	resumeEng := NewEngine(
+		mockClient,
+		"gpt-4o",
+		5,
+		reg,
+		memMgr,
+		nil,
+		WithStore(store),
+		WithWorkspaceDir(tmpDir),
+	)
+
+	result, err := resumeEng.Resume(ctx, sessRecord.ID, 5)
+	if err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	if result != "Task finished after resume" {
+		t.Errorf("expected resumed task result 'Task finished after resume', got %q", result)
+	}
+
+	resumedSess, err := store.GetSession(ctx, sessRecord.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if resumedSess.Status != persistence.StatusCompleted {
+		t.Errorf("expected status completed, got %s", resumedSess.Status)
+	}
+	if resumedSess.TotalSteps != 2 {
+		t.Errorf("expected total steps 2, got %d", resumedSess.TotalSteps)
+	}
+}
+
+func TestEngine_SignalInterruptionGracefulPersist(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := persistence.NewSQLiteStore(fmt.Sprintf("file:memdb_sigint_%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	memMgr := memory.NewManager(tmpDir)
+	reg := tools.NewRegistry(1000)
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context
+
+	eng := NewEngine(
+		&mockChatClient{},
+		"gpt-4o",
+		5,
+		reg,
+		memMgr,
+		nil,
+		WithStore(store),
+		WithWorkspaceDir(tmpDir),
+	)
+
+	_, err = eng.Run(canceledCtx, "Task with canceled context")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	sessions, err := store.ListSessions(context.Background(), tmpDir, 1)
+	if err != nil || len(sessions) == 0 {
+		t.Fatalf("expected 1 session recorded, got %v", sessions)
+	}
+	if sessions[0].Status != persistence.StatusInterrupted {
+		t.Errorf("expected status interrupted, got %s", sessions[0].Status)
+	}
+}
+

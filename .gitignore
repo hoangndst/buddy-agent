@@ -20,6 +20,7 @@ coverage.txt
 secrets/
 
 # Agent local state & memory
+.buddy/
 data/
 *.db
 *.db-journal

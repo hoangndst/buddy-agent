@@ -14,9 +14,11 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/cmd/doc"
 	mcpcmd "github.com/hoangndst/buddy-agent/internal/cmd/mcp"
+	sessioncmd "github.com/hoangndst/buddy-agent/internal/cmd/session"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
 	core "github.com/hoangndst/buddy-agent/internal/mcp"
 	"github.com/hoangndst/buddy-agent/internal/memory"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -50,6 +52,8 @@ three-partition context memory compaction, and Model Context Protocol (MCP) inte
 
 	rootCmd.AddCommand(mcpcmd.NewCmdMCP(f))
 	rootCmd.AddCommand(doc.NewCmdDoc(f))
+	rootCmd.AddCommand(sessioncmd.NewCmdSession(f))
+	rootCmd.AddCommand(NewCmdResume(f))
 
 	return rootCmd
 }
@@ -192,6 +196,24 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 		}
 	}
 
+	// Initialize Persistence Store
+	var store persistence.Store
+	var storeCleanup func()
+	if f.Store != nil {
+		s, sCleanup, sErr := f.Store()
+		if sErr == nil && s != nil {
+			store = s
+			storeCleanup = sCleanup
+		}
+	}
+
+	combinedCleanup := func() {
+		cleanupFunc()
+		if storeCleanup != nil {
+			storeCleanup()
+		}
+	}
+
 	engine := agent.NewEngine(
 		prov,
 		cfg.Model,
@@ -203,9 +225,11 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 		agent.WithWorkingTailSize(cfg.WorkingTailSize),
 		agent.WithIsLocal(cfg.IsLocal),
 		agent.WithReasoningEffort(cfg.ReasoningEffort),
+		agent.WithStore(store),
+		agent.WithWorkspaceDir(cfg.WorkspaceDir),
 	)
 
-	return engine, cleanupFunc, nil
+	return engine, combinedCleanup, nil
 }
 
 func runTask(ctx context.Context, f *cmdutil.Factory, args []string) error {
