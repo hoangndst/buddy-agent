@@ -3,6 +3,7 @@ package persistence
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,8 +33,8 @@ func TestMigrationRunner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query user_version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("expected user_version 1, got %d", version)
+	if version != 2 {
+		t.Errorf("expected user_version 2, got %d", version)
 	}
 }
 
@@ -574,5 +575,167 @@ func TestSecretRedaction_URIAndJSONBoundaries(t *testing.T) {
 	}
 	if loadedData.RecentErrors[0] != "contact: dev@example.com" {
 		t.Errorf("expected loaded email intact, got %q", loadedData.RecentErrors[0])
+	}
+}
+
+func TestHierarchicalSessionsAndTriggerCascade(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// 1. Create parent session (depth = 0)
+	parentSess := &SessionRecord{
+		ID:         "sess_parent_001",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Status:     StatusRunning,
+		Task:       "Parent task",
+		Model:      "gpt-4o",
+		WorkingDir: "/test/workspace",
+		MaxSteps:   30,
+		Role:       "root",
+		Depth:      0,
+	}
+	if err := store.CreateSession(ctx, parentSess); err != nil {
+		t.Fatalf("CreateSession (parent) failed: %v", err)
+	}
+
+	// 2. Create child session (depth = 1)
+	childSess := &SessionRecord{
+		ID:              "sess_child_001",
+		CreatedAt:       now.Add(1 * time.Second),
+		UpdatedAt:       now.Add(1 * time.Second),
+		Status:          StatusRunning,
+		Task:            "Child sub-task",
+		Model:           "gpt-4o",
+		WorkingDir:      "/test/workspace",
+		MaxSteps:        10,
+		ParentSessionID: &parentSess.ID,
+		Role:            "researcher",
+		Depth:           1,
+	}
+	if err := store.CreateSession(ctx, childSess); err != nil {
+		t.Fatalf("CreateSession (child) failed: %v", err)
+	}
+
+	// 3. Create a turn in the child session
+	childTurn := &TurnRecord{
+		SessionID:  childSess.ID,
+		StepNumber: 1,
+		Role:       "assistant",
+		Content:    "Child research content",
+		CreatedAt:  now.Add(2 * time.Second),
+	}
+	if err := store.CommitTurn(ctx, childTurn, 1, TokenUsage{TotalTokens: 150}); err != nil {
+		t.Fatalf("CommitTurn (child) failed: %v", err)
+	}
+
+	// 4. Verify GetChildSessions
+	children, err := store.GetChildSessions(ctx, parentSess.ID)
+	if err != nil {
+		t.Fatalf("GetChildSessions failed: %v", err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("expected 1 child session, got %d", len(children))
+	}
+	if children[0].ID != childSess.ID || children[0].Role != "researcher" || children[0].Depth != 1 {
+		t.Errorf("unexpected child session fields: %+v", children[0])
+	}
+
+	// 5. Verify ListSessions defaults to depth = 0 (excludes child)
+	rootList, err := store.ListSessions(ctx, "/test/workspace", 10)
+	if err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
+	}
+	if len(rootList) != 1 || rootList[0].ID != parentSess.ID {
+		t.Errorf("expected 1 root session in ListSessions, got: %d", len(rootList))
+	}
+
+	// 6. Verify ListAllSessions includes both
+	allList, err := store.ListAllSessions(ctx, "/test/workspace", 10)
+	if err != nil {
+		t.Fatalf("ListAllSessions failed: %v", err)
+	}
+	if len(allList) != 2 {
+		t.Errorf("expected 2 sessions in ListAllSessions, got: %d", len(allList))
+	}
+
+	// 7. Test cascading delete of child sessions via SQLite trigger
+	// Delete parent session directly
+	_, err = store.writerDB.ExecContext(ctx, "DELETE FROM sessions WHERE id = ?;", parentSess.ID)
+	if err != nil {
+		t.Fatalf("failed to delete parent session: %v", err)
+	}
+
+	// Verify parent is deleted
+	if _, err := store.GetSession(ctx, parentSess.ID); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("expected parent session not found, got %v", err)
+	}
+
+	// Verify child session was cascade-deleted by trigger trg_cascade_delete_sessions
+	if _, err := store.GetSession(ctx, childSess.ID); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("expected child session to be cascade-deleted, got %v", err)
+	}
+
+	// Verify child turns were cascade-deleted via turns foreign key
+	childTurns, err := store.GetAllTurns(ctx, childSess.ID)
+	if err != nil {
+		t.Fatalf("GetAllTurns failed: %v", err)
+	}
+	if len(childTurns) != 0 {
+		t.Errorf("expected 0 child turns after cascade delete, got %d", len(childTurns))
+	}
+}
+
+func TestIncrementSessionTokens(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	sess := &SessionRecord{
+		ID:         "sess_increment_tokens",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Status:     StatusRunning,
+		Task:       "Token increment test",
+		Model:      "gpt-4o",
+		WorkingDir: "/test/workspace",
+		TokenUsage: TokenUsage{
+			PromptTokens:     100,
+			CompletionTokens: 50,
+			TotalTokens:      150,
+		},
+	}
+	if err := store.CreateSession(ctx, sess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	// Increment tokens
+	delta := TokenUsage{
+		PromptTokens:     200,
+		CompletionTokens: 100,
+		ReasoningTokens:  20,
+		TotalTokens:      320,
+	}
+	if err := store.IncrementSessionTokens(ctx, sess.ID, delta); err != nil {
+		t.Fatalf("IncrementSessionTokens failed: %v", err)
+	}
+
+	loaded, err := store.GetSession(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+
+	if loaded.TokenUsage.PromptTokens != 300 {
+		t.Errorf("expected PromptTokens 300, got %d", loaded.TokenUsage.PromptTokens)
+	}
+	if loaded.TokenUsage.CompletionTokens != 150 {
+		t.Errorf("expected CompletionTokens 150, got %d", loaded.TokenUsage.CompletionTokens)
+	}
+	if loaded.TokenUsage.ReasoningTokens != 20 {
+		t.Errorf("expected ReasoningTokens 20, got %d", loaded.TokenUsage.ReasoningTokens)
+	}
+	if loaded.TokenUsage.TotalTokens != 470 {
+		t.Errorf("expected TotalTokens 470, got %d", loaded.TokenUsage.TotalTokens)
 	}
 }

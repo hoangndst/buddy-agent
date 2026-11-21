@@ -103,6 +103,20 @@ func (r *Registry) Tools() []Tool {
 	return res
 }
 
+// CloneWithFilter returns a new Registry containing tools that satisfy the predicate.
+func (r *Registry) CloneWithFilter(predicate func(Tool) bool) *Registry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	clone := NewRegistry(r.maxOutputChars)
+	for _, t := range r.tools {
+		if predicate == nil || predicate(t) {
+			clone.Register(t)
+		}
+	}
+	return clone
+}
+
 // OpenAITools converts registered tools into the official OpenAI Tool format,
 // strictly sorted alphabetically by tool name to preserve LLM provider KV prompt caches.
 func (r *Registry) OpenAITools() []openai.ChatCompletionToolParam {

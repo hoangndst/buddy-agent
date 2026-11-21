@@ -336,3 +336,88 @@ func TestBashTool_ExecutionAndOptions(t *testing.T) {
 	}
 }
 
+func TestListDirectoryAndSearchFiles(t *testing.T) {
+	tempDir := t.TempDir()
+	ctx := context.Background()
+
+	// Setup directory structure
+	subDir := filepath.Join(tempDir, "pkg", "sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("failed to create dirs: %v", err)
+	}
+
+	file1 := filepath.Join(tempDir, "main.go")
+	if err := os.WriteFile(file1, []byte("package main\n\nfunc main() {\n\tprintln(\"hello world\")\n}\n"), 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	file2 := filepath.Join(subDir, "helper.go")
+	if err := os.WriteFile(file2, []byte("package sub\n\n// HelperFunction returns greeting\nfunc HelperFunction() string {\n\treturn \"hello from helper\"\n}\n"), 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	// 1. Test ListDirectoryTool
+	listTool := NewListDirectoryTool(tempDir)
+	res, err := listTool.Execute(ctx, json.RawMessage(`{"path": "."}`))
+	if err != nil {
+		t.Fatalf("failed to list directory: %v", err)
+	}
+	if !strings.Contains(res, "[FILE] main.go") || !strings.Contains(res, "[DIR]  pkg/") {
+		t.Errorf("unexpected list directory output:\n%s", res)
+	}
+
+	// 2. Test SearchFilesTool
+	searchTool := NewSearchFilesTool(tempDir)
+	searchRes, err := searchTool.Execute(ctx, json.RawMessage(`{"query": "hello"}`))
+	if err != nil {
+		t.Fatalf("search files failed: %v", err)
+	}
+	if !strings.Contains(searchRes, "main.go:4: println(\"hello world\")") {
+		t.Errorf("expected search output to find main.go match, got:\n%s", searchRes)
+	}
+	if !strings.Contains(searchRes, "helper.go:5: return \"hello from helper\"") {
+		t.Errorf("expected search output to find helper.go match, got:\n%s", searchRes)
+	}
+
+	// Test SearchFilesTool on explicit dot-directory (e.g. .github)
+	dotDir := filepath.Join(tempDir, ".github", "workflows")
+	if err := os.MkdirAll(dotDir, 0755); err != nil {
+		t.Fatalf("failed to create dot dir: %v", err)
+	}
+	ciFile := filepath.Join(dotDir, "ci.yml")
+	if err := os.WriteFile(ciFile, []byte("name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n"), 0644); err != nil {
+		t.Fatalf("failed to write ci file: %v", err)
+	}
+	dotSearchRes, err := searchTool.Execute(ctx, json.RawMessage(`{"query": "ubuntu-latest", "path": ".github"}`))
+	if err != nil {
+		t.Fatalf("search in dot dir failed: %v", err)
+	}
+	if !strings.Contains(dotSearchRes, "ci.yml:5: runs-on: ubuntu-latest") {
+		t.Errorf("expected search in .github to find ci.yml match, got:\n%s", dotSearchRes)
+	}
+
+	// Test SearchFilesTool on file with line > 64KiB (exceeds default bufio.Scanner buffer)
+	longLineFile := filepath.Join(tempDir, "minified.json")
+	longContent := `{"data":"` + strings.Repeat("a", 100*1024) + `","targetKey":"targetValue"}` + "\n"
+	if err := os.WriteFile(longLineFile, []byte(longContent), 0644); err != nil {
+		t.Fatalf("failed to write long line file: %v", err)
+	}
+	longSearchRes, err := searchTool.Execute(ctx, json.RawMessage(`{"query": "targetKey"}`))
+	if err != nil {
+		t.Fatalf("search in long line file failed: %v", err)
+	}
+	if !strings.Contains(longSearchRes, "minified.json:1:") || !strings.Contains(longSearchRes, "targetKey") {
+		t.Errorf("expected search to find match in >64KB line, got:\n%s", longSearchRes)
+	}
+
+	// 3. Test ReadFileTool on directory returns helpful guidance
+	readTool := NewReadFileTool(tempDir)
+	readDirRes, err := readTool.Execute(ctx, json.RawMessage(`{"path": "pkg"}`))
+	if err != nil {
+		t.Fatalf("expected graceful directory response, got error: %v", err)
+	}
+	if !strings.Contains(readDirRes, "is a directory. Use list_directory") {
+		t.Errorf("expected guidance to use list_directory, got: %s", readDirRes)
+	}
+}
+

@@ -21,6 +21,7 @@ secrets/
 
 # Agent local state & memory
 .buddy/
+.agents/
 data/
 *.db
 *.db-journal

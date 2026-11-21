@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 // ReadFileTool reads files with line-range pagination.
@@ -70,6 +71,14 @@ func (r *ReadFileTool) Execute(_ context.Context, raw json.RawMessage) (string, 
 	targetPath, err := resolvePath(r.workspace, input.Path)
 	if err != nil {
 		return "", err
+	}
+
+	info, err := os.Stat(targetPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Sprintf("Path %q is a directory. Use list_directory to inspect its contents.", input.Path), nil
 	}
 
 	file, err := os.Open(targetPath)
@@ -270,6 +279,256 @@ func (e *EditFileTool) Execute(_ context.Context, raw json.RawMessage) (string, 
 	}
 
 	return fmt.Sprintf("Successfully replaced target block in %s", input.Path), nil
+}
+
+// ListDirectoryTool lists entries in a workspace directory.
+type ListDirectoryTool struct {
+	workspace string
+}
+
+// NewListDirectoryTool creates a new ListDirectoryTool bound to workspace.
+func NewListDirectoryTool(workspace string) *ListDirectoryTool {
+	return &ListDirectoryTool{workspace: workspace}
+}
+
+// Name returns the identifier of the tool.
+func (l *ListDirectoryTool) Name() string {
+	return "list_directory"
+}
+
+// Description returns an explanation of the tool.
+func (l *ListDirectoryTool) Description() string {
+	return "List files and subdirectories within a directory in the workspace."
+}
+
+// Parameters returns the JSON schema definition for tool arguments.
+func (l *ListDirectoryTool) Parameters() any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Path to the directory, relative to workspace. Defaults to '.' (workspace root).",
+				"default":     ".",
+			},
+		},
+	}
+}
+
+type listDirInput struct {
+	Path string `json:"path"`
+}
+
+// Execute returns a formatted listing of the directory contents.
+func (l *ListDirectoryTool) Execute(_ context.Context, raw json.RawMessage) (string, error) {
+	var input listDirInput
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &input)
+	}
+	if input.Path == "" {
+		input.Path = "."
+	}
+
+	targetPath, err := resolvePath(l.workspace, input.Path)
+	if err != nil {
+		return "", err
+	}
+
+	entries, err := os.ReadDir(targetPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read directory: %w", err)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Directory %s (%d entries):\n", input.Path, len(entries)))
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if entry.IsDir() {
+			sb.WriteString(fmt.Sprintf("  [DIR]  %s/\n", entry.Name()))
+		} else {
+			sb.WriteString(fmt.Sprintf("  [FILE] %s (%d bytes)\n", entry.Name(), info.Size()))
+		}
+	}
+	return sb.String(), nil
+}
+
+// SearchFilesTool performs substring or keyword search across files in the workspace.
+type SearchFilesTool struct {
+	workspace string
+}
+
+// NewSearchFilesTool creates a new SearchFilesTool bound to workspace.
+func NewSearchFilesTool(workspace string) *SearchFilesTool {
+	return &SearchFilesTool{workspace: workspace}
+}
+
+// Name returns the identifier of the tool.
+func (s *SearchFilesTool) Name() string {
+	return "search_files"
+}
+
+// Description returns an explanation of the tool.
+func (s *SearchFilesTool) Description() string {
+	return "Search for a text pattern or keyword across files in the workspace."
+}
+
+// Parameters returns the JSON schema definition for tool arguments.
+func (s *SearchFilesTool) Parameters() any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query": map[string]any{
+				"type":        "string",
+				"description": "The text pattern or keyword to search for.",
+			},
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Subdirectory to restrict search within. Defaults to '.' (entire workspace).",
+				"default":     ".",
+			},
+			"max_results": map[string]any{
+				"type":        "integer",
+				"description": "Maximum number of matching lines to return. Defaults to 50.",
+				"default":     50,
+			},
+		},
+		"required": []string{"query"},
+	}
+}
+
+type searchFilesInput struct {
+	Query      string `json:"query"`
+	Path       string `json:"path"`
+	MaxResults int    `json:"max_results"`
+}
+
+// Execute scans files for the target query string.
+func (s *SearchFilesTool) Execute(_ context.Context, raw json.RawMessage) (string, error) {
+	var input searchFilesInput
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+	if strings.TrimSpace(input.Query) == "" {
+		return "", errors.New("search query cannot be empty")
+	}
+	if input.Path == "" {
+		input.Path = "."
+	}
+	maxResults := input.MaxResults
+	if maxResults <= 0 || maxResults > 200 {
+		maxResults = 50
+	}
+
+	startPath, err := resolvePath(s.workspace, input.Path)
+	if err != nil {
+		return "", err
+	}
+
+	absWorkspace, _ := filepath.Abs(s.workspace)
+	cleanStart := filepath.Clean(startPath)
+	var sb strings.Builder
+	count := 0
+
+	walkErr := filepath.Walk(startPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || count >= maxResults {
+			return nil
+		}
+		if info.IsDir() {
+			if filepath.Clean(path) != cleanStart {
+				name := info.Name()
+				if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == "bin" {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		// Skip binary files or large files > 2MB
+		if info.Size() > 2*1024*1024 || info.Size() == 0 {
+			return nil
+		}
+
+		relPath, _ := filepath.Rel(absWorkspace, path)
+		f, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer func() { _ = f.Close() }()
+
+		reader := bufio.NewReader(f)
+		lineNum := 0
+		for {
+			line, readErr := reader.ReadString('\n')
+			if len(line) > 0 {
+				lineNum++
+				if strings.Contains(line, input.Query) {
+					snippet := extractSnippet(line, input.Query, 300)
+					sb.WriteString(fmt.Sprintf("%s:%d: %s\n", relPath, lineNum, snippet))
+					count++
+					if count >= maxResults {
+						return nil
+					}
+				}
+			}
+			if readErr != nil {
+				if errors.Is(readErr, io.EOF) {
+					break
+				}
+				return fmt.Errorf("reading %s: %w", relPath, readErr)
+			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return "", fmt.Errorf("search failed: %w", walkErr)
+	}
+
+	if count == 0 {
+		return fmt.Sprintf("No matches found for %q in %s", input.Query, input.Path), nil
+	}
+	return sb.String(), nil
+}
+
+// extractSnippet extracts a contextual snippet around query from a line, preserving UTF-8 integrity.
+func extractSnippet(line, query string, maxContext int) string {
+	idx := strings.Index(line, query)
+	if idx < 0 {
+		return ""
+	}
+	if len(line) <= maxContext {
+		return strings.TrimSpace(line)
+	}
+
+	start := idx - maxContext/2
+	if start < 0 {
+		start = 0
+	} else {
+		for start < len(line) && !utf8.RuneStart(line[start]) {
+			start++
+		}
+	}
+
+	end := idx + len(query) + maxContext/2
+	if end >= len(line) {
+		end = len(line)
+	} else {
+		for end < len(line) && !utf8.RuneStart(line[end]) {
+			end++
+		}
+	}
+
+	snippet := strings.TrimSpace(line[start:end])
+	prefix := ""
+	if start > 0 {
+		prefix = "..."
+	}
+	suffix := ""
+	if end < len(line) {
+		suffix = "..."
+	}
+	return prefix + snippet + suffix
 }
 
 // resolvePath canonicalizes target path and ensures it stays strictly within the workspace.

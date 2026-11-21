@@ -85,11 +85,11 @@ func (st *StateTracker) AddInvariant(inv string) {
 	st.Invariants = append(st.Invariants, trimmed)
 }
 
-// HasDynamicUpdates returns true if any touched files or recent errors have been recorded.
+// HasDynamicUpdates returns true if any touched files, recent errors, or invariants have been recorded.
 func (st *StateTracker) HasDynamicUpdates() bool {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
-	return len(st.ModifiedFiles) > 0 || len(st.RecentErrors) > 0
+	return len(st.ModifiedFiles) > 0 || len(st.RecentErrors) > 0 || len(st.Invariants) > 0
 }
 
 // RenderEpisodicState produces a deterministic Markdown document representing

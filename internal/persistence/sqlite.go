@@ -209,6 +209,42 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 		}
 	}
 
+	if currentVersion < 2 {
+		migration002 := `
+		ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;
+		ALTER TABLE sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'root';
+		ALTER TABLE sessions ADD COLUMN depth INTEGER NOT NULL DEFAULT 0;
+
+		CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+		CREATE INDEX IF NOT EXISTS idx_sessions_depth ON sessions(depth);
+
+		CREATE TRIGGER IF NOT EXISTS trg_cascade_delete_sessions
+		AFTER DELETE ON sessions
+		FOR EACH ROW
+		BEGIN
+			DELETE FROM sessions WHERE parent_session_id = OLD.id;
+		END;
+		`
+
+		tx, err := s.writerDB.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin migration 002 transaction: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		if _, err := tx.ExecContext(ctx, migration002); err != nil {
+			return fmt.Errorf("failed to execute migration 002 statements: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit migration 002: %w", err)
+		}
+
+		if _, err := s.writerDB.ExecContext(ctx, "PRAGMA user_version = 2;"); err != nil {
+			return fmt.Errorf("failed to bump PRAGMA user_version to 2: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -250,8 +286,9 @@ func (s *SQLiteStore) CreateSession(ctx context.Context, session *SessionRecord)
 	query := `
 	INSERT INTO sessions (
 		id, created_at, updated_at, status, task, model, working_dir,
-		max_steps, total_steps, prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, error_message
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+		max_steps, total_steps, prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, error_message,
+		parent_session_id, role, depth
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 
 	errMsg := ""
@@ -260,6 +297,15 @@ func (s *SQLiteStore) CreateSession(ctx context.Context, session *SessionRecord)
 	}
 	redactedTask := RedactSecrets(session.Task)
 	session.Task = redactedTask
+
+	role := session.Role
+	if role == "" {
+		role = "root"
+	}
+	var parentID sql.NullString
+	if session.ParentSessionID != nil && *session.ParentSessionID != "" {
+		parentID = sql.NullString{String: *session.ParentSessionID, Valid: true}
+	}
 
 	_, err := s.writerDB.ExecContext(
 		ctx,
@@ -278,6 +324,9 @@ func (s *SQLiteStore) CreateSession(ctx context.Context, session *SessionRecord)
 		session.TokenUsage.ReasoningTokens,
 		session.TokenUsage.TotalTokens,
 		sql.NullString{String: errMsg, Valid: session.ErrorMessage != nil},
+		parentID,
+		role,
+		session.Depth,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create session %s: %w", session.ID, err)
@@ -294,7 +343,8 @@ func (s *SQLiteStore) GetSession(ctx context.Context, idOrPrefix string) (*Sessi
 
 	query := `
 	SELECT id, created_at, updated_at, status, task, model, working_dir, max_steps, total_steps,
-	       prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, error_message
+	       prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, error_message,
+	       parent_session_id, role, depth
 	FROM sessions
 	WHERE id LIKE ? || '%'
 	ORDER BY updated_at DESC;
@@ -340,13 +390,14 @@ func (s *SQLiteStore) GetSession(ctx context.Context, idOrPrefix string) (*Sessi
 	return sessions[0], nil
 }
 
-// GetLatestResumableSession fetches the most recent interrupted, failed, or running session in workingDir.
+// GetLatestResumableSession fetches the most recent interrupted, failed, or running root session in workingDir.
 func (s *SQLiteStore) GetLatestResumableSession(ctx context.Context, workingDir string) (*SessionRecord, error) {
 	query := `
 	SELECT id, created_at, updated_at, status, task, model, working_dir, max_steps, total_steps,
-	       prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, error_message
+	       prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, error_message,
+	       parent_session_id, role, depth
 	FROM sessions
-	WHERE working_dir = ? AND status IN ('interrupted', 'failed', 'running')
+	WHERE working_dir = ? AND depth = 0 AND status IN ('interrupted', 'failed', 'running')
 	ORDER BY updated_at DESC
 	LIMIT 1;
 	`
@@ -362,7 +413,7 @@ func (s *SQLiteStore) GetLatestResumableSession(ctx context.Context, workingDir 
 	return sess, nil
 }
 
-// ListSessions returns recent sessions in the specified working directory ordered by updated_at DESC.
+// ListSessions returns recent root sessions (depth = 0) in the specified working directory ordered by updated_at DESC.
 func (s *SQLiteStore) ListSessions(ctx context.Context, workingDir string, limit int) ([]*SessionRecord, error) {
 	if limit <= 0 {
 		limit = 20
@@ -370,9 +421,10 @@ func (s *SQLiteStore) ListSessions(ctx context.Context, workingDir string, limit
 
 	query := `
 	SELECT id, created_at, updated_at, status, task, model, working_dir, max_steps, total_steps,
-	       prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, error_message
+	       prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, error_message,
+	       parent_session_id, role, depth
 	FROM sessions
-	WHERE working_dir = ?
+	WHERE working_dir = ? AND depth = 0
 	ORDER BY updated_at DESC
 	LIMIT ?;
 	`
@@ -392,6 +444,98 @@ func (s *SQLiteStore) ListSessions(ctx context.Context, workingDir string, limit
 		sessions = append(sessions, sess)
 	}
 	return sessions, rows.Err()
+}
+
+// ListAllSessions returns all recent sessions (including child subagents) in the specified working directory.
+func (s *SQLiteStore) ListAllSessions(ctx context.Context, workingDir string, limit int) ([]*SessionRecord, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
+	query := `
+	SELECT id, created_at, updated_at, status, task, model, working_dir, max_steps, total_steps,
+	       prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, error_message,
+	       parent_session_id, role, depth
+	FROM sessions
+	WHERE working_dir = ?
+	ORDER BY updated_at DESC
+	LIMIT ?;
+	`
+
+	rows, err := s.readerDB.QueryContext(ctx, query, workingDir, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list all sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var sessions []*SessionRecord
+	for rows.Next() {
+		sess, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, sess)
+	}
+	return sessions, rows.Err()
+}
+
+// GetChildSessions returns all child sessions belonging to the specified parent session ID ordered by created_at ASC.
+func (s *SQLiteStore) GetChildSessions(ctx context.Context, parentID string) ([]*SessionRecord, error) {
+	query := `
+	SELECT id, created_at, updated_at, status, task, model, working_dir, max_steps, total_steps,
+	       prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, error_message,
+	       parent_session_id, role, depth
+	FROM sessions
+	WHERE parent_session_id = ?
+	ORDER BY created_at ASC;
+	`
+
+	rows, err := s.readerDB.QueryContext(ctx, query, parentID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query child sessions for parent %q: %w", parentID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var sessions []*SessionRecord
+	for rows.Next() {
+		sess, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, sess)
+	}
+	return sessions, rows.Err()
+}
+
+// IncrementSessionTokens adds token usage metrics into an existing session record.
+func (s *SQLiteStore) IncrementSessionTokens(ctx context.Context, sessionID string, usage TokenUsage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+	UPDATE sessions SET
+		prompt_tokens = prompt_tokens + ?,
+		completion_tokens = completion_tokens + ?,
+		reasoning_tokens = reasoning_tokens + ?,
+		total_tokens = total_tokens + ?,
+		updated_at = ?
+	WHERE id = ?;
+	`
+
+	_, err := s.writerDB.ExecContext(
+		ctx,
+		query,
+		usage.PromptTokens,
+		usage.CompletionTokens,
+		usage.ReasoningTokens,
+		usage.TotalTokens,
+		time.Now().UTC(),
+		sessionID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to increment session tokens for %s: %w", sessionID, err)
+	}
+	return nil
 }
 
 // UpdateSessionStatus updates session lifecycle status, completed step count, usage, and error.
@@ -655,9 +799,10 @@ func (s *SQLiteStore) GetLatestSnapshot(ctx context.Context, sessionID string) (
 
 func scanSession(scanner interface{ Scan(...interface{}) error }) (*SessionRecord, error) {
 	var (
-		sess   SessionRecord
-		status string
-		errMsg sql.NullString
+		sess            SessionRecord
+		status          string
+		errMsg          sql.NullString
+		parentSessionID sql.NullString
 	)
 
 	err := scanner.Scan(
@@ -675,6 +820,9 @@ func scanSession(scanner interface{ Scan(...interface{}) error }) (*SessionRecor
 		&sess.TokenUsage.ReasoningTokens,
 		&sess.TokenUsage.TotalTokens,
 		&errMsg,
+		&parentSessionID,
+		&sess.Role,
+		&sess.Depth,
 	)
 	if err != nil {
 		return nil, err
@@ -683,6 +831,9 @@ func scanSession(scanner interface{ Scan(...interface{}) error }) (*SessionRecor
 	sess.Status = SessionStatus(status)
 	if errMsg.Valid {
 		sess.ErrorMessage = &errMsg.String
+	}
+	if parentSessionID.Valid && parentSessionID.String != "" {
+		sess.ParentSessionID = &parentSessionID.String
 	}
 	return &sess, nil
 }

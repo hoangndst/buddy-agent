@@ -131,6 +131,8 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 
 	reg.Register(tools.NewBashTool(cfg.WorkspaceDir, 60*time.Second, tools.WithMaxOutputBytes(cfg.MaxOutputChars)))
 	reg.Register(tools.NewReadFileTool(cfg.WorkspaceDir))
+	reg.Register(tools.NewListDirectoryTool(cfg.WorkspaceDir))
+	reg.Register(tools.NewSearchFilesTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewWriteFileTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewEditFileTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewSaveMemoryTool(memMgr))
@@ -213,6 +215,21 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 			storeCleanup()
 		}
 	}
+
+	// Register InvokeSubagentTool on the root engine (depth = 0)
+	subTool := agent.NewInvokeSubagentTool(agent.SubagentToolConfig{
+		Depth:            0,
+		ParentRegistry:   reg,
+		Provider:         prov,
+		Model:            cfg.Model,
+		WorkspaceDir:     cfg.WorkspaceDir,
+		ReasoningEffort:  cfg.ReasoningEffort,
+		Store:            store,
+		EventHandler:     eventHandler,
+		IsLocal:          cfg.IsLocal,
+		MaxContextTokens: cfg.MaxContextTokens,
+	})
+	reg.Register(subTool)
 
 	engine := agent.NewEngine(
 		prov,
