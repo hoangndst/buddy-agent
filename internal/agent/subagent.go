@@ -361,10 +361,10 @@ func (t *InvokeSubagentTool) buildChildRegistry(role string) *tools.Registry {
 		}
 
 		// Researcher role is strictly read-only:
-		// - Native tools: only read_file is allowed (no bash, write_file, edit_file)
+		// - Native tools: read_file, list_directory, search_files are allowed (no bash, write_file, edit_file)
 		// - MCP tools: only verified read-only inspection tools are allowed; mutating or unknown MCP tools are blocked
 		if role == "researcher" {
-			if name == "read_file" {
+			if name == "read_file" || name == "list_directory" || name == "search_files" {
 				return true
 			}
 			if strings.HasPrefix(name, "mcp_") {

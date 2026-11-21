@@ -131,6 +131,8 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 
 	reg.Register(tools.NewBashTool(cfg.WorkspaceDir, 60*time.Second, tools.WithMaxOutputBytes(cfg.MaxOutputChars)))
 	reg.Register(tools.NewReadFileTool(cfg.WorkspaceDir))
+	reg.Register(tools.NewListDirectoryTool(cfg.WorkspaceDir))
+	reg.Register(tools.NewSearchFilesTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewWriteFileTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewEditFileTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewSaveMemoryTool(memMgr))

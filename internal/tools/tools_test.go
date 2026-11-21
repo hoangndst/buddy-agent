@@ -336,3 +336,57 @@ func TestBashTool_ExecutionAndOptions(t *testing.T) {
 	}
 }
 
+func TestListDirectoryAndSearchFiles(t *testing.T) {
+	tempDir := t.TempDir()
+	ctx := context.Background()
+
+	// Setup directory structure
+	subDir := filepath.Join(tempDir, "pkg", "sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("failed to create dirs: %v", err)
+	}
+
+	file1 := filepath.Join(tempDir, "main.go")
+	if err := os.WriteFile(file1, []byte("package main\n\nfunc main() {\n\tprintln(\"hello world\")\n}\n"), 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	file2 := filepath.Join(subDir, "helper.go")
+	if err := os.WriteFile(file2, []byte("package sub\n\n// HelperFunction returns greeting\nfunc HelperFunction() string {\n\treturn \"hello from helper\"\n}\n"), 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	// 1. Test ListDirectoryTool
+	listTool := NewListDirectoryTool(tempDir)
+	res, err := listTool.Execute(ctx, json.RawMessage(`{"path": "."}`))
+	if err != nil {
+		t.Fatalf("failed to list directory: %v", err)
+	}
+	if !strings.Contains(res, "[FILE] main.go") || !strings.Contains(res, "[DIR]  pkg/") {
+		t.Errorf("unexpected list directory output:\n%s", res)
+	}
+
+	// 2. Test SearchFilesTool
+	searchTool := NewSearchFilesTool(tempDir)
+	searchRes, err := searchTool.Execute(ctx, json.RawMessage(`{"query": "hello"}`))
+	if err != nil {
+		t.Fatalf("search files failed: %v", err)
+	}
+	if !strings.Contains(searchRes, "main.go:4: println(\"hello world\")") {
+		t.Errorf("expected search output to find main.go match, got:\n%s", searchRes)
+	}
+	if !strings.Contains(searchRes, "helper.go:5: return \"hello from helper\"") {
+		t.Errorf("expected search output to find helper.go match, got:\n%s", searchRes)
+	}
+
+	// 3. Test ReadFileTool on directory returns helpful guidance
+	readTool := NewReadFileTool(tempDir)
+	readDirRes, err := readTool.Execute(ctx, json.RawMessage(`{"path": "pkg"}`))
+	if err != nil {
+		t.Fatalf("expected graceful directory response, got error: %v", err)
+	}
+	if !strings.Contains(readDirRes, "is a directory. Use list_directory") {
+		t.Errorf("expected guidance to use list_directory, got: %s", readDirRes)
+	}
+}
+

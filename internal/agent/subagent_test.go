@@ -29,6 +29,8 @@ func (d *dummyTestTool) Execute(_ context.Context, _ json.RawMessage) (string, e
 func TestSubagentTool_RoleGating(t *testing.T) {
 	reg := tools.NewRegistry(1000)
 	reg.Register(&dummyTestTool{name: "read_file"})
+	reg.Register(&dummyTestTool{name: "list_directory"})
+	reg.Register(&dummyTestTool{name: "search_files"})
 	reg.Register(&dummyTestTool{name: "write_file"})
 	reg.Register(&dummyTestTool{name: "edit_file"})
 	reg.Register(&dummyTestTool{name: "bash"})
@@ -51,6 +53,12 @@ func TestSubagentTool_RoleGating(t *testing.T) {
 	if _, ok := resReg.Get("read_file"); !ok {
 		t.Errorf("expected researcher to have read_file")
 	}
+	if _, ok := resReg.Get("list_directory"); !ok {
+		t.Errorf("expected researcher to have list_directory")
+	}
+	if _, ok := resReg.Get("search_files"); !ok {
+		t.Errorf("expected researcher to have search_files")
+	}
 	if _, ok := resReg.Get("mcp_list_files"); !ok {
 		t.Errorf("expected researcher to have mcp_list_files")
 	}
@@ -65,7 +73,7 @@ func TestSubagentTool_RoleGating(t *testing.T) {
 
 	// 2. Test worker registry
 	workerReg := subTool.buildChildRegistry("worker")
-	for _, allowed := range []string{"read_file", "write_file", "edit_file", "bash", "mcp_list_files", "mcp_create_issue", "mcp_write_data", "mcp_unknown_action"} {
+	for _, allowed := range []string{"read_file", "list_directory", "search_files", "write_file", "edit_file", "bash", "mcp_list_files", "mcp_create_issue", "mcp_write_data", "mcp_unknown_action"} {
 		if _, ok := workerReg.Get(allowed); !ok {
 			t.Errorf("worker expected to have %q", allowed)
 		}
