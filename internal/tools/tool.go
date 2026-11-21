@@ -84,6 +84,25 @@ func (r *Registry) Get(name string) (Tool, bool) {
 	return t, ok
 }
 
+// Tools returns all registered tools, strictly sorted alphabetically by name
+// to preserve LLM prompt cache stability.
+func (r *Registry) Tools() []Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	res := make([]Tool, 0, len(names))
+	for _, name := range names {
+		res = append(res, r.tools[name])
+	}
+	return res
+}
+
 // OpenAITools converts registered tools into the official OpenAI Tool format,
 // strictly sorted alphabetically by tool name to preserve LLM provider KV prompt caches.
 func (r *Registry) OpenAITools() []openai.ChatCompletionToolParam {

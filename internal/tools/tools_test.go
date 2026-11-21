@@ -109,6 +109,25 @@ func TestDeterministicToolOrderingAndSerialization(t *testing.T) {
 	}
 }
 
+func TestRegistry_Tools(t *testing.T) {
+	reg := NewRegistry(1000)
+	reg.Register(&dummyTool{name: "zebra", description: "zebra tool"})
+	reg.Register(&dummyTool{name: "alpha", description: "alpha tool"})
+	reg.Register(&dummyTool{name: "beta", description: "beta tool"})
+
+	toolsList := reg.Tools()
+	if len(toolsList) != 3 {
+		t.Fatalf("expected 3 tools, got %d", len(toolsList))
+	}
+
+	if toolsList[0].Name() != "alpha" ||
+		toolsList[1].Name() != "beta" ||
+		toolsList[2].Name() != "zebra" {
+		t.Errorf("tools are not sorted alphabetically: %s, %s, %s",
+			toolsList[0].Name(), toolsList[1].Name(), toolsList[2].Name())
+	}
+}
+
 func TestCanonicalizeParameters(t *testing.T) {
 	// 1. Nil parameter
 	nilParams := CanonicalizeParameters(nil)

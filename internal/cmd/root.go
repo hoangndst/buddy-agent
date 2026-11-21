@@ -4,12 +4,14 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hoangndst/buddy-agent/internal/agent"
+	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/cmd/doc"
 	mcpcmd "github.com/hoangndst/buddy-agent/internal/cmd/mcp"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
@@ -22,7 +24,6 @@ import (
 )
 
 var (
-	stepStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
 	thoughtStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("246")).Italic(true)
 	toolStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
 	resultStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
@@ -38,6 +39,7 @@ func NewRootCmd(f *cmdutil.Factory) *cobra.Command {
 		Long: `buddy-agent executes autonomous software engineering tasks via ReAct loops,
 three-partition context memory compaction, and Model Context Protocol (MCP) integrations.`,
 		SilenceUsage: true,
+		Args:         cobra.ArbitraryArgs,
 		RunE: func(c *cobra.Command, args []string) error {
 			if len(args) > 0 {
 				return runTask(c.Context(), f, args)
@@ -50,6 +52,46 @@ three-partition context memory compaction, and Model Context Protocol (MCP) inte
 	rootCmd.AddCommand(doc.NewCmdDoc(f))
 
 	return rootCmd
+}
+
+// formatToolPreview produces clean, human-readable tool invocation previews.
+func formatToolPreview(name, rawArgs string) string {
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(rawArgs), &args); err == nil {
+		switch name {
+		case "bash":
+			if cmd, ok := args["command"].(string); ok && cmd != "" {
+				return fmt.Sprintf("⚙ bash: %s", cmd)
+			}
+		case "read_file":
+			if p, ok := args["path"].(string); ok && p != "" {
+				return fmt.Sprintf("⚙ read_file: %s", p)
+			}
+		case "write_file":
+			if p, ok := args["path"].(string); ok && p != "" {
+				return fmt.Sprintf("⚙ write_file: %s", p)
+			}
+		case "edit_file":
+			if p, ok := args["path"].(string); ok && p != "" {
+				return fmt.Sprintf("⚙ edit_file: %s", p)
+			}
+		case "save_memory":
+			if topic, ok := args["topic"].(string); ok && topic != "" {
+				return fmt.Sprintf("⚙ save_memory: %s", topic)
+			}
+		case "create_skill":
+			if n, ok := args["name"].(string); ok && n != "" {
+				return fmt.Sprintf("⚙ create_skill: %s", n)
+			}
+		default:
+			for _, key := range []string{"path", "query", "command", "url", "name", "id", "prompt"} {
+				if val, ok := args[key].(string); ok && val != "" {
+					return fmt.Sprintf("⚙ %s: %s", name, val)
+				}
+			}
+		}
+	}
+	return fmt.Sprintf("⚙ %s(%s)", name, rawArgs)
 }
 
 func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func(), error) {
@@ -67,7 +109,17 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
 	}
 	client := openai.NewClient(opts...)
-	clientAdapter := agent.NewClientAdapter(&client)
+
+	var prov provider.ModelProvider
+	if f.NewModelProvider != nil {
+		prov = f.NewModelProvider(cfg, &client)
+	} else {
+		prov = provider.NewAutoProvider(
+			provider.NewChatCompletionsProvider(&client),
+			provider.NewResponsesProvider(&client),
+			cfg.IsLocal,
+		)
+	}
 
 	// Initialize Memory & Native Tools
 	memMgr := memory.NewManager(cfg.WorkspaceDir)
@@ -103,17 +155,28 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 	eventHandler := func(ev agent.Event) {
 		switch ev.Type {
 		case agent.EventStepStart:
-			_, _ = fmt.Fprintln(f.IOStreams.Out, stepStyle.Render(fmt.Sprintf("\n[Step %d]", ev.Step)))
-		case agent.EventThought:
-			_, _ = fmt.Fprintln(f.IOStreams.Out, thoughtStyle.Render(ev.Content))
+			// Unobtrusive: raw step banners eliminated for clean interactive REPL UX
+		case agent.EventReasoning:
+			styledReasoning := thoughtStyle.Render(fmt.Sprintf("💭 Thinking:\n   %s", strings.ReplaceAll(strings.TrimSpace(ev.Content), "\n", "\n   ")))
+			_, _ = fmt.Fprintln(f.IOStreams.Out, styledReasoning)
+		case agent.EventTextComplete:
+			_, _ = fmt.Fprintln(f.IOStreams.Out, ev.Content)
 		case agent.EventToolCall:
-			_, _ = fmt.Fprintln(f.IOStreams.Out, toolStyle.Render(fmt.Sprintf("⚙ %s(%s)", ev.ToolName, ev.ToolArgs)))
+			preview := formatToolPreview(ev.ToolName, ev.ToolArgs)
+			if ev.Step > 1 {
+				preview = fmt.Sprintf("⚙ [Step %d] %s", ev.Step, strings.TrimPrefix(preview, "⚙ "))
+			}
+			_, _ = fmt.Fprintln(f.IOStreams.Out, toolStyle.Render(preview))
 		case agent.EventToolResult:
 			trimmed := strings.TrimSpace(ev.ToolResult)
 			if len(trimmed) > 300 {
 				trimmed = trimmed[:300] + "..."
 			}
-			_, _ = fmt.Fprintln(f.IOStreams.Out, resultStyle.Render(fmt.Sprintf("→ %s", trimmed)))
+			if ev.ToolExitCode > 0 {
+				_, _ = fmt.Fprintln(f.IOStreams.Out, resultStyle.Render(fmt.Sprintf("→ (exit %d) %s", ev.ToolExitCode, trimmed)))
+			} else {
+				_, _ = fmt.Fprintln(f.IOStreams.Out, resultStyle.Render(fmt.Sprintf("→ %s", trimmed)))
+			}
 		case agent.EventFinished:
 			_, _ = fmt.Fprintln(f.IOStreams.Out, doneStyle.Render("\n✓ Done"))
 		case agent.EventCompactionStart:
@@ -130,7 +193,7 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 	}
 
 	engine := agent.NewEngine(
-		clientAdapter,
+		prov,
 		cfg.Model,
 		cfg.MaxSteps,
 		reg,
@@ -139,6 +202,7 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 		agent.WithMaxContextTokens(cfg.MaxContextTokens),
 		agent.WithWorkingTailSize(cfg.WorkingTailSize),
 		agent.WithIsLocal(cfg.IsLocal),
+		agent.WithReasoningEffort(cfg.ReasoningEffort),
 	)
 
 	return engine, cleanupFunc, nil
