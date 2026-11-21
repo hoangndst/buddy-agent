@@ -235,8 +235,10 @@ func (s *SQLiteStore) CreateSession(ctx context.Context, session *SessionRecord)
 
 	errMsg := ""
 	if session.ErrorMessage != nil {
-		errMsg = *session.ErrorMessage
+		errMsg = RedactSecrets(*session.ErrorMessage)
 	}
+	redactedTask := RedactSecrets(session.Task)
+	session.Task = redactedTask
 
 	_, err := s.writerDB.ExecContext(
 		ctx,
@@ -245,7 +247,7 @@ func (s *SQLiteStore) CreateSession(ctx context.Context, session *SessionRecord)
 		session.CreatedAt.UTC(),
 		session.UpdatedAt.UTC(),
 		string(session.Status),
-		session.Task,
+		redactedTask,
 		session.Model,
 		session.WorkingDir,
 		session.MaxSteps,
@@ -390,6 +392,11 @@ func (s *SQLiteStore) UpdateSessionStatus(
 	WHERE id = ?;
 	`
 
+	redactedErrMsg := ""
+	if errMsg != "" {
+		redactedErrMsg = RedactSecrets(errMsg)
+	}
+
 	_, err := s.writerDB.ExecContext(
 		ctx,
 		query,
@@ -399,7 +406,7 @@ func (s *SQLiteStore) UpdateSessionStatus(
 		usage.CompletionTokens,
 		usage.ReasoningTokens,
 		usage.TotalTokens,
-		sql.NullString{String: errMsg, Valid: errMsg != ""},
+		sql.NullString{String: redactedErrMsg, Valid: errMsg != ""},
 		time.Now().UTC(),
 		id,
 	)
@@ -571,13 +578,18 @@ func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snapshot *SnapshotRecord
 	) VALUES (?, ?, ?, ?, ?, ?);
 	`
 
+	redactedNarrative := RedactSecrets(snapshot.DistilledNarrative)
+	redactedTracker := RedactSecrets(snapshot.StateTrackerJSON)
+	snapshot.DistilledNarrative = redactedNarrative
+	snapshot.StateTrackerJSON = redactedTracker
+
 	res, err := s.writerDB.ExecContext(
 		ctx,
 		query,
 		snapshot.SessionID,
 		snapshot.StepNumber,
-		snapshot.DistilledNarrative,
-		snapshot.StateTrackerJSON,
+		redactedNarrative,
+		redactedTracker,
 		snapshot.CurrentTokens,
 		snapshot.CreatedAt.UTC(),
 	)

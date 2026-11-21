@@ -22,6 +22,8 @@ type Session struct {
 	blocks            []TurnBlock   // Partition 3 (and staged intermediate history)
 	config            SessionConfig
 	estimator         *UsageTracker
+	lastCompactedStep int
+	currentStep       int
 }
 
 // NewSession initializes a new history Session with production defaults.
@@ -114,6 +116,7 @@ func (s *Session) CommitSimpleAssistant(msg openai.ChatCompletionMessage) {
 	defer s.mu.Unlock()
 
 	block := NewAssistantSimpleBlock(msg)
+	block.StepNumber = s.currentStep
 	block.EstimatedTokens = EstimateBlock(&block)
 	s.blocks = append(s.blocks, block)
 	s.estimator.AddDelta(block.EstimatedTokens)
@@ -129,6 +132,7 @@ func (s *Session) CommitToolTurn(
 	defer s.mu.Unlock()
 
 	block := NewAssistantToolCallBlock(msg, results)
+	block.StepNumber = s.currentStep
 	block.EstimatedTokens = EstimateBlock(&block)
 	s.blocks = append(s.blocks, block)
 	s.estimator.AddDelta(block.EstimatedTokens)
@@ -301,6 +305,11 @@ func (s *Session) EnsureWatermarks(
 	if len(s.blocks) >= len(intermediateBlocks) {
 		s.blocks = s.blocks[len(intermediateBlocks):]
 	}
+	for _, ib := range intermediateBlocks {
+		if ib.StepNumber > s.lastCompactedStep {
+			s.lastCompactedStep = ib.StepNumber
+		}
+	}
 	s.estimator.ResetBaseline(s.recalculateTotalTokensLocked())
 
 	// Safe Halt Check: Verify irreducible context does not exceed hard ceiling
@@ -430,6 +439,11 @@ func (s *Session) ForceCompaction(ctx context.Context, client CompletionClient, 
 	if len(s.blocks) >= len(intermediateBlocks) {
 		s.blocks = s.blocks[len(intermediateBlocks):]
 	}
+	for _, ib := range intermediateBlocks {
+		if ib.StepNumber > s.lastCompactedStep {
+			s.lastCompactedStep = ib.StepNumber
+		}
+	}
 	s.estimator.ResetBaseline(s.recalculateTotalTokensLocked())
 
 	if s.estimator.CurrentTokens() > s.config.MaxContextTokens {
@@ -493,11 +507,12 @@ func RestoreSession(state RestoredState, opts ...Option) (*Session, error) {
 		tracker:           tracker,
 		config:            cfg,
 		blocks:            make([]TurnBlock, 0, len(state.TrailingTurns)+1),
+		lastCompactedStep: state.CompactedStep,
 	}
 
-	// Invariant: If no compaction has occurred (CompactedStep == 0), the root user task
-	// must be anchored as blocks[0] to preserve conversational role alternation and prompt fidelity.
-	if state.CompactedStep == 0 {
+	// Invariant: If no compaction has occurred (CompactedStep == 0 and empty narrative),
+	// the root user task must be anchored as blocks[0] to preserve conversational role alternation and prompt fidelity.
+	if state.CompactedStep == 0 && state.EpisodicNarrative == "" {
 		rootBlock := NewUserBlock(state.Task)
 		rootBlock.EstimatedTokens = EstimateBlock(&rootBlock)
 		s.blocks = append(s.blocks, rootBlock)
@@ -529,4 +544,18 @@ func (s *Session) EpisodicNarrative() string {
 // Tracker returns the active StateTracker.
 func (s *Session) Tracker() *StateTracker {
 	return s.tracker
+}
+
+// SetCurrentStep sets the active step index for subsequent turn block commits.
+func (s *Session) SetCurrentStep(step int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.currentStep = step
+}
+
+// LastCompactedStep returns the step index of the most recently compacted turn.
+func (s *Session) LastCompactedStep() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastCompactedStep
 }

@@ -17,8 +17,8 @@ var secretPatterns = []struct {
 	{regexp.MustCompile(`(?i)bearer\s+[a-zA-Z0-9_\-\.]{15,}`), "Bearer [REDACTED]"},
 	// GitHub personal access tokens
 	{regexp.MustCompile(`ghp_[a-zA-Z0-9]{20,}`), "ghp_[REDACTED]"},
-	// OpenAI API keys
-	{regexp.MustCompile(`sk-[a-zA-Z0-9]{32,}`), "sk-[REDACTED]"},
+	// OpenAI API keys (including project/service account prefixes)
+	{regexp.MustCompile(`sk-[a-zA-Z0-9_\-]{32,}`), "sk-[REDACTED]"},
 	// AWS Access Key IDs
 	{regexp.MustCompile(`AKIA[0-9A-Z]{16}`), "AKIA[REDACTED]"},
 	// Private Keys (RSA, OpenSSH, EC, etc.)

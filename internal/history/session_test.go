@@ -935,3 +935,51 @@ func TestRestoreSession_WithCompactedSnapshot(t *testing.T) {
 	}
 }
 
+func TestCompaction_LastCompactedStepTracking(t *testing.T) {
+	session := NewSession(
+		"You are Buddy.",
+		"Root task",
+		WithMaxContextTokens(500),
+		WithWorkingTailSize(2),
+		WithWatermarkRatios(0.30, 0.40),
+	)
+
+	// Add 4 turns with step numbers
+	for step := 1; step <= 4; step++ {
+		session.SetCurrentStep(step)
+		session.CommitSimpleAssistant(openai.ChatCompletionMessage{
+			Role:    "assistant",
+			Content: fmt.Sprintf("Turn content %d %s", step, strings.Repeat("detail ", 60)),
+		})
+	}
+
+	mockClient := &mockCompletionClient{
+		response: &openai.ChatCompletion{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    "assistant",
+						Content: "Summary of intermediate turns.",
+					},
+				},
+			},
+		},
+	}
+
+	// Trigger compaction
+	err := session.EnsureWatermarks(context.Background(), mockClient, "gpt-4o")
+	if err != nil {
+		t.Fatalf("EnsureWatermarks failed: %v", err)
+	}
+
+	// With working tail size 2, turns 3 and 4 should be retained.
+	// Evicted blocks: root task (step 0), turn 1 (step 1), turn 2 (step 2).
+	// Therefore, lastCompactedStep should be 2!
+	if session.LastCompactedStep() != 2 {
+		t.Fatalf("expected lastCompactedStep 2, got %d", session.LastCompactedStep())
+	}
+	if session.BlockCount() != 2 {
+		t.Fatalf("expected 2 blocks in working tail, got %d", session.BlockCount())
+	}
+}
+

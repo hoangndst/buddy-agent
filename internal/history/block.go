@@ -126,6 +126,7 @@ func (b *TurnBlock) Clone() TurnBlock {
 		ID:              b.ID,
 		Kind:            b.Kind,
 		Timestamp:       b.Timestamp,
+		StepNumber:      b.StepNumber,
 		UserPrompt:      b.UserPrompt,
 		EstimatedTokens: b.EstimatedTokens,
 	}

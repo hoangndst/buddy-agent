@@ -873,3 +873,66 @@ func TestEngine_SignalInterruptionGracefulPersist(t *testing.T) {
 	}
 }
 
+func TestEngine_ResetCumulativeUsage(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := persistence.NewSQLiteStore(fmt.Sprintf("file:memdb_usage_%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	memMgr := memory.NewManager(tmpDir)
+	reg := tools.NewRegistry(1000)
+
+	mockClient := &mockChatClient{
+		responses: []*openai.ChatCompletion{
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{Message: openai.ChatCompletionMessage{Role: "assistant", Content: "Run 1 done"}},
+				},
+				Usage: openai.CompletionUsage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150},
+			},
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{Message: openai.ChatCompletionMessage{Role: "assistant", Content: "Run 2 done"}},
+				},
+				Usage: openai.CompletionUsage{PromptTokens: 40, CompletionTokens: 20, TotalTokens: 60},
+			},
+		},
+	}
+
+	eng := NewEngine(
+		mockClient,
+		"gpt-4o",
+		5,
+		reg,
+		memMgr,
+		nil,
+		WithStore(store),
+		WithWorkspaceDir(tmpDir),
+	)
+
+	ctx := context.Background()
+	_, err = eng.Run(ctx, "Task 1")
+	if err != nil {
+		t.Fatalf("Run 1 failed: %v", err)
+	}
+
+	// Run 2 must reset cumulative usage
+	_, err = eng.Run(ctx, "Task 2")
+	if err != nil {
+		t.Fatalf("Run 2 failed: %v", err)
+	}
+
+	sessions, err := store.ListSessions(ctx, tmpDir, 10)
+	if err != nil || len(sessions) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(sessions))
+	}
+
+	// sessions[0] is the most recent (Task 2)
+	task2Sess := sessions[0]
+	if task2Sess.TokenUsage.TotalTokens != 60 {
+		t.Errorf("expected Task 2 to have 60 total tokens, got %d", task2Sess.TokenUsage.TotalTokens)
+	}
+}
+

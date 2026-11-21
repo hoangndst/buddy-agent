@@ -167,6 +167,8 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		return "", errors.New("task cannot be empty")
 	}
 
+	e.cumulativeUsage = persistence.TokenUsage{}
+
 	// 1. Build initial system prompt from memory and skills
 	systemPrompt, err := e.memoryMgr.LoadSystemPrompt()
 	if err != nil {
@@ -315,6 +317,7 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 	const maxTurnRetries = 2
 
 	for step := startStep; step <= totalMaxSteps; step++ {
+		session.SetCurrentStep(step)
 		select {
 		case <-ctx.Done():
 			if e.store != nil && sessionID != "" {
@@ -625,7 +628,7 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 				narrative, trackerJSON, currentTokens := session.ExtractSnapshot()
 				snapRec := &persistence.SnapshotRecord{
 					SessionID:          sessionID,
-					StepNumber:         step,
+					StepNumber:         session.LastCompactedStep(),
 					DistilledNarrative: narrative,
 					StateTrackerJSON:   trackerJSON,
 					CurrentTokens:      currentTokens,
@@ -652,11 +655,15 @@ func generateSessionID() string {
 
 func mapTurnRecordToBlock(tr *persistence.TurnRecord) history.TurnBlock {
 	if tr.Role == "user" {
-		return history.NewUserBlock(tr.Content)
+		b := history.NewUserBlock(tr.Content)
+		b.StepNumber = tr.StepNumber
+		return b
 	}
 	if len(tr.ToolCalls) == 0 {
 		msg := openai.ChatCompletionMessage{Role: "assistant", Content: tr.Content}
-		return history.NewAssistantSimpleBlock(msg)
+		b := history.NewAssistantSimpleBlock(msg)
+		b.StepNumber = tr.StepNumber
+		return b
 	}
 
 	toolCalls := make([]openai.ChatCompletionMessageToolCall, len(tr.ToolCalls))
@@ -681,7 +688,9 @@ func mapTurnRecordToBlock(tr *persistence.TurnRecord) history.TurnBlock {
 		Content:   tr.Content,
 		ToolCalls: toolCalls,
 	}
-	return history.NewAssistantToolCallBlock(msg, results)
+	b := history.NewAssistantToolCallBlock(msg, results)
+	b.StepNumber = tr.StepNumber
+	return b
 }
 
 // parseToolExitCode extracts a process exit code from tool output or defaults to 0 on success.

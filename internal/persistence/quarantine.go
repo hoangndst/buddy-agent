@@ -26,13 +26,21 @@ func CheckOrQuarantine(dbPath string) error {
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(1000)&_pragma=query_only(ON)", dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return quarantineFiles(dbPath)
+		return fmt.Errorf("failed to open database %s: %w", dbPath, err)
 	}
 	defer func() { _ = db.Close() }()
 
 	var result string
 	err = db.QueryRow("PRAGMA quick_check(1);").Scan(&result)
-	if err != nil || result != "ok" {
+	if err != nil {
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "corrupt") || strings.Contains(errStr, "malformed") || strings.Contains(errStr, "not a database") {
+			_ = db.Close()
+			return quarantineFiles(dbPath)
+		}
+		return fmt.Errorf("database quick_check operational error: %w", err)
+	}
+	if result != "ok" {
 		_ = db.Close()
 		return quarantineFiles(dbPath)
 	}

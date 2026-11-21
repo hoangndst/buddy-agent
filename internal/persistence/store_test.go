@@ -397,3 +397,59 @@ func TestCorruptionQuarantine(t *testing.T) {
 		t.Errorf("expected to find test.db.corrupt.<timestamp>, but found entries: %v", entries)
 	}
 }
+
+func TestSecretRedaction_SessionAndSnapshot(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	apiKey := "sk-proj-abc1234567890123456789012345678901234567890"
+	sess := &SessionRecord{
+		ID:         "sess_secret_test",
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+		Status:     StatusRunning,
+		Task:       fmt.Sprintf("Run deploy with key %s", apiKey),
+		Model:      "gpt-4o",
+		WorkingDir: "/test/workspace",
+	}
+
+	err := store.CreateSession(ctx, sess)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	loadedSess, err := store.GetSession(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if strings.Contains(loadedSess.Task, apiKey) {
+		t.Errorf("expected task to be redacted, got: %s", loadedSess.Task)
+	}
+	if !strings.Contains(loadedSess.Task, "sk-[REDACTED]") {
+		t.Errorf("expected sk-[REDACTED] in task, got: %s", loadedSess.Task)
+	}
+
+	snap := &SnapshotRecord{
+		SessionID:          sess.ID,
+		StepNumber:         1,
+		DistilledNarrative: fmt.Sprintf("Narrative with secret %s", apiKey),
+		StateTrackerJSON:   fmt.Sprintf(`{"root_goal":"deploy with %s"}`, apiKey),
+		CurrentTokens:      100,
+		CreatedAt:          time.Now().UTC(),
+	}
+	err = store.SaveSnapshot(ctx, snap)
+	if err != nil {
+		t.Fatalf("SaveSnapshot failed: %v", err)
+	}
+
+	loadedSnap, err := store.GetLatestSnapshot(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("GetLatestSnapshot failed: %v", err)
+	}
+	if strings.Contains(loadedSnap.DistilledNarrative, apiKey) {
+		t.Errorf("expected narrative to be redacted, got: %s", loadedSnap.DistilledNarrative)
+	}
+	if strings.Contains(loadedSnap.StateTrackerJSON, apiKey) {
+		t.Errorf("expected state tracker json to be redacted, got: %s", loadedSnap.StateTrackerJSON)
+	}
+}

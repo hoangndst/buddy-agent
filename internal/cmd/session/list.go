@@ -45,16 +45,12 @@ func NewCmdList(f *cmdutil.Factory) *cobra.Command {
 			w := tabwriter.NewWriter(f.IOStreams.Out, 0, 4, 2, ' ', 0)
 			_, _ = fmt.Fprintln(w, "ID\tSTATUS\tSTEPS\tTOKENS\tUPDATED\tTASK")
 			for _, s := range sessions {
-				shortID := s.ID
-				if len(shortID) > 12 {
-					shortID = shortID[:12]
-				}
 				taskSnippet := s.Task
 				if len(taskSnippet) > 40 {
 					taskSnippet = taskSnippet[:40] + "..."
 				}
 				_, _ = fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n",
-					shortID,
+					s.ID,
 					s.Status,
 					s.TotalSteps,
 					s.TokenUsage.TotalTokens,
