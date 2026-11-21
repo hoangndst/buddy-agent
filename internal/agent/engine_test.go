@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/history"
 	"github.com/hoangndst/buddy-agent/internal/memory"
 	"github.com/hoangndst/buddy-agent/internal/tools"
@@ -31,6 +32,42 @@ func (m *mockChatClient) CreateChatCompletion(_ context.Context, _ openai.ChatCo
 	resp := m.responses[m.calls]
 	m.calls++
 	return resp, nil
+}
+
+func (m *mockChatClient) Protocol() string {
+	return "chat"
+}
+
+func (m *mockChatClient) Generate(ctx context.Context, req provider.GenerateRequest) (*provider.GenerateResponse, error) {
+	chatResp, err := m.CreateChatCompletion(ctx, openai.ChatCompletionNewParams{
+		Model:    req.Model,
+		Messages: req.Messages,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(chatResp.Choices) == 0 {
+		return &provider.GenerateResponse{Protocol: "chat"}, nil
+	}
+	choice := chatResp.Choices[0]
+	toolCalls := make([]provider.ToolCall, 0, len(choice.Message.ToolCalls))
+	for _, tc := range choice.Message.ToolCalls {
+		toolCalls = append(toolCalls, provider.ToolCall{
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: tc.Function.Arguments,
+		})
+	}
+	return &provider.GenerateResponse{
+		Content:   choice.Message.Content,
+		ToolCalls: toolCalls,
+		Usage: provider.TokenUsage{
+			PromptTokens:     chatResp.Usage.PromptTokens,
+			CompletionTokens: chatResp.Usage.CompletionTokens,
+			TotalTokens:      chatResp.Usage.TotalTokens,
+		},
+		Protocol: "chat",
+	}, nil
 }
 
 func TestEngineExecutionFlow(t *testing.T) {
@@ -91,15 +128,15 @@ func TestEngineExecutionFlow(t *testing.T) {
 	}
 
 	// Verify events sequence
-	hasThought := false
+	hasTextComplete := false
 	hasToolCall := false
 	hasToolResult := false
 	hasFinished := false
 
 	for _, ev := range events {
 		switch ev.Type {
-		case EventThought:
-			hasThought = true
+		case EventTextComplete:
+			hasTextComplete = true
 		case EventToolCall:
 			hasToolCall = true
 		case EventToolResult:
@@ -109,7 +146,7 @@ func TestEngineExecutionFlow(t *testing.T) {
 		}
 	}
 
-	if !hasThought || !hasToolCall || !hasToolResult || !hasFinished {
+	if !hasTextComplete || !hasToolCall || !hasToolResult || !hasFinished {
 		t.Errorf("missing expected events in trace: %+v", events)
 	}
 }
@@ -296,6 +333,46 @@ func (m *flexibleMockClient) CreateChatCompletion(_ context.Context, params open
 	resp, err := m.handler(m.calls, params, opts)
 	m.calls++
 	return resp, err
+}
+
+func (m *flexibleMockClient) Protocol() string {
+	return "chat"
+}
+
+func (m *flexibleMockClient) Generate(ctx context.Context, req provider.GenerateRequest) (*provider.GenerateResponse, error) {
+	var opts []option.RequestOption
+	if req.IsLocal && req.LocalNumCtx > 0 {
+		opts = append(opts, option.WithJSONSet("options.num_ctx", req.LocalNumCtx))
+	}
+	chatResp, err := m.CreateChatCompletion(ctx, openai.ChatCompletionNewParams{
+		Model:    req.Model,
+		Messages: req.Messages,
+	}, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if len(chatResp.Choices) == 0 {
+		return &provider.GenerateResponse{Protocol: "chat"}, nil
+	}
+	choice := chatResp.Choices[0]
+	toolCalls := make([]provider.ToolCall, 0, len(choice.Message.ToolCalls))
+	for _, tc := range choice.Message.ToolCalls {
+		toolCalls = append(toolCalls, provider.ToolCall{
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: tc.Function.Arguments,
+		})
+	}
+	return &provider.GenerateResponse{
+		Content:   choice.Message.Content,
+		ToolCalls: toolCalls,
+		Usage: provider.TokenUsage{
+			PromptTokens:     chatResp.Usage.PromptTokens,
+			CompletionTokens: chatResp.Usage.CompletionTokens,
+			TotalTokens:      chatResp.Usage.TotalTokens,
+		},
+		Protocol: "chat",
+	}, nil
 }
 
 func TestEngineReactiveContextRecovery(t *testing.T) {
@@ -534,5 +611,58 @@ func TestEngineCumulativeToolOutputTruncation(t *testing.T) {
 	expectedPrefix := "[Output truncated: cumulative turn output limit reached] | Exit Code: 0"
 	if truncatedResult != expectedPrefix {
 		t.Errorf("expected truncated tool result %q, got %q", expectedPrefix, truncatedResult)
+	}
+}
+
+type mockProviderWithReasoning struct {
+	response *provider.GenerateResponse
+}
+
+func (m *mockProviderWithReasoning) Protocol() string { return "responses" }
+func (m *mockProviderWithReasoning) Generate(_ context.Context, _ provider.GenerateRequest) (*provider.GenerateResponse, error) {
+	return m.response, nil
+}
+
+func TestEngineReasoningEventEmission(t *testing.T) {
+	tempDir := t.TempDir()
+	reg := tools.NewRegistry(1000)
+	memMgr := memory.NewManager(tempDir)
+
+	mockProv := &mockProviderWithReasoning{
+		response: &provider.GenerateResponse{
+			Content:          "Final answer",
+			ReasoningContent: "Thinking about the solution...",
+			Protocol:         "responses",
+		},
+	}
+
+	var events []Event
+	engine := NewEngine(mockProv, "test-model", 5, reg, memMgr, func(e Event) {
+		events = append(events, e)
+	})
+
+	res, err := engine.Run(context.Background(), "solve this")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res != "Final answer" {
+		t.Errorf("expected 'Final answer', got %s", res)
+	}
+
+	hasReasoning := false
+	hasTextComplete := false
+	for _, ev := range events {
+		if ev.Type == EventReasoning && ev.Content == "Thinking about the solution..." {
+			hasReasoning = true
+		}
+		if ev.Type == EventTextComplete && ev.Content == "Final answer" {
+			hasTextComplete = true
+		}
+	}
+	if !hasReasoning {
+		t.Errorf("expected EventReasoning event, got events: %+v", events)
+	}
+	if !hasTextComplete {
+		t.Errorf("expected EventTextComplete event, got events: %+v", events)
 	}
 }

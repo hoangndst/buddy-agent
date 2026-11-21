@@ -3,7 +3,9 @@ package agent
 
 import (
 	"context"
+	"time"
 
+	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 )
@@ -34,7 +36,10 @@ type EventType string
 // Supported agent event types.
 const (
 	EventStepStart        EventType = "step_start"
-	EventThought          EventType = "thought"
+	EventReasoning        EventType = "reasoning"
+	EventThought          EventType = "reasoning" // Deprecated alias for backward test compatibility
+	EventTextDelta        EventType = "text_delta" // Reserved for Milestone 9 streaming tokens
+	EventTextComplete     EventType = "text_complete"
 	EventToolCall         EventType = "tool_call"
 	EventToolResult       EventType = "tool_result"
 	EventFinished         EventType = "finished"
@@ -48,13 +53,19 @@ const (
 
 // Event conveys real-time execution telemetry to listeners.
 type Event struct {
-	Type       EventType
-	Step       int
-	Content    string
-	ToolName   string
-	ToolArgs   string
-	ToolResult string
-	Error      error
+	Type         EventType
+	Step         int
+	Timestamp    time.Time
+	Duration     time.Duration
+	Protocol     string
+	Content      string
+	ToolCallID   string
+	ToolName     string
+	ToolArgs     string
+	ToolResult   string
+	ToolExitCode int
+	Usage        provider.TokenUsage
+	Error        error
 }
 
 // EventHandler receives agent lifecycle events.

@@ -16,6 +16,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.BaseURL != "http://localhost:11434/v1" {
 		t.Errorf("expected default BaseURL http://localhost:11434/v1, got %s", cfg.BaseURL)
 	}
+	if cfg.APIType != "auto" {
+		t.Errorf("expected default APIType auto, got %s", cfg.APIType)
+	}
+	if cfg.ReasoningEffort != "" {
+		t.Errorf("expected default ReasoningEffort empty, got %s", cfg.ReasoningEffort)
+	}
 	if cfg.MaxSteps != 30 {
 		t.Errorf("expected default MaxSteps 30, got %d", cfg.MaxSteps)
 	}
@@ -96,6 +102,64 @@ func TestLoadCustom_BuddyEnvPrecedence(t *testing.T) {
 	}
 	if !cfg.IsLocal {
 		t.Errorf("expected IsLocal true for localhost, got false")
+	}
+}
+
+func TestLoadCustom_APITypeAndReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name            string
+		envAPIType      string
+		envEffort       string
+		expectedAPIType string
+		expectedEffort  string
+	}{
+		{
+			name:            "Valid lowercase chat and medium",
+			envAPIType:      "chat",
+			envEffort:       "medium",
+			expectedAPIType: "chat",
+			expectedEffort:  "medium",
+		},
+		{
+			name:            "Whitespace and uppercase normalization",
+			envAPIType:      "  RESPONSES  ",
+			envEffort:       "  HIGH  ",
+			expectedAPIType: "responses",
+			expectedEffort:  "high",
+		},
+		{
+			name:            "Invalid values fallback to defaults",
+			envAPIType:      "invalid_protocol",
+			envEffort:       "ultra_high",
+			expectedAPIType: "auto",
+			expectedEffort:  "",
+		},
+		{
+			name:            "Explicit none reasoning effort",
+			envAPIType:      "auto",
+			envEffort:       "none",
+			expectedAPIType: "auto",
+			expectedEffort:  "none",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			os.Clearenv()
+			t.Setenv("BUDDY_API_TYPE", tt.envAPIType)
+			t.Setenv("BUDDY_REASONING_EFFORT", tt.envEffort)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("unexpected error loading config: %v", err)
+			}
+			if cfg.APIType != tt.expectedAPIType {
+				t.Errorf("expected APIType %q, got %q", tt.expectedAPIType, cfg.APIType)
+			}
+			if cfg.ReasoningEffort != tt.expectedEffort {
+				t.Errorf("expected ReasoningEffort %q, got %q", tt.expectedEffort, cfg.ReasoningEffort)
+			}
+		})
 	}
 }
 

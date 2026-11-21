@@ -24,6 +24,8 @@ type Config struct {
 	BaseURL          string
 	APIKey           string
 	Model            string
+	APIType          string
+	ReasoningEffort  string
 	MaxSteps         int
 	MaxOutputChars   int
 	MaxContextTokens int
@@ -57,6 +59,20 @@ func Load() (*Config, error) {
 	baseURL := getEnv("BUDDY_BASE_URL", getEnv("OPENAI_BASE_URL", "http://localhost:11434/v1"))
 	apiKey := getEnv("BUDDY_API_KEY", getEnv("OPENAI_API_KEY", ""))
 
+	apiType := strings.ToLower(strings.TrimSpace(getEnv("BUDDY_API_TYPE", "auto")))
+	switch apiType {
+	case "auto", "chat", "responses":
+	default:
+		apiType = "auto"
+	}
+
+	reasoningEffort := strings.ToLower(strings.TrimSpace(getEnv("BUDDY_REASONING_EFFORT", "")))
+	switch reasoningEffort {
+	case "none", "low", "medium", "high":
+	default:
+		reasoningEffort = ""
+	}
+
 	maxContextTokens := resolveContextCeiling(os.Getenv("BUDDY_MAX_CONTEXT_TOKENS"), baseURL)
 
 	workingTailSize, err := strconv.Atoi(getEnv("BUDDY_WORKING_TAIL_SIZE", "5"))
@@ -71,6 +87,8 @@ func Load() (*Config, error) {
 		BaseURL:          baseURL,
 		APIKey:           apiKey,
 		Model:            model,
+		APIType:          apiType,
+		ReasoningEffort:  reasoningEffort,
 		MaxSteps:         maxSteps,
 		MaxOutputChars:   maxOutputChars,
 		MaxContextTokens: maxContextTokens,
