@@ -1016,3 +1016,47 @@ func TestEngine_ResumeWithTurnGaps(t *testing.T) {
 	}
 }
 
+func TestEngine_SessionIDOverride(t *testing.T) {
+	mock := &mockChatClient{
+		responses: []*openai.ChatCompletion{
+			{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    "assistant",
+							Content: "override done",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	eng := NewEngine(
+		mock,
+		"test-model",
+		1,
+		tools.NewRegistry(1000),
+		nil,
+		nil,
+		WithSystemPromptOverride("override prompt"),
+		WithSessionIDOverride("sess_override_1234"),
+	)
+	eng.compClient = mock
+
+	res, err := eng.Run(context.Background(), "test task")
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if res != "override done" {
+		t.Errorf("expected 'override done', got %q", res)
+	}
+	lastRes := eng.LastExecutionResult()
+	if lastRes == nil {
+		t.Fatal("expected LastExecutionResult to be non-nil")
+	}
+	if lastRes.SessionID != "sess_override_1234" {
+		t.Errorf("expected session ID 'sess_override_1234', got %q", lastRes.SessionID)
+	}
+}
+

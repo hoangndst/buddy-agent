@@ -11,7 +11,8 @@ import (
 func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	// 1. Request roundtrip
 	req, err := NewRequest("req-1", MethodSessionStart, SessionStartParams{
-		Task: "run tests",
+		Task:             "run tests",
+		MaxContextTokens: 32000,
 	})
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
@@ -39,6 +40,9 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	}
 	if params.Task != "run tests" {
 		t.Fatalf("expected task 'run tests', got %q", params.Task)
+	}
+	if params.MaxContextTokens != 32000 {
+		t.Fatalf("expected max context tokens 32000, got %d", params.MaxContextTokens)
 	}
 
 	// 2. Response roundtrip

@@ -267,3 +267,48 @@ func TestLoadConfig_MalformedJSON(t *testing.T) {
 		t.Fatal("expected error on malformed json, got nil")
 	}
 }
+
+func TestLoadConfig_WorkDirInheritance(t *testing.T) {
+	tempDir := t.TempDir()
+	userHome := filepath.Join(tempDir, "home")
+	projectDir := filepath.Join(tempDir, "project")
+
+	projectJSON := `{
+  "mcpServers": {
+    "default-wd": {
+      "command": "sh",
+      "args": ["-c", "pwd"]
+    },
+    "custom-wd": {
+      "command": "sh",
+      "args": ["-c", "pwd"],
+      "workDir": "/custom/path"
+    }
+  }
+}`
+	projectPath := filepath.Join(projectDir, ".buddy", "mcp.json")
+	_ = os.MkdirAll(filepath.Dir(projectPath), 0755)
+	_ = os.WriteFile(projectPath, []byte(projectJSON), 0644)
+
+	cfg, err := LoadConfig(projectDir, userHome)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	defSrv := cfg.MCPServers["default-wd"]
+	if defSrv.WorkDir != projectDir {
+		t.Errorf("expected default-wd WorkDir to be %q, got %q", projectDir, defSrv.WorkDir)
+	}
+	customSrv := cfg.MCPServers["custom-wd"]
+	if customSrv.WorkDir != "/custom/path" {
+		t.Errorf("expected custom-wd WorkDir to be '/custom/path', got %q", customSrv.WorkDir)
+	}
+
+	cmd, _, _, err := buildStdioCommand(defSrv)
+	if err != nil {
+		t.Fatalf("buildStdioCommand failed: %v", err)
+	}
+	if cmd.Dir != projectDir {
+		t.Errorf("expected cmd.Dir to be %q, got %q", projectDir, cmd.Dir)
+	}
+}

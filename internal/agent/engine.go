@@ -110,6 +110,14 @@ func WithInheritedInvariants(invariants []string) EngineOption {
 	}
 }
 
+// WithSessionIDOverride configures an explicit session ID on the engine,
+// ensuring parity between daemon session identifiers and persistence stores.
+func WithSessionIDOverride(sessionID string) EngineOption {
+	return func(e *Engine) {
+		e.sessionIDOverride = sessionID
+	}
+}
+
 // providerCompletionAdapter bridges a ModelProvider to history.CompletionClient.
 type providerCompletionAdapter struct {
 	prov  provider.ModelProvider
@@ -165,6 +173,7 @@ type Engine struct {
 	workspaceDir         string
 	depth                int
 	parentSessionID      string
+	sessionIDOverride   string
 	role                 string
 	systemPromptOverride string
 	inheritedInvariants  []string
@@ -247,6 +256,9 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 	}
 
 	sessionID := generateSessionID()
+	if e.sessionIDOverride != "" {
+		sessionID = e.sessionIDOverride
+	}
 	if e.registry != nil {
 		if t, ok := e.registry.Get("invoke_subagent"); ok {
 			if subTool, ok := t.(*InvokeSubagentTool); ok {

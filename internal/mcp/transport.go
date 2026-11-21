@@ -70,6 +70,11 @@ func buildStdioCommand(srv ServerConfig) (*exec.Cmd, subprocess.Supervisor, *rol
 	}
 
 	cmd := exec.Command(srv.Command, srv.Args...)
+	if srv.WorkDir != "" {
+		cmd.Dir = srv.WorkDir
+	} else if srv.Cwd != "" {
+		cmd.Dir = srv.Cwd
+	}
 
 	// Merge environment: start with current environment, override with srv.Env
 	envMap := make(map[string]string)

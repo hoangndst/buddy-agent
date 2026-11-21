@@ -175,6 +175,12 @@ func buildEngineForSession(
 	home, _ := f.UserHome()
 	mcpCfg, mcpErr := f.MCPConfigLoader(wsDir, home)
 	if mcpErr == nil && mcpCfg != nil && len(mcpCfg.MCPServers) > 0 {
+		for name, srv := range mcpCfg.MCPServers {
+			if srv.WorkDir == "" && srv.Cwd == "" && wsDir != "" {
+				srv.WorkDir = wsDir
+				mcpCfg.MCPServers[name] = srv
+			}
+		}
 		mcpMgr := f.NewClientManager(mcpCfg)
 		_ = mcpMgr.StartAll(ctx)
 		cleanups = append(cleanups, func() {
@@ -188,7 +194,17 @@ func buildEngineForSession(
 	}
 
 	var store persistence.Store
-	if f.Store != nil {
+	if f.StoreForWorkspace != nil {
+		s, closer, sErr := f.StoreForWorkspace(wsDir)
+		if sErr == nil && s != nil {
+			store = s
+			if closer != nil {
+				cleanups = append(cleanups, func() {
+					closer()
+				})
+			}
+		}
+	} else if f.Store != nil {
 		s, closer, sErr := f.Store()
 		if sErr == nil && s != nil {
 			store = s
@@ -212,6 +228,16 @@ func buildEngineForSession(
 	if params.ReasoningEffort != "" {
 		effort = params.ReasoningEffort
 	}
+	maxCtx := cfg.MaxContextTokens
+	if params.MaxContextTokens > 0 {
+		maxCtx = params.MaxContextTokens
+	} else if params.BaseURL != "" && isLocal != cfg.IsLocal {
+		if isLocal {
+			maxCtx = config.DefaultLocalContextTokens
+		} else {
+			maxCtx = config.DefaultRemoteContextTokens
+		}
+	}
 
 	subTool := agent.NewInvokeSubagentTool(agent.SubagentToolConfig{
 		Depth:            0,
@@ -224,7 +250,7 @@ func buildEngineForSession(
 		Store:            store,
 		EventHandler:     emitHandler,
 		IsLocal:          isLocal,
-		MaxContextTokens: cfg.MaxContextTokens,
+		MaxContextTokens: maxCtx,
 	})
 	reg.Register(subTool)
 
@@ -235,12 +261,13 @@ func buildEngineForSession(
 		reg,
 		memMgr,
 		emitHandler,
-		agent.WithMaxContextTokens(cfg.MaxContextTokens),
+		agent.WithMaxContextTokens(maxCtx),
 		agent.WithWorkingTailSize(cfg.WorkingTailSize),
 		agent.WithIsLocal(isLocal),
 		agent.WithReasoningEffort(effort),
 		agent.WithStore(store),
 		agent.WithWorkspaceDir(wsDir),
+		agent.WithSessionIDOverride(sessionID),
 	)
 
 	cleanup := func() {

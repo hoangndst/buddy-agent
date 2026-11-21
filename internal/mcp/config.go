@@ -21,6 +21,8 @@ type ServerConfig struct {
 	Command string            `json:"command,omitempty"`
 	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
+	WorkDir string            `json:"workDir,omitempty"`
+	Cwd     string            `json:"cwd,omitempty"`
 
 	// Remote HTTP/SSE transport parameters
 	URL     string            `json:"url,omitempty"`
@@ -67,6 +69,12 @@ func LoadConfig(projectDir, userHome string) (*Config, error) {
 		if globalCfg, err := loadSingleConfigFile(globalPath); err == nil && globalCfg != nil {
 			for name, srv := range globalCfg.MCPServers {
 				srv.Source = "global"
+				if srv.WorkDir == "" && srv.Cwd != "" {
+					srv.WorkDir = srv.Cwd
+				}
+				if srv.WorkDir == "" && projectDir != "" {
+					srv.WorkDir = projectDir
+				}
 				merged[name] = srv
 			}
 		} else if err != nil && !os.IsNotExist(err) {
@@ -80,6 +88,12 @@ func LoadConfig(projectDir, userHome string) (*Config, error) {
 		if projectCfg, err := loadSingleConfigFile(projectPath); err == nil && projectCfg != nil {
 			for name, srv := range projectCfg.MCPServers {
 				srv.Source = "project"
+				if srv.WorkDir == "" && srv.Cwd != "" {
+					srv.WorkDir = srv.Cwd
+				}
+				if srv.WorkDir == "" && projectDir != "" {
+					srv.WorkDir = projectDir
+				}
 				merged[name] = srv
 			}
 		} else if err != nil && !os.IsNotExist(err) {

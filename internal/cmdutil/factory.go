@@ -20,8 +20,9 @@ type Factory struct {
 	WorkDir          func() (string, error)
 	UserHome         func() (string, error)
 	NewClientManager func(cfg *mcp.Config) *mcp.ClientManager
-	NewModelProvider func(cfg *config.Config, client *openai.Client) provider.ModelProvider
-	Store            func() (persistence.Store, func(), error)
+	NewModelProvider  func(cfg *config.Config, client *openai.Client) provider.ModelProvider
+	Store             func() (persistence.Store, func(), error)
+	StoreForWorkspace func(wsDir string) (persistence.Store, func(), error)
 }
 
 // NewFactory constructs a default production command factory.
@@ -55,6 +56,37 @@ func NewFactory() *Factory {
 			dbPath := cfg.DBPath
 			if dbPath == "" {
 				ws := cfg.WorkspaceDir
+				if ws == "" {
+					ws = "."
+				}
+				dbPath = filepath.Join(ws, ".buddy", "history.db")
+			}
+			store, err := persistence.NewSQLiteStore(dbPath)
+			if err != nil {
+				if home, homeErr := os.UserHomeDir(); homeErr == nil {
+					fallbackPath := filepath.Join(home, ".buddy", "history.db")
+					store, err = persistence.NewSQLiteStore(fallbackPath)
+				}
+				if err != nil {
+					return nil, nil, err
+				}
+			}
+			cleanup := func() {
+				_ = store.Close()
+			}
+			return store, cleanup, nil
+		},
+		StoreForWorkspace: func(wsDir string) (persistence.Store, func(), error) {
+			cfg, err := config.Load()
+			if err != nil {
+				return nil, nil, err
+			}
+			dbPath := cfg.DBPath
+			if dbPath == "" {
+				ws := wsDir
+				if ws == "" {
+					ws = cfg.WorkspaceDir
+				}
 				if ws == "" {
 					ws = "."
 				}
