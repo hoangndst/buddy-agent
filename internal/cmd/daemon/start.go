@@ -249,7 +249,7 @@ func buildEngineForSession(
 			}
 			mcpCfg.MCPServers[name] = srv
 		}
-		mcpMgr := f.NewClientManager(mcpCfg)
+		mcpMgr := f.NewClientManager(mcpCfg, params.Env)
 		_ = mcpMgr.StartAll(ctx)
 		cleanups = append(cleanups, func() {
 			_ = mcpMgr.Close()

@@ -168,7 +168,7 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 	home, _ := f.UserHome()
 	mcpCfg, mcpErr := f.MCPConfigLoader(wd, home)
 	if mcpErr == nil && mcpCfg != nil && len(mcpCfg.MCPServers) > 0 {
-		mcpMgr := f.NewClientManager(mcpCfg)
+		mcpMgr := f.NewClientManager(mcpCfg, callerEnv)
 		_ = mcpMgr.StartAll(ctx)
 		cleanupFunc = func() {
 			_ = mcpMgr.Close()

@@ -10,6 +10,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
 	"github.com/hoangndst/buddy-agent/internal/config"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
+	core "github.com/hoangndst/buddy-agent/internal/mcp"
 	"github.com/openai/openai-go"
 )
 
@@ -259,5 +260,64 @@ func TestRenderEvent_TextComplete(t *testing.T) {
 	out := outBuf.String()
 	if !strings.Contains(out, "I have prepared the changes and will now execute the build.") {
 		t.Errorf("expected conversational text in output, got:\n%s", out)
+	}
+}
+
+func TestSetupEngine_PassesCallerEnvToMCPManager(t *testing.T) {
+	f := cmdutil.NewFactory()
+	tempDir := t.TempDir()
+
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			APIKey:           "test-key",
+			Model:            "test-model",
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   1000,
+			MaxContextTokens: 4096,
+		}, nil
+	}
+
+	callerEnv := []string{
+		"BUDDY_CLI_TOKEN=custom_cli_token_999",
+		"BUDDY_CLI_SETTING=1",
+	}
+	f.Environ = func() []string {
+		return callerEnv
+	}
+
+	f.MCPConfigLoader = func(_, _ string) (*core.Config, error) {
+		return &core.Config{
+			MCPServers: map[string]core.ServerConfig{
+				"test-mcp-server": {Command: "echo"},
+			},
+		}, nil
+	}
+
+	var observedBaseEnv []string
+	f.NewClientManager = func(cfg *core.Config, baseEnv ...[]string) *core.ClientManager {
+		if len(baseEnv) > 0 {
+			observedBaseEnv = baseEnv[0]
+		}
+		return core.NewClientManager(cfg, baseEnv...)
+	}
+
+	eng, cleanup, err := setupEngine(context.Background(), f)
+	if err != nil {
+		t.Fatalf("setupEngine failed: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+
+	if len(observedBaseEnv) != len(callerEnv) {
+		t.Fatalf("expected observedBaseEnv length %d, got %d", len(callerEnv), len(observedBaseEnv))
+	}
+	for i, val := range callerEnv {
+		if observedBaseEnv[i] != val {
+			t.Errorf("expected observedBaseEnv[%d] = %q, got %q", i, val, observedBaseEnv[i])
+		}
 	}
 }

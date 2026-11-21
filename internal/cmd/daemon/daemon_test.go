@@ -295,9 +295,9 @@ func TestBuildEngineForSession_CallerResolvedMCPConfig(t *testing.T) {
 	}
 
 	var observedMCPConfig *core.Config
-	f.NewClientManager = func(cfg *core.Config) *core.ClientManager {
+	f.NewClientManager = func(cfg *core.Config, baseEnv ...[]string) *core.ClientManager {
 		observedMCPConfig = cfg
-		return core.NewClientManager(cfg)
+		return core.NewClientManager(cfg, baseEnv...)
 	}
 
 	callerMCPConfig := &core.Config{
@@ -368,9 +368,9 @@ func TestBuildEngineForSession_MCPConfigFallback(t *testing.T) {
 	}
 
 	var observedMCPConfig *core.Config
-	f.NewClientManager = func(cfg *core.Config) *core.ClientManager {
+	f.NewClientManager = func(cfg *core.Config, baseEnv ...[]string) *core.ClientManager {
 		observedMCPConfig = cfg
-		return core.NewClientManager(cfg)
+		return core.NewClientManager(cfg, baseEnv...)
 	}
 
 	params := protocol.SessionStartParams{
@@ -482,5 +482,68 @@ func TestBuildEngineForSession_CallerEnvironment(t *testing.T) {
 	out := eng.Registry().Dispatch(context.Background(), "bash", json.RawMessage(`{"command": "echo $BUDDY_CALLER_ENV_TEST"}`))
 	if !strings.Contains(out, "custom_token_12345") {
 		t.Errorf("expected bash execution to contain custom_token_12345, got:\n%s", out)
+	}
+}
+
+func TestBuildEngineForSession_PassesCallerEnvToMCPManager(t *testing.T) {
+	tempDir := t.TempDir()
+	f := cmdutil.NewFactory()
+
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			Model:            "test-model",
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   10000,
+			MaxSteps:         10,
+			MaxContextTokens: 64000,
+		}, nil
+	}
+
+	var observedBaseEnv []string
+	f.NewClientManager = func(cfg *core.Config, baseEnv ...[]string) *core.ClientManager {
+		if len(baseEnv) > 0 {
+			observedBaseEnv = baseEnv[0]
+		}
+		return core.NewClientManager(cfg, baseEnv...)
+	}
+
+	callerMCPConfig := &core.Config{
+		MCPServers: map[string]core.ServerConfig{
+			"caller-server": {
+				Command: "echo",
+			},
+		},
+	}
+
+	callerEnv := []string{
+		"BUDDY_API_KEY=secret_key_123",
+		"BUDDY_CUSTOM_SETTING=enabled",
+	}
+
+	params := protocol.SessionStartParams{
+		Task:         "task with caller env and mcp",
+		WorkspaceDir: tempDir,
+		MCPConfig:    callerMCPConfig,
+		Env:          callerEnv,
+	}
+
+	eng, cleanup, err := buildEngineForSession(context.Background(), f, "sess_mcp_env_test", params, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+
+	if len(observedBaseEnv) != len(callerEnv) {
+		t.Fatalf("expected observedBaseEnv length %d, got %d", len(callerEnv), len(observedBaseEnv))
+	}
+	for i, val := range callerEnv {
+		if observedBaseEnv[i] != val {
+			t.Errorf("expected observedBaseEnv[%d] = %q, got %q", i, val, observedBaseEnv[i])
+		}
 	}
 }

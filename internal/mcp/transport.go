@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,22 +15,22 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// rollingBuffer implements a thread-safe, bounded in-memory buffer
+// RollingBuffer implements a thread-safe, bounded in-memory buffer
 // capturing standard error output up to a maximum capacity.
-type rollingBuffer struct {
+type RollingBuffer struct {
 	mu       sync.Mutex
 	capacity int
 	buf      []byte
 }
 
-func newRollingBuffer(capacity int) *rollingBuffer {
+func newRollingBuffer(capacity int) *RollingBuffer {
 	if capacity <= 0 {
 		capacity = 4096
 	}
-	return &rollingBuffer{capacity: capacity}
+	return &RollingBuffer{capacity: capacity}
 }
 
-func (b *rollingBuffer) Write(p []byte) (n int, err error) {
+func (b *RollingBuffer) Write(p []byte) (n int, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.buf = append(b.buf, p...)
@@ -38,7 +40,7 @@ func (b *rollingBuffer) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-func (b *rollingBuffer) String() string {
+func (b *RollingBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return string(b.buf)
@@ -64,7 +66,7 @@ func (rt *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 
 // buildStdioCommand prepares an exec.Cmd with environment merging,
 // process group supervisor preparation, and rolling stderr buffer attachment.
-func buildStdioCommand(srv ServerConfig) (*exec.Cmd, subprocess.Supervisor, *rollingBuffer, error) {
+func buildStdioCommand(srv ServerConfig, baseEnv ...[]string) (*exec.Cmd, subprocess.Supervisor, *RollingBuffer, error) {
 	if srv.Command == "" {
 		return nil, nil, nil, fmt.Errorf("stdio server requires a command: %w", ErrMissingCommandOrURL)
 	}
@@ -76,14 +78,19 @@ func buildStdioCommand(srv ServerConfig) (*exec.Cmd, subprocess.Supervisor, *rol
 		cmd.Dir = srv.Cwd
 	}
 
-	// Merge environment: start with current environment, override with srv.Env
+	var initialEnv []string
+	if len(baseEnv) > 0 && baseEnv[0] != nil {
+		initialEnv = baseEnv[0]
+	} else {
+		initialEnv = os.Environ()
+	}
+
+	// Merge environment: start with base environment, override with srv.Env
 	envMap := make(map[string]string)
-	for _, envStr := range os.Environ() {
-		for i := 0; i < len(envStr); i++ {
-			if envStr[i] == '=' {
-				envMap[envStr[:i]] = envStr[i+1:]
-				break
-			}
+	for _, envStr := range initialEnv {
+		k, v, ok := strings.Cut(envStr, "=")
+		if ok {
+			envMap[k] = v
 		}
 	}
 	for k, v := range srv.Env {
@@ -93,6 +100,7 @@ func buildStdioCommand(srv ServerConfig) (*exec.Cmd, subprocess.Supervisor, *rol
 	for k, v := range envMap {
 		mergedEnv = append(mergedEnv, fmt.Sprintf("%s=%s", k, v))
 	}
+	sort.Strings(mergedEnv)
 	cmd.Env = mergedEnv
 
 	sup := subprocess.NewSupervisor()
@@ -106,29 +114,70 @@ func buildStdioCommand(srv ServerConfig) (*exec.Cmd, subprocess.Supervisor, *rol
 	return cmd, sup, stderrBuf, nil
 }
 
-// supervisedCommandTransport wraps mcp.CommandTransport to attach the process group
+// SupervisedCommandTransport wraps mcp.CommandTransport to attach the process group
 // supervisor immediately upon child process creation, before the JSON-RPC initialization handshake.
-type supervisedCommandTransport struct {
-	inner *mcp.CommandTransport
-	cmd   *exec.Cmd
-	sup   subprocess.Supervisor
+type SupervisedCommandTransport struct {
+	inner     *mcp.CommandTransport
+	cmd       *exec.Cmd
+	sup       subprocess.Supervisor
+	stderrBuf *RollingBuffer
 }
 
-// newSupervisedCommandTransport creates a supervisedCommandTransport wrapping an SDK CommandTransport.
-func newSupervisedCommandTransport(cmd *exec.Cmd, sup subprocess.Supervisor) *supervisedCommandTransport {
-	return &supervisedCommandTransport{
+// NewStdioTransport creates a supervised stdio command transport with optional base environment merging.
+// When baseEnv is provided and non-nil, it starts with baseEnv instead of os.Environ(),
+// overlaying srv.Env onto it (preserving explicit server-level overrides). If baseEnv
+// is not provided or nil, it falls back to os.Environ().
+func NewStdioTransport(srv ServerConfig, baseEnv ...[]string) (*SupervisedCommandTransport, error) {
+	cmd, sup, stderrBuf, err := buildStdioCommand(srv, baseEnv...)
+	if err != nil {
+		return nil, err
+	}
+	return &SupervisedCommandTransport{
 		inner: &mcp.CommandTransport{
 			Command:           cmd,
 			TerminateDuration: 100 * time.Millisecond,
 		},
-		cmd: cmd,
-		sup: sup,
+		cmd:       cmd,
+		sup:       sup,
+		stderrBuf: stderrBuf,
+	}, nil
+}
+
+// Cmd returns the underlying exec.Cmd for the transport.
+func (t *SupervisedCommandTransport) Cmd() *exec.Cmd {
+	if t == nil {
+		return nil
 	}
+	return t.cmd
+}
+
+// Supervisor returns the process group supervisor.
+func (t *SupervisedCommandTransport) Supervisor() subprocess.Supervisor {
+	if t == nil {
+		return nil
+	}
+	return t.sup
+}
+
+// StderrBuffer returns the bounded in-memory rolling buffer capturing stderr.
+func (t *SupervisedCommandTransport) StderrBuffer() *RollingBuffer {
+	if t == nil {
+		return nil
+	}
+	return t.stderrBuf
+}
+
+// StderrText returns the accumulated standard error output.
+func (t *SupervisedCommandTransport) StderrText() string {
+	if t == nil || t.stderrBuf == nil {
+		return ""
+	}
+	return t.stderrBuf.String()
 }
 
 // Connect starts the child process and immediately attaches the process group supervisor
 // before returning the connection for the JSON-RPC initialization handshake.
-func (t *supervisedCommandTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+func (t *SupervisedCommandTransport) Connect(ctx context.Context) (mcp.Connection, error) {
 	conn, err := t.inner.Connect(ctx)
 	if err != nil {
 		return nil, err

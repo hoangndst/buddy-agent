@@ -20,7 +20,7 @@ type Factory struct {
 	WorkDir          func() (string, error)
 	UserHome         func() (string, error)
 	Environ          func() []string
-	NewClientManager func(cfg *mcp.Config) *mcp.ClientManager
+	NewClientManager func(cfg *mcp.Config, baseEnv ...[]string) *mcp.ClientManager
 	NewModelProvider  func(cfg *config.Config, client *openai.Client) provider.ModelProvider
 	Store             func() (persistence.Store, func(), error)
 	StoreForWorkspace func(wsDir string, dbPath ...string) (persistence.Store, func(), error)
@@ -35,8 +35,8 @@ func NewFactory() *Factory {
 		WorkDir:         os.Getwd,
 		UserHome:        os.UserHomeDir,
 		Environ:          os.Environ,
-		NewClientManager: func(cfg *mcp.Config) *mcp.ClientManager {
-			return mcp.NewClientManager(cfg)
+		NewClientManager: func(cfg *mcp.Config, baseEnv ...[]string) *mcp.ClientManager {
+			return mcp.NewClientManager(cfg, baseEnv...)
 		},
 		NewModelProvider: func(cfg *config.Config, client *openai.Client) provider.ModelProvider {
 			switch cfg.APIType {
