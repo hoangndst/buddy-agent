@@ -189,7 +189,7 @@ func TestRootCmd_TaskExecution_FormattingAndNoRawStepHeaders(t *testing.T) {
 	}
 
 	rootCmd := NewRootCmd(f)
-	rootCmd.SetArgs([]string{"list files"})
+	rootCmd.SetArgs([]string{"--standalone", "list files"})
 	if err := rootCmd.Execute(); err != nil {
 		t.Fatalf("task execution failed: %v", err)
 	}

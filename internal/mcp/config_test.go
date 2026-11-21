@@ -312,3 +312,46 @@ func TestLoadConfig_WorkDirInheritance(t *testing.T) {
 		t.Errorf("expected cmd.Dir to be %q, got %q", projectDir, cmd.Dir)
 	}
 }
+
+func TestLoadConfig_RelativeWorkDirResolution(t *testing.T) {
+	tempDir := t.TempDir()
+	projectDir := filepath.Join(tempDir, "project")
+
+	projectJSON := `{
+  "mcpServers": {
+    "relative-tool": {
+      "command": "node",
+      "args": ["server.js"],
+      "workDir": "./custom/tools",
+      "cwd": "scripts"
+    }
+  }
+}`
+	projectPath := filepath.Join(projectDir, ".buddy", "mcp.json")
+	if err := os.MkdirAll(filepath.Dir(projectPath), 0755); err != nil {
+		t.Fatalf("failed to create project dir: %v", err)
+	}
+	if err := os.WriteFile(projectPath, []byte(projectJSON), 0644); err != nil {
+		t.Fatalf("failed to write project json: %v", err)
+	}
+
+	cfg, err := LoadConfig(projectDir, "")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	srv, ok := cfg.MCPServers["relative-tool"]
+	if !ok {
+		t.Fatal("expected relative-tool in MCPServers")
+	}
+
+	expectedWorkDir := filepath.Join(projectDir, "custom", "tools")
+	if srv.WorkDir != expectedWorkDir {
+		t.Errorf("expected normalized absolute WorkDir %q, got %q", expectedWorkDir, srv.WorkDir)
+	}
+
+	expectedCwd := filepath.Join(projectDir, "scripts")
+	if srv.Cwd != expectedCwd {
+		t.Errorf("expected normalized absolute Cwd %q, got %q", expectedCwd, srv.Cwd)
+	}
+}

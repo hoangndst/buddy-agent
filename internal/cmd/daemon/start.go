@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -229,10 +230,19 @@ func buildEngineForSession(
 	}
 	if mcpErr == nil && mcpCfg != nil && len(mcpCfg.MCPServers) > 0 {
 		for name, srv := range mcpCfg.MCPServers {
-			if srv.WorkDir == "" && srv.Cwd == "" && wsDir != "" {
-				srv.WorkDir = wsDir
-				mcpCfg.MCPServers[name] = srv
+			if srv.WorkDir == "" && srv.Cwd != "" {
+				srv.WorkDir = srv.Cwd
 			}
+			if srv.WorkDir == "" && wsDir != "" {
+				srv.WorkDir = wsDir
+			}
+			if srv.WorkDir != "" && !filepath.IsAbs(srv.WorkDir) && wsDir != "" {
+				srv.WorkDir = filepath.Clean(filepath.Join(wsDir, srv.WorkDir))
+			}
+			if srv.Cwd != "" && !filepath.IsAbs(srv.Cwd) && wsDir != "" {
+				srv.Cwd = filepath.Clean(filepath.Join(wsDir, srv.Cwd))
+			}
+			mcpCfg.MCPServers[name] = srv
 		}
 		mcpMgr := f.NewClientManager(mcpCfg)
 		_ = mcpMgr.StartAll(ctx)
