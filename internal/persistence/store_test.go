@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -484,5 +485,94 @@ func TestMemoryStoreSharedBetweenPools(t *testing.T) {
 	}
 	if loaded.Task != sess.Task {
 		t.Errorf("expected task %q, got %q", sess.Task, loaded.Task)
+	}
+}
+
+func TestSecretRedaction_URIAndJSONBoundaries(t *testing.T) {
+	// 1. Connection URI password redaction
+	uri := "postgres://admin:secret123@db.example.com:5432/buddy"
+	redactedURI := RedactSecrets(uri)
+	expectedURI := "postgres://admin:[REDACTED]@db.example.com:5432/buddy"
+	if redactedURI != expectedURI {
+		t.Errorf("expected %q, got %q", expectedURI, redactedURI)
+	}
+
+	// 2. Unrelated URL and email address must not be matched across boundaries
+	sentence := "See https://example.com and send reports to dev@example.com"
+	redactedSentence := RedactSecrets(sentence)
+	if redactedSentence != sentence {
+		t.Errorf("expected sentence with URL and email to be unchanged, got %q", redactedSentence)
+	}
+
+	// 3. RedactJSON with root_goal URL and email error must preserve valid JSON and redact URI secrets
+	rawJSON := `{"root_goal":"https://example.com","recent_errors":["contact: dev@example.com","failed postgres://admin:secret_pass@db:5432/prod"]}`
+	redactedJSON := RedactJSON(rawJSON)
+
+	var parsed struct {
+		RootGoal     string   `json:"root_goal"`
+		RecentErrors []string `json:"recent_errors"`
+	}
+	if err := json.Unmarshal([]byte(redactedJSON), &parsed); err != nil {
+		t.Fatalf("RedactJSON produced invalid JSON: %v, output: %s", err, redactedJSON)
+	}
+	if parsed.RootGoal != "https://example.com" {
+		t.Errorf("expected root_goal unchanged, got %q", parsed.RootGoal)
+	}
+	if len(parsed.RecentErrors) != 2 {
+		t.Fatalf("expected 2 recent errors, got %d", len(parsed.RecentErrors))
+	}
+	if parsed.RecentErrors[0] != "contact: dev@example.com" {
+		t.Errorf("expected email intact, got %q", parsed.RecentErrors[0])
+	}
+	if !strings.Contains(parsed.RecentErrors[1], "postgres://admin:[REDACTED]@db:5432/prod") {
+		t.Errorf("expected DB password to be redacted in recent errors, got %q", parsed.RecentErrors[1])
+	}
+
+	// 4. Test SaveSnapshot preserves tracker JSON validity through storage
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	sess := &SessionRecord{
+		ID:         "sess_json_snap",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Status:     StatusRunning,
+		Task:       "Test JSON snapshot safety",
+		Model:      "gpt-4o",
+		WorkingDir: "/test/workspace",
+	}
+	if err := store.CreateSession(ctx, sess); err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	snap := &SnapshotRecord{
+		SessionID:          sess.ID,
+		StepNumber:         1,
+		DistilledNarrative: "Narrative with https://example.com and dev@example.com",
+		StateTrackerJSON:   rawJSON,
+		CurrentTokens:      100,
+		CreatedAt:          now,
+	}
+	if err := store.SaveSnapshot(ctx, snap); err != nil {
+		t.Fatalf("SaveSnapshot failed: %v", err)
+	}
+
+	loadedSnap, err := store.GetLatestSnapshot(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("GetLatestSnapshot failed: %v", err)
+	}
+
+	var loadedData struct {
+		RootGoal     string   `json:"root_goal"`
+		RecentErrors []string `json:"recent_errors"`
+	}
+	if err := json.Unmarshal([]byte(loadedSnap.StateTrackerJSON), &loadedData); err != nil {
+		t.Fatalf("loaded snapshot contains invalid tracker JSON: %v, raw: %s", err, loadedSnap.StateTrackerJSON)
+	}
+	if loadedData.RootGoal != "https://example.com" {
+		t.Errorf("expected loaded root_goal %q, got %q", "https://example.com", loadedData.RootGoal)
+	}
+	if loadedData.RecentErrors[0] != "contact: dev@example.com" {
+		t.Errorf("expected loaded email intact, got %q", loadedData.RecentErrors[0])
 	}
 }

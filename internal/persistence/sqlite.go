@@ -479,7 +479,7 @@ func (s *SQLiteStore) CommitTurn(
 		redactedToolCalls[i] = ToolCallRecord{
 			ID:       tc.ID,
 			Name:     tc.Name,
-			Args:     RedactSecrets(tc.Args),
+			Args:     RedactJSON(tc.Args),
 			Result:   SanitizeToolOutput(tc.Result),
 			ExitCode: tc.ExitCode,
 		}
@@ -600,7 +600,7 @@ func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snapshot *SnapshotRecord
 	`
 
 	redactedNarrative := RedactSecrets(snapshot.DistilledNarrative)
-	redactedTracker := RedactSecrets(snapshot.StateTrackerJSON)
+	redactedTracker := RedactJSON(snapshot.StateTrackerJSON)
 	snapshot.DistilledNarrative = redactedNarrative
 	snapshot.StateTrackerJSON = redactedTracker
 

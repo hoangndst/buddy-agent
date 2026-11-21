@@ -472,7 +472,7 @@ func RedactSecrets(input string) string {
 		{regexp.MustCompile(`sk-[a-zA-Z0-9]{32,}`), "sk-[REDACTED]"},
 		{regexp.MustCompile(`AKIA[0-9A-Z]{16}`), "AKIA[REDACTED]"},
 		{regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`), "[PRIVATE KEY REDACTED]"},
-		{regexp.MustCompile(`://([^:]+):([^@]+)@`), "://$1:[REDACTED]@"},
+		{regexp.MustCompile(`://([^\s/:"'\\{},[\]]+):([^\s/@"'\\{},[\]]+)@`), "://$1:[REDACTED]@"},
 	}
 
 	out := input
