@@ -36,6 +36,9 @@ func TestSubagentTool_RoleGating(t *testing.T) {
 	reg.Register(&dummyTestTool{name: "create_skill"})
 	reg.Register(&dummyTestTool{name: "invoke_subagent"})
 	reg.Register(&dummyTestTool{name: "mcp_list_files"})
+	reg.Register(&dummyTestTool{name: "mcp_create_issue"})
+	reg.Register(&dummyTestTool{name: "mcp_write_data"})
+	reg.Register(&dummyTestTool{name: "mcp_unknown_action"})
 
 	subTool := NewInvokeSubagentTool(SubagentToolConfig{
 		Depth:          0,
@@ -50,7 +53,7 @@ func TestSubagentTool_RoleGating(t *testing.T) {
 	if _, ok := resReg.Get("mcp_list_files"); !ok {
 		t.Errorf("expected researcher to have mcp_list_files")
 	}
-	for _, forbidden := range []string{"bash", "write_file", "edit_file", "invoke_subagent", "save_memory", "create_skill"} {
+	for _, forbidden := range []string{"bash", "write_file", "edit_file", "invoke_subagent", "save_memory", "create_skill", "mcp_create_issue", "mcp_write_data", "mcp_unknown_action"} {
 		if _, ok := resReg.Get(forbidden); ok {
 			t.Errorf("researcher role MUST NOT have %q", forbidden)
 		}
@@ -58,7 +61,7 @@ func TestSubagentTool_RoleGating(t *testing.T) {
 
 	// 2. Test worker registry
 	workerReg := subTool.buildChildRegistry("worker")
-	for _, allowed := range []string{"read_file", "write_file", "edit_file", "bash", "mcp_list_files"} {
+	for _, allowed := range []string{"read_file", "write_file", "edit_file", "bash", "mcp_list_files", "mcp_create_issue", "mcp_write_data", "mcp_unknown_action"} {
 		if _, ok := workerReg.Get(allowed); !ok {
 			t.Errorf("worker expected to have %q", allowed)
 		}

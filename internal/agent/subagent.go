@@ -360,15 +360,59 @@ func (t *InvokeSubagentTool) buildChildRegistry(role string) *tools.Registry {
 			return false
 		}
 
-		// Researcher role is strictly read-only: no bash, no write, no edit
+		// Researcher role is strictly read-only:
+		// - Native tools: only read_file is allowed (no bash, write_file, edit_file)
+		// - MCP tools: only verified read-only inspection tools are allowed; mutating or unknown MCP tools are blocked
 		if role == "researcher" {
-			if name == "bash" || name == "write_file" || name == "edit_file" {
-				return false
+			if name == "read_file" {
+				return true
 			}
+			if strings.HasPrefix(name, "mcp_") {
+				return isReadOnlyMCPTool(name)
+			}
+			return false
 		}
 
 		return true
 	})
+}
+
+// isReadOnlyMCPTool validates whether an MCP tool is a safe read-only inspection tool.
+func isReadOnlyMCPTool(name string) bool {
+	// Standard built-in MCP resource inspection tools
+	if name == "mcp_list_resources" || name == "mcp_read_resource" {
+		return true
+	}
+	if !strings.HasPrefix(name, "mcp_") {
+		return false
+	}
+
+	lower := strings.ToLower(name)
+
+	// Block mutating actions immediately
+	mutatingKeywords := []string{
+		"create", "write", "edit", "update", "delete", "remove", "drop",
+		"insert", "post", "put", "patch", "modify", "exec", "execute",
+		"run", "apply", "set", "upload", "push", "kill", "restart",
+	}
+	for _, kw := range mutatingKeywords {
+		if strings.Contains(lower, kw) {
+			return false
+		}
+	}
+
+	// Must match recognized read-only query/inspection verbs
+	readOnlyKeywords := []string{
+		"read", "list", "get", "search", "fetch", "find", "query",
+		"inspect", "describe", "view", "show", "cat", "info", "status",
+	}
+	for _, kw := range readOnlyKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // buildSubagentSystemPrompt constructs a concise non-interactive prompt for subagents.
