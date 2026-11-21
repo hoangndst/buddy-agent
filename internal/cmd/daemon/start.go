@@ -209,7 +209,12 @@ func buildEngineForSession(
 	memMgr := memory.NewManager(wsDir)
 	reg := tools.NewRegistry(cfg.MaxOutputChars)
 
-	reg.Register(tools.NewBashTool(wsDir, 60*time.Second, tools.WithMaxOutputBytes(cfg.MaxOutputChars)))
+	var bashOpts []tools.BashToolOption
+	bashOpts = append(bashOpts, tools.WithMaxOutputBytes(cfg.MaxOutputChars))
+	if len(params.Env) > 0 {
+		bashOpts = append(bashOpts, tools.WithEnv(params.Env))
+	}
+	reg.Register(tools.NewBashTool(wsDir, 60*time.Second, bashOpts...))
 	reg.Register(tools.NewReadFileTool(wsDir))
 	reg.Register(tools.NewListDirectoryTool(wsDir))
 	reg.Register(tools.NewSearchFilesTool(wsDir))

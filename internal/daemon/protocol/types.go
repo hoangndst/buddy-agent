@@ -70,6 +70,7 @@ type SessionStartParams struct {
 	APIType          string      `json:"api_type,omitempty"`
 	MCPConfig        *mcp.Config `json:"mcp_config,omitempty"`
 	DBPath           string      `json:"db_path,omitempty"`
+	Env              []string    `json:"env,omitempty"`
 }
 
 // SessionStartResult returns the created session identifier.

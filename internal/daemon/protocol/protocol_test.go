@@ -21,6 +21,7 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 		APIType:          "responses",
 		ReasoningEffort:  &effort,
 		DBPath:           "/custom/path.db",
+		Env:              []string{"FOO=bar", "PATH=/custom/bin"},
 		MCPConfig: &mcp.Config{
 			MCPServers: map[string]mcp.ServerConfig{
 				"test-mcp": {
@@ -71,6 +72,9 @@ func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	}
 	if params.DBPath != "/custom/path.db" {
 		t.Fatalf("expected db path '/custom/path.db', got %q", params.DBPath)
+	}
+	if len(params.Env) != 2 || params.Env[0] != "FOO=bar" || params.Env[1] != "PATH=/custom/bin" {
+		t.Fatalf("expected env [FOO=bar PATH=/custom/bin], got %+v", params.Env)
 	}
 	if params.MCPConfig == nil || len(params.MCPConfig.MCPServers) != 1 {
 		t.Fatalf("expected mcp config with 1 server, got %+v", params.MCPConfig)

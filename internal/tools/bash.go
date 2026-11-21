@@ -31,12 +31,20 @@ func WithMaxOutputBytes(n int) BashToolOption {
 	}
 }
 
+// WithEnv sets the environment variables for the BashTool subprocess execution.
+func WithEnv(env []string) BashToolOption {
+	return func(b *BashTool) {
+		b.env = env
+	}
+}
+
 // BashTool executes shell commands in the agent's workspace.
 type BashTool struct {
 	workspace      string
 	timeout        time.Duration
 	maxOutputBytes int
 	runner         subprocess.Runner
+	env            []string
 }
 
 // NewBashTool creates a new BashTool with optional configuration options.
@@ -106,6 +114,7 @@ func (b *BashTool) Execute(ctx context.Context, raw json.RawMessage) (string, er
 		Dir:            b.workspace,
 		Timeout:        b.timeout,
 		MaxOutputBytes: runnerMaxBytes,
+		Env:            b.env,
 	})
 	if err != nil {
 		return "", fmt.Errorf("command execution failed: %w", err)

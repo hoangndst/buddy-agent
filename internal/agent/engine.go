@@ -185,6 +185,11 @@ func (e *Engine) LastExecutionResult() *ExecutionResult {
 	return e.lastExecutionResult
 }
 
+// Registry returns the tool registry configured for this engine.
+func (e *Engine) Registry() *tools.Registry {
+	return e.registry
+}
+
 // NewEngine creates a new Agent Engine.
 func NewEngine(
 	prov provider.ModelProvider,

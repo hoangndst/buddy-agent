@@ -19,6 +19,7 @@ type Factory struct {
 	MCPConfigLoader  func(projectDir, userHome string) (*mcp.Config, error)
 	WorkDir          func() (string, error)
 	UserHome         func() (string, error)
+	Environ          func() []string
 	NewClientManager func(cfg *mcp.Config) *mcp.ClientManager
 	NewModelProvider  func(cfg *config.Config, client *openai.Client) provider.ModelProvider
 	Store             func() (persistence.Store, func(), error)
@@ -33,6 +34,7 @@ func NewFactory() *Factory {
 		MCPConfigLoader: mcp.LoadConfig,
 		WorkDir:         os.Getwd,
 		UserHome:        os.UserHomeDir,
+		Environ:          os.Environ,
 		NewClientManager: func(cfg *mcp.Config) *mcp.ClientManager {
 			return mcp.NewClientManager(cfg)
 		},

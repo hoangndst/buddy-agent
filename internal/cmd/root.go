@@ -144,7 +144,16 @@ func setupEngine(ctx context.Context, f *cmdutil.Factory) (*agent.Engine, func()
 	memMgr := memory.NewManager(cfg.WorkspaceDir)
 	reg := tools.NewRegistry(cfg.MaxOutputChars)
 
-	reg.Register(tools.NewBashTool(cfg.WorkspaceDir, 60*time.Second, tools.WithMaxOutputBytes(cfg.MaxOutputChars)))
+	var callerEnv []string
+	if f.Environ != nil {
+		callerEnv = f.Environ()
+	}
+	var bashOpts []tools.BashToolOption
+	bashOpts = append(bashOpts, tools.WithMaxOutputBytes(cfg.MaxOutputChars))
+	if len(callerEnv) > 0 {
+		bashOpts = append(bashOpts, tools.WithEnv(callerEnv))
+	}
+	reg.Register(tools.NewBashTool(cfg.WorkspaceDir, 60*time.Second, bashOpts...))
 	reg.Register(tools.NewReadFileTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewListDirectoryTool(cfg.WorkspaceDir))
 	reg.Register(tools.NewSearchFilesTool(cfg.WorkspaceDir))
@@ -308,6 +317,10 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				home, _ := f.UserHome()
 				mcpCfg, _ = f.MCPConfigLoader(effectiveDir, home)
 			}
+			var callerEnv []string
+			if f.Environ != nil {
+				callerEnv = f.Environ()
+			}
 			sessionID, startErr := cl.StartSession(protocol.SessionStartParams{
 				Task:             task,
 				WorkspaceDir:     workspaceDir,
@@ -320,6 +333,7 @@ func runTask(ctx context.Context, f *cmdutil.Factory, args []string, standalone 
 				APIType:          apiType,
 				MCPConfig:        mcpCfg,
 				DBPath:           dbPath,
+				Env:              callerEnv,
 			})
 			if startErr != nil {
 				// Avoid ambiguous double-execution: if daemon connection succeeded but start failed, abort immediately

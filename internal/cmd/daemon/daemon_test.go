@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -442,5 +444,43 @@ func TestBuildEngineForSession_ExplicitDBPathForwarding(t *testing.T) {
 	}
 	if observedDBPath != customDB {
 		t.Errorf("expected observed DBPath %q, got %q", customDB, observedDBPath)
+	}
+}
+
+func TestBuildEngineForSession_CallerEnvironment(t *testing.T) {
+	tempDir := t.TempDir()
+	f := cmdutil.NewFactory()
+
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			Model:            "test-model",
+			WorkspaceDir:     tempDir,
+			MaxOutputChars:   10000,
+			MaxSteps:         10,
+			MaxContextTokens: 64000,
+		}, nil
+	}
+
+	params := protocol.SessionStartParams{
+		Task:         "echo caller environment",
+		WorkspaceDir: tempDir,
+		Env:          append(os.Environ(), "BUDDY_CALLER_ENV_TEST=custom_token_12345"),
+	}
+
+	eng, cleanup, err := buildEngineForSession(context.Background(), f, "sess_env_test", params, nil)
+	if err != nil {
+		t.Fatalf("buildEngineForSession failed: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	if eng.Registry() == nil {
+		t.Fatal("expected non-nil registry")
+	}
+
+	out := eng.Registry().Dispatch(context.Background(), "bash", json.RawMessage(`{"command": "echo $BUDDY_CALLER_ENV_TEST"}`))
+	if !strings.Contains(out, "custom_token_12345") {
+		t.Errorf("expected bash execution to contain custom_token_12345, got:\n%s", out)
 	}
 }
