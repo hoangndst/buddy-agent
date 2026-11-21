@@ -117,3 +117,62 @@ func TestResumeCommand(t *testing.T) {
 		t.Errorf("expected status completed, got %s", resumed.Status)
 	}
 }
+
+func TestResumeCommand_WorkspaceMismatch(t *testing.T) {
+	outBuf := &bytes.Buffer{}
+	errBuf := &bytes.Buffer{}
+	inBuf := &bytes.Buffer{}
+
+	streams := &cmdutil.IOStreams{
+		In:     inBuf,
+		Out:    outBuf,
+		ErrOut: errBuf,
+	}
+
+	dsn := fmt.Sprintf("file:memdb_resume_ws_%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", time.Now().UnixNano())
+	store, err := persistence.NewSQLiteStore(dsn)
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	sess := &persistence.SessionRecord{
+		ID:         "sess_other_ws",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Status:     persistence.StatusInterrupted,
+		Task:       "Task from another project",
+		Model:      "gpt-4o",
+		WorkingDir: "/other/workspace",
+		MaxSteps:   10,
+	}
+	_ = store.CreateSession(ctx, sess)
+
+	f := cmdutil.NewFactory()
+	f.IOStreams = streams
+	f.ConfigLoader = func() (*config.Config, error) {
+		return &config.Config{
+			WorkspaceDir: "/current/workspace",
+			Model:        "gpt-4o",
+			MaxSteps:     10,
+		}, nil
+	}
+	f.Store = func() (persistence.Store, func(), error) {
+		return store, func() {}, nil
+	}
+	f.NewModelProvider = func(_ *config.Config, _ *openai.Client) provider.ModelProvider {
+		return &mockProvider{content: "Should not execute"}
+	}
+
+	rootCmd := cmd.NewRootCmd(f)
+	rootCmd.SetArgs([]string{"resume", "sess_other_ws"})
+	err = rootCmd.ExecuteContext(ctx)
+	if err == nil {
+		t.Fatal("expected error due to workspace mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "working directory mismatch") {
+		t.Errorf("expected working directory mismatch error, got: %v", err)
+	}
+}

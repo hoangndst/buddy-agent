@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -118,7 +119,6 @@ type Engine struct {
 	eventHandler     EventHandler
 	store            persistence.Store
 	workspaceDir     string
-	cumulativeUsage  persistence.TokenUsage
 }
 
 // NewEngine creates a new Agent Engine.
@@ -167,8 +167,6 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		return "", errors.New("task cannot be empty")
 	}
 
-	e.cumulativeUsage = persistence.TokenUsage{}
-
 	// 1. Build initial system prompt from memory and skills
 	systemPrompt, err := e.memoryMgr.LoadSystemPrompt()
 	if err != nil {
@@ -203,24 +201,24 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		if errors.Is(err, history.ErrContextExhausted) {
 			e.eventHandler(Event{Type: EventContextExhausted, Step: 0, Error: err})
 			if e.store != nil {
-				_ = e.store.UpdateSessionStatus(context.Background(), sessionID, persistence.StatusFailed, 0, e.cumulativeUsage, err.Error())
+				_ = e.store.UpdateSessionStatus(context.Background(), sessionID, persistence.StatusFailed, 0, persistence.TokenUsage{}, err.Error())
 			}
 			return "", err
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			if e.store != nil {
-				_ = e.store.UpdateSessionStatus(context.Background(), sessionID, persistence.StatusInterrupted, 0, e.cumulativeUsage, "Process interrupted by signal or user")
+				_ = e.store.UpdateSessionStatus(context.Background(), sessionID, persistence.StatusInterrupted, 0, persistence.TokenUsage{}, "Process interrupted by signal or user")
 			}
 			return "", err
 		}
 		e.eventHandler(Event{Type: EventError, Step: 0, Error: err})
 		if e.store != nil {
-			_ = e.store.UpdateSessionStatus(context.Background(), sessionID, persistence.StatusFailed, 0, e.cumulativeUsage, err.Error())
+			_ = e.store.UpdateSessionStatus(context.Background(), sessionID, persistence.StatusFailed, 0, persistence.TokenUsage{}, err.Error())
 		}
 		return "", fmt.Errorf("initial context validation failed: %w", err)
 	}
 
-	return e.executeLoop(ctx, sessionID, session, 1, e.maxSteps)
+	return e.executeLoop(ctx, sessionID, session, 1, e.maxSteps, persistence.TokenUsage{})
 }
 
 // Resume restores an interrupted or failed session from persistence and continues execution.
@@ -236,6 +234,15 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 
 	if sessionRec.Status == persistence.StatusCompleted {
 		return "", persistence.ErrSessionCompleted
+	}
+
+	if e.workspaceDir != "" && sessionRec.WorkingDir != "" {
+		cleanCurrent, err1 := filepath.Abs(filepath.Clean(e.workspaceDir))
+		cleanRecorded, err2 := filepath.Abs(filepath.Clean(sessionRec.WorkingDir))
+		if err1 == nil && err2 == nil && cleanCurrent != cleanRecorded {
+			return "", fmt.Errorf("cannot resume session %q: working directory mismatch (session: %s, active workspace: %s)",
+				sessionID, sessionRec.WorkingDir, e.workspaceDir)
+		}
 	}
 
 	// 1. Build initial system prompt
@@ -307,14 +314,20 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 		totalMaxSteps = startStep + 10
 	}
 
-	e.cumulativeUsage = sessionRec.TokenUsage
-	_ = e.store.UpdateSessionStatus(ctx, sessionRec.ID, persistence.StatusRunning, startStep-1, e.cumulativeUsage, "")
+	_ = e.store.UpdateSessionStatus(ctx, sessionRec.ID, persistence.StatusRunning, startStep-1, sessionRec.TokenUsage, "")
 
-	return e.executeLoop(ctx, sessionRec.ID, session, startStep, totalMaxSteps)
+	return e.executeLoop(ctx, sessionRec.ID, session, startStep, totalMaxSteps, sessionRec.TokenUsage)
 }
 
-func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *history.Session, startStep, totalMaxSteps int) (string, error) {
+func (e *Engine) executeLoop(
+	ctx context.Context,
+	sessionID string,
+	session *history.Session,
+	startStep, totalMaxSteps int,
+	initialUsage persistence.TokenUsage,
+) (string, error) {
 	const maxTurnRetries = 2
+	cumulativeUsage := initialUsage
 
 	for step := startStep; step <= totalMaxSteps; step++ {
 		session.SetCurrentStep(step)
@@ -323,7 +336,7 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 			if e.store != nil && sessionID != "" {
 				shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				defer cancel()
-				_ = e.store.UpdateSessionStatus(shutdownCtx, sessionID, persistence.StatusInterrupted, step-1, e.cumulativeUsage, "Process interrupted by signal or user")
+				_ = e.store.UpdateSessionStatus(shutdownCtx, sessionID, persistence.StatusInterrupted, step-1, cumulativeUsage, "Process interrupted by signal or user")
 			}
 			return "", ctx.Err()
 		default:
@@ -354,10 +367,10 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 				if resp.Usage.PromptTokens > 0 {
 					session.CalibrateUsage(resp.Usage.PromptTokens)
 				}
-				e.cumulativeUsage.PromptTokens += resp.Usage.PromptTokens
-				e.cumulativeUsage.CompletionTokens += resp.Usage.CompletionTokens
-				e.cumulativeUsage.ReasoningTokens += resp.Usage.ReasoningTokens
-				e.cumulativeUsage.TotalTokens += resp.Usage.TotalTokens
+				cumulativeUsage.PromptTokens += resp.Usage.PromptTokens
+				cumulativeUsage.CompletionTokens += resp.Usage.CompletionTokens
+				cumulativeUsage.ReasoningTokens += resp.Usage.ReasoningTokens
+				cumulativeUsage.TotalTokens += resp.Usage.TotalTokens
 				genResp = resp
 				completionErr = nil
 				break
@@ -368,7 +381,7 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 			if !matched || retry == maxTurnRetries {
 				e.eventHandler(Event{Type: EventError, Step: step, Duration: callDuration, Error: err})
 				if e.store != nil && sessionID != "" {
-					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, e.cumulativeUsage, err.Error())
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
 				}
 				return "", fmt.Errorf("step %d LLM call failed: %w", step, err)
 			}
@@ -385,13 +398,13 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 				if errors.Is(err, history.ErrContextExhausted) {
 					e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
 					if e.store != nil && sessionID != "" {
-						_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, e.cumulativeUsage, err.Error())
+						_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
 					}
 					return "", err
 				}
 				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
 				if e.store != nil && sessionID != "" {
-					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, e.cumulativeUsage, err.Error())
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
 				}
 				return "", fmt.Errorf("downscale watermark failed: %w", err)
 			}
@@ -401,7 +414,7 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 				if errors.Is(err, history.ErrContextExhausted) {
 					e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
 					if e.store != nil && sessionID != "" {
-						_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, e.cumulativeUsage, err.Error())
+						_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
 					}
 					return "", err
 				}
@@ -410,7 +423,7 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 				}
 				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
 				if e.store != nil && sessionID != "" {
-					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, e.cumulativeUsage, err.Error())
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step-1, cumulativeUsage, err.Error())
 				}
 				return "", fmt.Errorf("force compaction failed: %w", err)
 			}
@@ -452,8 +465,8 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 					DurationMs: time.Since(stepStartTime).Milliseconds(),
 					CreatedAt:  time.Now().UTC(),
 				}
-				_ = e.store.CommitTurn(ctx, turnRec, step, e.cumulativeUsage)
-				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusCompleted, step, e.cumulativeUsage, "")
+				_ = e.store.CommitTurn(ctx, turnRec, step, cumulativeUsage)
+				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusCompleted, step, cumulativeUsage, "")
 			}
 			e.eventHandler(Event{
 				Type:      EventTextComplete,
@@ -597,7 +610,7 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 				DurationMs: time.Since(stepStartTime).Milliseconds(),
 				CreatedAt:  time.Now().UTC(),
 			}
-			_ = e.store.CommitTurn(ctx, turnRec, step, e.cumulativeUsage)
+			_ = e.store.CommitTurn(ctx, turnRec, step, cumulativeUsage)
 		}
 
 		// Watermark check: execute staged micro-pruning or macro-distillation
@@ -609,7 +622,7 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 			if errors.Is(err, history.ErrContextExhausted) {
 				e.eventHandler(Event{Type: EventContextExhausted, Step: step, Error: err})
 				if e.store != nil && sessionID != "" {
-					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step, e.cumulativeUsage, err.Error())
+					_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step, cumulativeUsage, err.Error())
 				}
 				return "", err
 			}
@@ -618,7 +631,7 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 			}
 			e.eventHandler(Event{Type: EventError, Step: step, Error: err})
 			if e.store != nil && sessionID != "" {
-				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step, e.cumulativeUsage, err.Error())
+				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, step, cumulativeUsage, err.Error())
 			}
 			return "", fmt.Errorf("context compaction failed: %w", err)
 		}
@@ -641,7 +654,7 @@ func (e *Engine) executeLoop(ctx context.Context, sessionID string, session *his
 
 	maxStepErr := fmt.Errorf("reached maximum step budget (%d) without finishing", totalMaxSteps)
 	if e.store != nil && sessionID != "" {
-		_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, totalMaxSteps, e.cumulativeUsage, maxStepErr.Error())
+		_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, totalMaxSteps, cumulativeUsage, maxStepErr.Error())
 	}
 	e.eventHandler(Event{Type: EventError, Error: maxStepErr})
 	return "", maxStepErr

@@ -39,10 +39,12 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 			return nil, fmt.Errorf("failed to create database directory: %w", err)
 		}
 
-		// Ensure .buddy/.gitignore exists to prevent accidental Git commits
-		gitignorePath := filepath.Join(dbDir, ".gitignore")
-		if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
-			_ = os.WriteFile(gitignorePath, []byte("*\n"), 0644)
+		// Ensure .buddy/.gitignore exists only within the dedicated .buddy directory
+		if filepath.Base(dbDir) == ".buddy" {
+			gitignorePath := filepath.Join(dbDir, ".gitignore")
+			if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
+				_ = os.WriteFile(gitignorePath, []byte("*\n"), 0644)
+			}
 		}
 
 		// Pre-create file with 0600 mode

@@ -23,7 +23,7 @@ func CheckOrQuarantine(dbPath string) error {
 	}
 
 	// Open raw connection to run quick_check
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(1000)&_pragma=query_only(ON)", dbPath)
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=query_only(ON)", dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("failed to open database %s: %w", dbPath, err)
@@ -41,6 +41,10 @@ func CheckOrQuarantine(dbPath string) error {
 		return fmt.Errorf("database quick_check operational error: %w", err)
 	}
 	if result != "ok" {
+		resLower := strings.ToLower(result)
+		if strings.Contains(resLower, "lock") || strings.Contains(resLower, "busy") || strings.Contains(resLower, "timeout") {
+			return fmt.Errorf("database is temporarily locked: %s", result)
+		}
 		_ = db.Close()
 		return quarantineFiles(dbPath)
 	}
