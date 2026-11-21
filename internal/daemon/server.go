@@ -62,6 +62,25 @@ func (c *clientConnection) Send(msg *protocol.JSONRPCMessage) error {
 	}
 }
 
+func (c *clientConnection) SendWithTimeout(msg *protocol.JSONRPCMessage, timeout time.Duration) error {
+	c.outboundMu.RLock()
+	defer c.outboundMu.RUnlock()
+
+	if c.closed.Load() {
+		return fmt.Errorf("connection closed")
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case c.outbound <- msg:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("client outbound buffer timed out after %v", timeout)
+	}
+}
+
 func (c *clientConnection) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
 		c.outboundMu.Lock()
@@ -128,7 +147,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		id:         generateClientID(),
 		conn:       conn,
 		codec:      protocol.NewStreamCodec(conn, conn),
-		outbound:   make(chan *protocol.JSONRPCMessage, 256),
+		outbound:   make(chan *protocol.JSONRPCMessage, 1024),
 		server:     s,
 		activeSess: make(map[string]*SessionWorker),
 	}

@@ -314,21 +314,25 @@ func streamClientEvents(ctx context.Context, f *cmdutil.Factory, cl *client.Clie
 	defer signal.Stop(sigCh)
 
 	inputScanner := bufio.NewScanner(f.IOStreams.In)
+	permCh := cl.Permissions()
+	eventsCh := cl.Events()
 
 	for {
 		select {
-		case <-ctx.Done():
-			_ = cl.CancelSession(sessionID)
-			return ctx.Err()
-
 		case <-sigCh:
 			_, _ = fmt.Fprintf(f.IOStreams.Out, "\nDetaching from session %s. Task continues in background.\nRun 'buddy attach %s' to reconnect.\n", sessionID, sessionID)
 			_ = cl.DetachSession(sessionID)
 			return nil
 
-		case req, ok := <-cl.Permissions():
+		case <-ctx.Done():
+			_, _ = fmt.Fprintf(f.IOStreams.Out, "\nDetaching from session %s. Task continues in background.\nRun 'buddy attach %s' to reconnect.\n", sessionID, sessionID)
+			_ = cl.DetachSession(sessionID)
+			return nil
+
+		case req, ok := <-permCh:
 			if !ok {
-				return nil
+				permCh = nil
+				continue
 			}
 			_, _ = fmt.Fprintf(f.IOStreams.Out, "\n%s Tool %s requests permission with arguments: %+v\nAllow? [y/N]: ",
 				toolStyle.Render("⚡ [PERMISSION REQUIRED]"), req.Tool, req.Arguments)
@@ -341,9 +345,9 @@ func streamClientEvents(ctx context.Context, f *cmdutil.Factory, cl *client.Clie
 			}
 			_ = cl.RespondPermission(req.RequestID, decision)
 
-		case evt, ok := <-cl.Events():
+		case evt, ok := <-eventsCh:
 			if !ok {
-				return nil
+				return fmt.Errorf("connection to daemon closed unexpectedly before session completed")
 			}
 			renderEvent(f, evt)
 			if evt.Type == string(agent.EventFinished) {

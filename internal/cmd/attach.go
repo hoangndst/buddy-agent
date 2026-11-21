@@ -53,6 +53,8 @@ func NewCmdAttach(f *cmdutil.Factory) *cobra.Command {
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 			inputScanner := bufio.NewScanner(f.IOStreams.In)
+			permCh := cl.Permissions()
+			eventsCh := cl.Events()
 
 			for {
 				select {
@@ -61,9 +63,10 @@ func NewCmdAttach(f *cmdutil.Factory) *cobra.Command {
 					_ = cl.DetachSession(sessionID)
 					return nil
 
-				case req, ok := <-cl.Permissions():
+				case req, ok := <-permCh:
 					if !ok {
-						return nil
+						permCh = nil
+						continue
 					}
 					_, _ = fmt.Fprintf(f.IOStreams.Out, "\n%s Tool %s requests permission with arguments: %+v\nAllow? [y/N]: ",
 						toolStyle.Render("⚡ [PERMISSION REQUIRED]"), req.Tool, req.Arguments)
@@ -76,9 +79,9 @@ func NewCmdAttach(f *cmdutil.Factory) *cobra.Command {
 					}
 					_ = cl.RespondPermission(req.RequestID, decision)
 
-				case evt, ok := <-cl.Events():
+				case evt, ok := <-eventsCh:
 					if !ok {
-						return nil
+						return fmt.Errorf("connection to daemon closed unexpectedly before session completed")
 					}
 					renderEvent(f, evt)
 					if evt.Type == string(agent.EventFinished) {

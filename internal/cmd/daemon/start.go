@@ -158,9 +158,8 @@ func buildEngineForSession(
 
 	var cleanups []func()
 
-	wd, _ := f.WorkDir()
 	home, _ := f.UserHome()
-	mcpCfg, mcpErr := f.MCPConfigLoader(wd, home)
+	mcpCfg, mcpErr := f.MCPConfigLoader(wsDir, home)
 	if mcpErr == nil && mcpCfg != nil && len(mcpCfg.MCPServers) > 0 {
 		mcpMgr := f.NewClientManager(mcpCfg)
 		_ = mcpMgr.StartAll(ctx)
@@ -187,21 +186,6 @@ func buildEngineForSession(
 		}
 	}
 
-	subTool := agent.NewInvokeSubagentTool(agent.SubagentToolConfig{
-		Depth:            0,
-		ParentSessionID:  sessionID,
-		ParentRegistry:   reg,
-		Provider:         prov,
-		Model:            cfg.Model,
-		WorkspaceDir:     wsDir,
-		ReasoningEffort:  cfg.ReasoningEffort,
-		Store:            store,
-		EventHandler:     emitHandler,
-		IsLocal:          cfg.IsLocal,
-		MaxContextTokens: cfg.MaxContextTokens,
-	})
-	reg.Register(subTool)
-
 	model := cfg.Model
 	if params.Model != "" {
 		model = params.Model
@@ -214,6 +198,21 @@ func buildEngineForSession(
 	if params.ReasoningEffort != "" {
 		effort = params.ReasoningEffort
 	}
+
+	subTool := agent.NewInvokeSubagentTool(agent.SubagentToolConfig{
+		Depth:            0,
+		ParentSessionID:  sessionID,
+		ParentRegistry:   reg,
+		Provider:         prov,
+		Model:            model,
+		WorkspaceDir:     wsDir,
+		ReasoningEffort:  effort,
+		Store:            store,
+		EventHandler:     emitHandler,
+		IsLocal:          cfg.IsLocal,
+		MaxContextTokens: cfg.MaxContextTokens,
+	})
+	reg.Register(subTool)
 
 	eng := agent.NewEngine(
 		prov,

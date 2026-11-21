@@ -14,6 +14,7 @@ import (
 type ClientConn interface {
 	ID() string
 	Send(msg *protocol.JSONRPCMessage) error
+	SendWithTimeout(msg *protocol.JSONRPCMessage, timeout time.Duration) error
 	Close() error
 }
 
@@ -201,7 +202,7 @@ func (w *SessionWorker) Attach(conn ClientConn, lastEventID uint64, takeControl 
 		if err != nil {
 			continue
 		}
-		if err := conn.Send(notify); err != nil {
+		if err := conn.SendWithTimeout(notify, 1*time.Second); err != nil {
 			w.Detach(conn)
 			return role, err
 		}
