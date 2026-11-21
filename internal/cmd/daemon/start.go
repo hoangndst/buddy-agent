@@ -133,6 +133,44 @@ func buildEngineForSession(
 		isLocal = config.IsLocalEndpoint(baseURL)
 	}
 
+	model := cfg.Model
+	if params.Model != "" {
+		model = params.Model
+	}
+	maxSteps := cfg.MaxSteps
+	if params.MaxSteps > 0 {
+		maxSteps = params.MaxSteps
+	}
+	effort := cfg.ReasoningEffort
+	if params.ReasoningEffort != "" {
+		effort = params.ReasoningEffort
+	}
+	maxCtx := cfg.MaxContextTokens
+	if params.MaxContextTokens > 0 {
+		maxCtx = params.MaxContextTokens
+	} else if params.BaseURL != "" && isLocal != cfg.IsLocal {
+		if isLocal {
+			maxCtx = config.DefaultLocalContextTokens
+		} else {
+			maxCtx = config.DefaultRemoteContextTokens
+		}
+	}
+
+	wsDir := cfg.WorkspaceDir
+	if params.WorkspaceDir != "" {
+		wsDir = params.WorkspaceDir
+	}
+
+	sessionCfg := *cfg
+	sessionCfg.APIKey = apiKey
+	sessionCfg.BaseURL = baseURL
+	sessionCfg.IsLocal = isLocal
+	sessionCfg.Model = model
+	sessionCfg.MaxSteps = maxSteps
+	sessionCfg.ReasoningEffort = effort
+	sessionCfg.MaxContextTokens = maxCtx
+	sessionCfg.WorkspaceDir = wsDir
+
 	opts := []option.RequestOption{
 		option.WithAPIKey(apiKey),
 		option.WithRequestTimeout(120 * time.Second),
@@ -144,18 +182,13 @@ func buildEngineForSession(
 
 	var prov provider.ModelProvider
 	if f.NewModelProvider != nil {
-		prov = f.NewModelProvider(cfg, &llmClient)
+		prov = f.NewModelProvider(&sessionCfg, &llmClient)
 	} else {
 		prov = provider.NewAutoProvider(
 			provider.NewChatCompletionsProvider(&llmClient),
 			provider.NewResponsesProvider(&llmClient),
 			isLocal,
 		)
-	}
-
-	wsDir := cfg.WorkspaceDir
-	if params.WorkspaceDir != "" {
-		wsDir = params.WorkspaceDir
 	}
 
 	memMgr := memory.NewManager(wsDir)
@@ -213,29 +246,6 @@ func buildEngineForSession(
 					closer()
 				})
 			}
-		}
-	}
-
-	model := cfg.Model
-	if params.Model != "" {
-		model = params.Model
-	}
-	maxSteps := cfg.MaxSteps
-	if params.MaxSteps > 0 {
-		maxSteps = params.MaxSteps
-	}
-	effort := cfg.ReasoningEffort
-	if params.ReasoningEffort != "" {
-		effort = params.ReasoningEffort
-	}
-	maxCtx := cfg.MaxContextTokens
-	if params.MaxContextTokens > 0 {
-		maxCtx = params.MaxContextTokens
-	} else if params.BaseURL != "" && isLocal != cfg.IsLocal {
-		if isLocal {
-			maxCtx = config.DefaultLocalContextTokens
-		} else {
-			maxCtx = config.DefaultRemoteContextTokens
 		}
 	}
 
