@@ -44,17 +44,20 @@ type TokenUsage struct {
 
 // SessionRecord stores lifecycle metadata and token totals for an execution session.
 type SessionRecord struct {
-	ID           string        `json:"id"`
-	CreatedAt    time.Time     `json:"created_at"`
-	UpdatedAt    time.Time     `json:"updated_at"`
-	Status       SessionStatus `json:"status"`
-	Task         string        `json:"task"`
-	Model        string        `json:"model"`
-	WorkingDir   string        `json:"working_dir"`
-	MaxSteps     int           `json:"max_steps"`
-	TotalSteps   int           `json:"total_steps"`
-	TokenUsage   TokenUsage    `json:"usage"`
-	ErrorMessage *string       `json:"error_message,omitempty"`
+	ID              string        `json:"id"`
+	CreatedAt       time.Time     `json:"created_at"`
+	UpdatedAt       time.Time     `json:"updated_at"`
+	Status          SessionStatus `json:"status"`
+	Task            string        `json:"task"`
+	Model           string        `json:"model"`
+	WorkingDir      string        `json:"working_dir"`
+	MaxSteps        int           `json:"max_steps"`
+	TotalSteps      int           `json:"total_steps"`
+	TokenUsage      TokenUsage    `json:"usage"`
+	ErrorMessage    *string       `json:"error_message,omitempty"`
+	ParentSessionID *string       `json:"parent_session_id,omitempty"`
+	Role            string        `json:"role"`
+	Depth           int           `json:"depth"`
 }
 
 // ToolCallRecord captures an individual tool invocation and its execution result.
@@ -102,6 +105,9 @@ type Store interface {
 	GetSession(ctx context.Context, idOrPrefix string) (*SessionRecord, error)
 	GetLatestResumableSession(ctx context.Context, workingDir string) (*SessionRecord, error)
 	ListSessions(ctx context.Context, workingDir string, limit int) ([]*SessionRecord, error)
+	ListAllSessions(ctx context.Context, workingDir string, limit int) ([]*SessionRecord, error)
+	GetChildSessions(ctx context.Context, parentID string) ([]*SessionRecord, error)
+	IncrementSessionTokens(ctx context.Context, sessionID string, usage TokenUsage) error
 	UpdateSessionStatus(ctx context.Context, id string, status SessionStatus, steps int, usage TokenUsage, errMsg string) error
 	PruneSessions(ctx context.Context, olderThan time.Duration, keepMax int) (int64, error)
 

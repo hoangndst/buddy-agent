@@ -6,12 +6,14 @@ import (
 	"text/tabwriter"
 
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/spf13/cobra"
 )
 
 // NewCmdList creates the session list subcommand.
 func NewCmdList(f *cmdutil.Factory) *cobra.Command {
 	var limit int
+	var all bool
 	cmd := &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"ls"},
@@ -32,7 +34,12 @@ func NewCmdList(f *cmdutil.Factory) *cobra.Command {
 				workDir = cfg.WorkspaceDir
 			}
 
-			sessions, err := store.ListSessions(c.Context(), workDir, limit)
+			var sessions []*persistence.SessionRecord
+			if all {
+				sessions, err = store.ListAllSessions(c.Context(), workDir, limit)
+			} else {
+				sessions, err = store.ListSessions(c.Context(), workDir, limit)
+			}
 			if err != nil {
 				return fmt.Errorf("failed to list sessions: %w", err)
 			}
@@ -62,5 +69,6 @@ func NewCmdList(f *cmdutil.Factory) *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVarP(&limit, "limit", "n", 20, "Maximum number of sessions to display")
+	cmd.Flags().BoolVar(&all, "all", false, "Include child subagent sessions in the listing")
 	return cmd
 }

@@ -75,6 +75,41 @@ func WithCompletionClient(client history.CompletionClient) EngineOption {
 	}
 }
 
+// WithDepth sets the execution depth of the engine (0 for root, 1 for subagent).
+func WithDepth(depth int) EngineOption {
+	return func(e *Engine) {
+		e.depth = depth
+	}
+}
+
+// WithParentSessionID sets the parent session ID for hierarchical persistence.
+func WithParentSessionID(id string) EngineOption {
+	return func(e *Engine) {
+		e.parentSessionID = id
+	}
+}
+
+// WithRole sets the operational role of the engine (root, researcher, worker).
+func WithRole(role string) EngineOption {
+	return func(e *Engine) {
+		e.role = role
+	}
+}
+
+// WithSystemPromptOverride configures a dedicated system prompt, bypassing MemoryManager.
+func WithSystemPromptOverride(prompt string) EngineOption {
+	return func(e *Engine) {
+		e.systemPromptOverride = prompt
+	}
+}
+
+// WithInheritedInvariants injects parent project invariants into child state tracking.
+func WithInheritedInvariants(invariants []string) EngineOption {
+	return func(e *Engine) {
+		e.inheritedInvariants = invariants
+	}
+}
+
 // providerCompletionAdapter bridges a ModelProvider to history.CompletionClient.
 type providerCompletionAdapter struct {
 	prov  provider.ModelProvider
@@ -104,21 +139,41 @@ func (a *providerCompletionAdapter) CreateChatCompletion(ctx context.Context, pa
 	}, nil
 }
 
+// ExecutionResult captures post-execution metrics and state changes from an engine run.
+type ExecutionResult struct {
+	SessionID     string
+	Status        persistence.SessionStatus
+	Summary       string
+	ModifiedFiles map[string]history.FileRecord
+	TokenUsage    persistence.TokenUsage
+}
+
 // Engine orchestrates the ReAct loop: prompting, tool execution, and memory feedback.
 type Engine struct {
-	provider         provider.ModelProvider
-	compClient       history.CompletionClient
-	model            string
-	reasoningEffort  string
-	maxSteps         int
-	maxContextTokens int
-	workingTailSize  int
-	isLocal          bool
-	registry         *tools.Registry
-	memoryMgr        *memory.Manager
-	eventHandler     EventHandler
-	store            persistence.Store
-	workspaceDir     string
+	provider             provider.ModelProvider
+	compClient           history.CompletionClient
+	model                string
+	reasoningEffort      string
+	maxSteps             int
+	maxContextTokens     int
+	workingTailSize      int
+	isLocal              bool
+	registry             *tools.Registry
+	memoryMgr            *memory.Manager
+	eventHandler         EventHandler
+	store                persistence.Store
+	workspaceDir         string
+	depth                int
+	parentSessionID      string
+	role                 string
+	systemPromptOverride string
+	inheritedInvariants  []string
+	lastExecutionResult  *ExecutionResult
+}
+
+// LastExecutionResult returns the execution result from the most recent Run invocation.
+func (e *Engine) LastExecutionResult() *ExecutionResult {
+	return e.lastExecutionResult
 }
 
 // NewEngine creates a new Agent Engine.
@@ -167,10 +222,16 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		return "", errors.New("task cannot be empty")
 	}
 
-	// 1. Build initial system prompt from memory and skills
-	systemPrompt, err := e.memoryMgr.LoadSystemPrompt()
-	if err != nil {
-		return "", fmt.Errorf("failed to load system prompt: %w", err)
+	// 1. Build initial system prompt from memory and skills or override
+	var systemPrompt string
+	if e.systemPromptOverride != "" {
+		systemPrompt = e.systemPromptOverride
+	} else if e.memoryMgr != nil {
+		var err error
+		systemPrompt, err = e.memoryMgr.LoadSystemPrompt()
+		if err != nil {
+			return "", fmt.Errorf("failed to load system prompt: %w", err)
+		}
 	}
 
 	session := history.NewSession(
@@ -179,9 +240,33 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		history.WithMaxContextTokens(e.maxContextTokens),
 		history.WithWorkingTailSize(e.workingTailSize),
 	)
+	if len(e.inheritedInvariants) > 0 {
+		for _, inv := range e.inheritedInvariants {
+			session.Tracker().AddInvariant(inv)
+		}
+	}
 
 	sessionID := generateSessionID()
+	if e.registry != nil {
+		if t, ok := e.registry.Get("invoke_subagent"); ok {
+			if subTool, ok := t.(interface {
+				SetParentSessionID(string)
+				SetParentTracker(*history.StateTracker)
+			}); ok {
+				subTool.SetParentSessionID(sessionID)
+				subTool.SetParentTracker(session.Tracker())
+			}
+		}
+	}
 	if e.store != nil {
+		role := e.role
+		if role == "" {
+			if e.depth == 0 {
+				role = "root"
+			} else {
+				role = "subagent"
+			}
+		}
 		sessRec := &persistence.SessionRecord{
 			ID:         sessionID,
 			CreatedAt:  time.Now().UTC(),
@@ -192,6 +277,11 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 			WorkingDir: e.workspaceDir,
 			MaxSteps:   e.maxSteps,
 			TotalSteps: 0,
+			Role:       role,
+			Depth:      e.depth,
+		}
+		if e.parentSessionID != "" {
+			sessRec.ParentSessionID = &e.parentSessionID
 		}
 		_ = e.store.CreateSession(context.Background(), sessRec)
 	}
@@ -321,6 +411,18 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 		return "", fmt.Errorf("failed to restore history session: %w", err)
 	}
 
+	if e.registry != nil {
+		if t, ok := e.registry.Get("invoke_subagent"); ok {
+			if subTool, ok := t.(interface {
+				SetParentSessionID(string)
+				SetParentTracker(*history.StateTracker)
+			}); ok {
+				subTool.SetParentSessionID(sessionRec.ID)
+				subTool.SetParentTracker(session.Tracker())
+			}
+		}
+	}
+
 	maxStep := 0
 	allTurns, _ := e.store.GetAllTurns(ctx, sessionRec.ID)
 	for _, t := range allTurns {
@@ -422,6 +524,18 @@ func (e *Engine) executeLoop(
 			}
 
 			completionErr = err
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if e.store != nil && sessionID != "" {
+					status := persistence.StatusInterrupted
+					errMsg := "Process interrupted by signal or user"
+					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+						status = persistence.StatusFailed
+						errMsg = "Execution timeout reached"
+					}
+					_ = e.store.UpdateSessionStatus(context.Background(), sessionID, status, step-1, cumulativeUsage, errMsg)
+				}
+				return "", err
+			}
 			targetTokens, matched := ParseContextLengthError(err)
 			if !matched || retry == maxTurnRetries {
 				e.eventHandler(Event{Type: EventError, Step: step, Duration: callDuration, Error: err})
@@ -529,6 +643,13 @@ func (e *Engine) executeLoop(
 				Protocol:  genResp.Protocol,
 				Usage:     genResp.Usage,
 			})
+			e.lastExecutionResult = &ExecutionResult{
+				SessionID:     sessionID,
+				Status:        persistence.StatusCompleted,
+				Summary:       genResp.Content,
+				ModifiedFiles: session.Tracker().ExportData().ModifiedFiles,
+				TokenUsage:    cumulativeUsage,
+			}
 			return genResp.Content, nil
 		}
 
@@ -708,9 +829,66 @@ func (e *Engine) executeLoop(
 		}
 	}
 
+	// Reserve-Step Budget Exhaustion Synthesis:
+	// For subagents (depth > 0), if maximum step budget is exhausted without finishing,
+	// make a forced non-tool attempt to synthesize findings so the parent receives analytical output.
+	if e.depth > 0 && e.provider != nil {
+		synthesisPrompt := "You have reached your maximum step budget. Do not call any tools. Provide a concise, complete synthesis of your findings, touched files, and any unresolved blockers based on your execution so far."
+		msgs := append(session.CompileMessages(), openai.UserMessage(synthesisPrompt))
+
+		genReq := provider.GenerateRequest{
+			Model:           e.model,
+			Messages:        msgs,
+			Tools:           nil, // No tools allowed during emergency synthesis
+			ReasoningEffort: e.reasoningEffort,
+		}
+		synthResp, err := e.provider.Generate(ctx, genReq)
+		if err == nil && synthResp.Content != "" {
+			cumulativeUsage.PromptTokens += synthResp.Usage.PromptTokens
+			cumulativeUsage.CompletionTokens += synthResp.Usage.CompletionTokens
+			cumulativeUsage.ReasoningTokens += synthResp.Usage.ReasoningTokens
+			cumulativeUsage.TotalTokens += synthResp.Usage.TotalTokens
+
+			synthStep := totalMaxSteps + 1
+			if e.store != nil && sessionID != "" {
+				turnRec := &persistence.TurnRecord{
+					SessionID:  sessionID,
+					StepNumber: synthStep,
+					Role:       "assistant",
+					Content:    synthResp.Content,
+					TokenUsage: persistence.TokenUsage{
+						PromptTokens:     synthResp.Usage.PromptTokens,
+						CompletionTokens: synthResp.Usage.CompletionTokens,
+						ReasoningTokens:  synthResp.Usage.ReasoningTokens,
+						TotalTokens:      synthResp.Usage.TotalTokens,
+					},
+					DurationMs: 0,
+					CreatedAt:  time.Now().UTC(),
+				}
+				_ = e.store.CommitTurn(ctx, turnRec, synthStep, cumulativeUsage)
+				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, synthStep, cumulativeUsage, "maximum step budget reached (synthesized)")
+			}
+			e.lastExecutionResult = &ExecutionResult{
+				SessionID:     sessionID,
+				Status:        persistence.StatusFailed,
+				Summary:       synthResp.Content,
+				ModifiedFiles: session.Tracker().ExportData().ModifiedFiles,
+				TokenUsage:    cumulativeUsage,
+			}
+			return fmt.Sprintf("[Subagent: budget_exhausted] %s", synthResp.Content), nil
+		}
+	}
+
 	maxStepErr := fmt.Errorf("reached maximum step budget (%d) without finishing", totalMaxSteps)
 	if e.store != nil && sessionID != "" {
 		_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, totalMaxSteps, cumulativeUsage, maxStepErr.Error())
+	}
+	e.lastExecutionResult = &ExecutionResult{
+		SessionID:     sessionID,
+		Status:        persistence.StatusFailed,
+		Summary:       maxStepErr.Error(),
+		ModifiedFiles: session.Tracker().ExportData().ModifiedFiles,
+		TokenUsage:    cumulativeUsage,
 	}
 	e.eventHandler(Event{Type: EventError, Error: maxStepErr})
 	return "", maxStepErr
