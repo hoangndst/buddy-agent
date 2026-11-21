@@ -180,6 +180,7 @@ func (w *SessionWorker) emitEvent(evt agent.Event, terminal bool) {
 	for _, conn := range subs {
 		if sendErr := conn.Send(notify); sendErr != nil {
 			w.Detach(conn)
+			_ = conn.Close()
 		}
 	}
 }
@@ -187,15 +188,16 @@ func (w *SessionWorker) emitEvent(evt agent.Event, terminal bool) {
 // Attach registers a client connection, replays missed events, and returns assigned role.
 func (w *SessionWorker) Attach(conn ClientConn, lastEventID uint64, takeControl bool) (string, error) {
 	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	role := "observer"
 	if takeControl || w.controller == nil {
 		w.controller = conn
 		role = "controller"
 	}
-	w.subscribers[conn] = struct{}{}
-	w.mu.Unlock()
 
-	// Replay buffered events after lastEventID
+	// Replay buffered events before registering to live subscribers,
+	// holding mutex so no new live events can overtake replay history
 	missed := w.ringBuffer.ReplayAfter(lastEventID)
 	for _, item := range missed {
 		notify, err := createEventNotification(w.sessionID, item.EventID, item.Event, item.Terminal)
@@ -203,10 +205,13 @@ func (w *SessionWorker) Attach(conn ClientConn, lastEventID uint64, takeControl 
 			continue
 		}
 		if err := conn.SendWithTimeout(notify, 1*time.Second); err != nil {
-			w.Detach(conn)
+			_ = conn.Close()
 			return role, err
 		}
 	}
+
+	// Register to live subscribers only AFTER all historical events have been enqueued
+	w.subscribers[conn] = struct{}{}
 
 	return role, nil
 }
