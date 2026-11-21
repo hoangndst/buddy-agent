@@ -396,6 +396,20 @@ func TestListDirectoryAndSearchFiles(t *testing.T) {
 		t.Errorf("expected search in .github to find ci.yml match, got:\n%s", dotSearchRes)
 	}
 
+	// Test SearchFilesTool on file with line > 64KiB (exceeds default bufio.Scanner buffer)
+	longLineFile := filepath.Join(tempDir, "minified.json")
+	longContent := `{"data":"` + strings.Repeat("a", 100*1024) + `","targetKey":"targetValue"}` + "\n"
+	if err := os.WriteFile(longLineFile, []byte(longContent), 0644); err != nil {
+		t.Fatalf("failed to write long line file: %v", err)
+	}
+	longSearchRes, err := searchTool.Execute(ctx, json.RawMessage(`{"query": "targetKey"}`))
+	if err != nil {
+		t.Fatalf("search in long line file failed: %v", err)
+	}
+	if !strings.Contains(longSearchRes, "minified.json:1:") || !strings.Contains(longSearchRes, "targetKey") {
+		t.Errorf("expected search to find match in >64KB line, got:\n%s", longSearchRes)
+	}
+
 	// 3. Test ReadFileTool on directory returns helpful guidance
 	readTool := NewReadFileTool(tempDir)
 	readDirRes, err := readTool.Execute(ctx, json.RawMessage(`{"path": "pkg"}`))

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 // ReadFileTool reads files with line-range pagination.
@@ -456,17 +457,26 @@ func (s *SearchFilesTool) Execute(_ context.Context, raw json.RawMessage) (strin
 		}
 		defer func() { _ = f.Close() }()
 
-		scanner := bufio.NewScanner(f)
+		reader := bufio.NewReader(f)
 		lineNum := 0
-		for scanner.Scan() {
-			lineNum++
-			line := scanner.Text()
-			if strings.Contains(line, input.Query) {
-				sb.WriteString(fmt.Sprintf("%s:%d: %s\n", relPath, lineNum, strings.TrimSpace(line)))
-				count++
-				if count >= maxResults {
-					return nil
+		for {
+			line, readErr := reader.ReadString('\n')
+			if len(line) > 0 {
+				lineNum++
+				if strings.Contains(line, input.Query) {
+					snippet := extractSnippet(line, input.Query, 300)
+					sb.WriteString(fmt.Sprintf("%s:%d: %s\n", relPath, lineNum, snippet))
+					count++
+					if count >= maxResults {
+						return nil
+					}
 				}
+			}
+			if readErr != nil {
+				if errors.Is(readErr, io.EOF) {
+					break
+				}
+				return fmt.Errorf("reading %s: %w", relPath, readErr)
 			}
 		}
 		return nil
@@ -479,6 +489,46 @@ func (s *SearchFilesTool) Execute(_ context.Context, raw json.RawMessage) (strin
 		return fmt.Sprintf("No matches found for %q in %s", input.Query, input.Path), nil
 	}
 	return sb.String(), nil
+}
+
+// extractSnippet extracts a contextual snippet around query from a line, preserving UTF-8 integrity.
+func extractSnippet(line, query string, maxContext int) string {
+	idx := strings.Index(line, query)
+	if idx < 0 {
+		return ""
+	}
+	if len(line) <= maxContext {
+		return strings.TrimSpace(line)
+	}
+
+	start := idx - maxContext/2
+	if start < 0 {
+		start = 0
+	} else {
+		for start < len(line) && !utf8.RuneStart(line[start]) {
+			start++
+		}
+	}
+
+	end := idx + len(query) + maxContext/2
+	if end >= len(line) {
+		end = len(line)
+	} else {
+		for end < len(line) && !utf8.RuneStart(line[end]) {
+			end++
+		}
+	}
+
+	snippet := strings.TrimSpace(line[start:end])
+	prefix := ""
+	if start > 0 {
+		prefix = "..."
+	}
+	suffix := ""
+	if end < len(line) {
+		suffix = "..."
+	}
+	return prefix + snippet + suffix
 }
 
 // resolvePath canonicalizes target path and ensures it stays strictly within the workspace.
