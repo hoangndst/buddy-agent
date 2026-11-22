@@ -596,10 +596,12 @@ func TestConversationTUIMarkdownTableTruncation(t *testing.T) {
 }
 
 func TestConversationTUIToolEventHyperlink(t *testing.T) {
+	t.Setenv("TERM", "xterm-256color")
 	api := &conversationAPITestDouble{events: make(chan protocol.SessionEventNotification, 10)}
 	model := &conversationTUI{
 		client:         api,
 		conversation:   "conversation-1",
+		workspace:      "/test/workspace",
 		width:          80,
 		height:         24,
 		lineCountCache: make(map[string]int),
@@ -627,6 +629,9 @@ func TestConversationTUIToolEventHyperlink(t *testing.T) {
 	}
 	if !strings.Contains(toolBlock.Header, "internal/cmd/root.go:42") {
 		t.Fatalf("toolBlock Header missing file and line: %s", toolBlock.Header)
+	}
+	if !strings.Contains(toolBlock.Header, "file:///test/workspace/internal/cmd/root.go#L42") {
+		t.Fatalf("toolBlock Header missing workspace-resolved file URI: %s", toolBlock.Header)
 	}
 }
 

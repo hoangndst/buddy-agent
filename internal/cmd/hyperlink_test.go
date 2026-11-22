@@ -42,6 +42,15 @@ func TestFormatFileHyperlink(t *testing.T) {
 			t.Fatalf("expected plain filename display, got %q", got)
 		}
 	})
+
+	t.Run("with explicit workspace directory", func(t *testing.T) {
+		t.Setenv("TERM", "xterm-256color")
+		got := FormatWorkspaceFileHyperlink("/custom/workspace", "sub/file.go", 10)
+		expectedTarget := "file:///custom/workspace/sub/file.go#L10"
+		if !strings.Contains(got, expectedTarget) {
+			t.Fatalf("expected target %q in %q", expectedTarget, got)
+		}
+	})
 }
 
 func TestStripHyperlinks(t *testing.T) {

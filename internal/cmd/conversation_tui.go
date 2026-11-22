@@ -671,13 +671,13 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if l, ok := msg.Data["line"].(float64); ok {
 						line = int(l)
 					}
-					tool += " " + FormatFileHyperlink(path, line)
+					tool += " " + FormatWorkspaceFileHyperlink(m.workspace, path, line)
 				} else if path, ok := msg.Data["file_path"].(string); ok && path != "" {
 					line := 0
 					if l, ok := msg.Data["line"].(float64); ok {
 						line = int(l)
 					}
-					tool += " " + FormatFileHyperlink(path, line)
+					tool += " " + FormatWorkspaceFileHyperlink(m.workspace, path, line)
 				}
 			}
 			block := TranscriptBlock{
