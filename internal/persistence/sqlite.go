@@ -347,6 +347,39 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 		}
 	}
 
+	if currentVersion < 5 {
+		migration005 := `
+		CREATE TABLE conversation_provider_profiles (
+			conversation_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+			base_url TEXT NOT NULL,
+			api_type TEXT NOT NULL,
+			model TEXT NOT NULL,
+			reasoning_effort TEXT NOT NULL,
+			max_steps INTEGER NOT NULL,
+			max_context_tokens INTEGER NOT NULL,
+			max_output_chars INTEGER NOT NULL,
+			working_tail_size INTEGER NOT NULL,
+			requires_mcp_config INTEGER NOT NULL DEFAULT 0,
+			requires_env INTEGER NOT NULL DEFAULT 0,
+			credential_source TEXT NOT NULL CHECK (credential_source IN ('daemon-default', 'ephemeral'))
+		);
+		`
+		tx, err := s.writerDB.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin migration 005 transaction: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.ExecContext(ctx, migration005); err != nil {
+			return fmt.Errorf("failed to execute migration 005 statements: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit migration 005: %w", err)
+		}
+		if _, err := s.writerDB.ExecContext(ctx, "PRAGMA user_version = 5;"); err != nil {
+			return fmt.Errorf("failed to bump PRAGMA user_version to 5: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -575,10 +608,71 @@ func (s *SQLiteStore) CreateConversation(ctx context.Context, request *Conversat
 	if err != nil {
 		return nil, fmt.Errorf("failed to persist conversation start key: %w", err)
 	}
+	if request.ProviderProfile != nil {
+		if err := insertConversationProviderProfile(ctx, tx, session.ID, request.ProviderProfile); err != nil {
+			return nil, fmt.Errorf("failed to persist conversation provider profile: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit conversation creation: %w", err)
 	}
 	return &ConversationStartResult{ConversationID: session.ID, SubmissionID: first.SubmissionID, TurnID: derefString(first.TurnID)}, nil
+}
+
+func insertConversationProviderProfile(ctx context.Context, tx *sql.Tx, conversationID string, profile *ConversationProviderProfile) error {
+	if profile == nil || profile.Model == "" || profile.CredentialSource != ConversationCredentialDaemonDefault && profile.CredentialSource != ConversationCredentialEphemeral {
+		return errors.New("conversation provider profile requires model and a supported credential source")
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO conversation_provider_profiles (
+		conversation_id, base_url, api_type, model, reasoning_effort, max_steps, max_context_tokens,
+		max_output_chars, working_tail_size, requires_mcp_config, requires_env, credential_source
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, conversationID, profile.BaseURL, profile.APIType, profile.Model,
+		profile.ReasoningEffort, profile.MaxSteps, profile.MaxContextTokens, profile.MaxOutputChars, profile.WorkingTailSize, profile.RequiresMCPConfig, profile.RequiresEnv, profile.CredentialSource)
+	return err
+}
+
+// GetConversationProviderProfile loads the nonsecret provider settings used by a conversation.
+func (s *SQLiteStore) GetConversationProviderProfile(ctx context.Context, conversationID string) (*ConversationProviderProfile, error) {
+	var profile ConversationProviderProfile
+	err := s.readerDB.QueryRowContext(ctx, `SELECT base_url, api_type, model, reasoning_effort, max_steps,
+		max_context_tokens, max_output_chars, working_tail_size, requires_mcp_config, requires_env, credential_source
+		FROM conversation_provider_profiles WHERE conversation_id = ?;`, conversationID).Scan(
+		&profile.BaseURL, &profile.APIType, &profile.Model, &profile.ReasoningEffort, &profile.MaxSteps,
+		&profile.MaxContextTokens, &profile.MaxOutputChars, &profile.WorkingTailSize, &profile.RequiresMCPConfig, &profile.RequiresEnv, &profile.CredentialSource)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load conversation provider profile: %w", err)
+	}
+	return &profile, nil
+}
+
+// SaveConversationProviderProfile stores a nonsecret provider profile for a conversation.
+func (s *SQLiteStore) SaveConversationProviderProfile(ctx context.Context, conversationID string, profile *ConversationProviderProfile) error {
+	if conversationID == "" || profile == nil {
+		return errors.New("conversation ID and provider profile are required")
+	}
+	if profile.Model == "" || profile.CredentialSource != ConversationCredentialDaemonDefault && profile.CredentialSource != ConversationCredentialEphemeral {
+		return errors.New("conversation provider profile requires model and a supported credential source")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.writerDB.ExecContext(ctx, `INSERT INTO conversation_provider_profiles (
+		conversation_id, base_url, api_type, model, reasoning_effort, max_steps, max_context_tokens,
+		max_output_chars, working_tail_size, requires_mcp_config, requires_env, credential_source
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(conversation_id) DO UPDATE SET base_url=excluded.base_url, api_type=excluded.api_type,
+	model=excluded.model, reasoning_effort=excluded.reasoning_effort, max_steps=excluded.max_steps,
+	max_context_tokens=excluded.max_context_tokens, max_output_chars=excluded.max_output_chars,
+	working_tail_size=excluded.working_tail_size, requires_mcp_config=excluded.requires_mcp_config,
+	requires_env=excluded.requires_env, credential_source=excluded.credential_source;`,
+		conversationID, profile.BaseURL, profile.APIType, profile.Model, profile.ReasoningEffort, profile.MaxSteps,
+		profile.MaxContextTokens, profile.MaxOutputChars, profile.WorkingTailSize, profile.RequiresMCPConfig, profile.RequiresEnv, profile.CredentialSource)
+	if err != nil {
+		return fmt.Errorf("save conversation provider profile: %w", err)
+	}
+	return nil
 }
 
 // AdmitSubmission persists a later prompt before acknowledging it and returns the canonical record.

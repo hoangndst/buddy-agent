@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,6 +21,17 @@ import (
 )
 
 type mockProvider struct{}
+
+type resumeTestProvider struct{ calls chan struct{} }
+
+func (p resumeTestProvider) Protocol() string { return "chat" }
+func (p resumeTestProvider) Generate(context.Context, provider.GenerateRequest) (*provider.GenerateResponse, error) {
+	select {
+	case p.calls <- struct{}{}:
+	default:
+	}
+	return &provider.GenerateResponse{Protocol: "chat", Content: "restored answer"}, nil
+}
 
 func (m *mockProvider) Protocol() string {
 	return "chat"
@@ -267,6 +280,112 @@ func TestSessionManager_StartConversationAndQueueSubmissions(t *testing.T) {
 	}
 	waitForConversationTurns(t, store, started.ConversationID, 3)
 	restartedManager.Drain(time.Second)
+}
+
+func TestResumeConversationRequiresEphemeralCredentialAndReconfigures(t *testing.T) {
+	workspace := t.TempDir()
+	dbPath := filepath.Join(workspace, "buddy.db")
+	store, err := persistence.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	calls := make(chan struct{}, 4)
+	factory := func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		eng := agent.NewEngine(resumeTestProvider{calls: calls}, params.Model, 3, tools.NewRegistry(1000), nil, emitHandler,
+			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID),
+			agent.WithProviderMetadata(params.BaseURL, params.APIType, 1000))
+		return eng, nil, nil
+	}
+	secret := "ephemeral-test-secret"
+	manager := NewSessionManager(factory)
+	_, started, err := manager.StartConversation(t.Context(), protocol.ConversationStartParams{
+		StartID: "ephemeral-start", SubmissionID: "ephemeral-first", Prompt: "first prompt", WorkspaceDir: workspace,
+		Model: "test-model", BaseURL: "https://provider.example/v1", APIType: "chat", APIKey: &secret,
+	}, nil)
+	if err != nil {
+		t.Fatalf("start conversation: %v", err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial provider request did not run")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		submission, getErr := store.GetSubmission(t.Context(), started.ConversationID, "ephemeral-first")
+		if getErr == nil && submission.Status == persistence.SubmissionConsumed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	profile, err := store.GetConversationProviderProfile(t.Context(), started.ConversationID)
+	if err != nil || profile == nil || profile.CredentialSource != persistence.ConversationCredentialEphemeral || profile.BaseURL != "https://provider.example/v1" || profile.APIType != "chat" {
+		t.Fatalf("provider profile did not preserve safe settings/source: profile=%+v err=%v", profile, err)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", profile), secret) {
+		t.Fatal("ephemeral API key appeared in the persisted provider profile")
+	}
+	var hasAPIKeyColumn int
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM pragma_table_info('conversation_provider_profiles') WHERE name = 'api_key'`).Scan(&hasAPIKeyColumn); err != nil || hasAPIKeyColumn != 0 {
+		t.Fatalf("provider profile schema stores an API key column: count=%d err=%v", hasAPIKeyColumn, err)
+	}
+	manager.Drain(time.Second)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = persistence.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	restoredManager := NewSessionManager(func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		eng := agent.NewEngine(resumeTestProvider{calls: calls}, params.Model, 3, tools.NewRegistry(1000), nil, emitHandler,
+			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID),
+			agent.WithProviderMetadata(params.BaseURL, params.APIType, 1000))
+		return eng, nil, nil
+	})
+	resume := protocol.ConversationResumeParams{
+		WorkspaceDir: workspace, ConversationID: started.ConversationID, DBPath: dbPath,
+		Model: "test-model", BaseURL: "https://provider.example/v1", APIType: "chat",
+	}
+	restored, _, err := restoredManager.ResumeConversation(t.Context(), resume, nil)
+	if err != nil {
+		t.Fatalf("restore history without ephemeral key: %v", err)
+	}
+	if reason := restored.ExecutionBlocked(); !strings.Contains(reason, "credentials") {
+		t.Fatalf("restore did not block execution pending credentials: %q", reason)
+	}
+	snapshot, _, err := restored.Sync(t.Context(), protocol.ConversationSyncParams{ConversationID: started.ConversationID}, nil)
+	if err != nil || snapshot.ExecutionBlocked == "" || len(snapshot.Transcript) == 0 {
+		t.Fatalf("blocked restore did not expose history and reason: snapshot=%+v err=%v", snapshot, err)
+	}
+	resume.APIKey = &secret
+	if _, _, err := restoredManager.ResumeConversation(t.Context(), resume, nil); err != nil {
+		t.Fatalf("resume with re-supplied ephemeral key: %v", err)
+	}
+	if reason := restored.ExecutionBlocked(); reason != "" {
+		t.Fatalf("execution remained blocked after credentials were supplied: %q", reason)
+	}
+	if _, _, err := restored.Submit(t.Context(), &persistence.SubmissionRecord{
+		ConversationID: started.ConversationID, SubmissionID: "after-restore", Prompt: "continue", Mode: persistence.SubmissionQueue,
+	}); err != nil {
+		t.Fatalf("submit after reconfiguration: %v", err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider request did not run after credentials were re-supplied")
+	}
+	restoredManager.Drain(time.Second)
 }
 
 func waitForConversationTurns(t *testing.T, store persistence.Store, conversationID string, count int) {

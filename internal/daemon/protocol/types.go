@@ -81,6 +81,7 @@ type SessionStartParams struct {
 	BaseURL          string      `json:"base_url,omitempty"`
 	APIKey           *string     `json:"api_key,omitempty"`
 	APIType          string      `json:"api_type,omitempty"`
+	CredentialSource string      `json:"credential_source,omitempty"`
 	MCPConfig        *mcp.Config `json:"mcp_config,omitempty"`
 	DBPath           string      `json:"db_path,omitempty"`
 	Env              []string    `json:"env,omitempty"`
@@ -124,9 +125,21 @@ type ConversationStartResult struct {
 
 // ConversationResumeParams restores a conversation by ID or selects the latest in a workspace.
 type ConversationResumeParams struct {
-	WorkspaceDir   string `json:"workspace_dir"`
-	ConversationID string `json:"conversation_id,omitempty"`
-	DBPath         string `json:"db_path,omitempty"`
+	WorkspaceDir     string      `json:"workspace_dir"`
+	ConversationID   string      `json:"conversation_id,omitempty"`
+	DBPath           string      `json:"db_path,omitempty"`
+	Model            string      `json:"model,omitempty"`
+	BaseURL          string      `json:"base_url,omitempty"`
+	APIType          string      `json:"api_type,omitempty"`
+	CredentialSource string      `json:"credential_source,omitempty"`
+	APIKey           *string     `json:"api_key,omitempty"`
+	ReasoningEffort  *string     `json:"reasoning_effort,omitempty"`
+	MaxSteps         int         `json:"max_steps,omitempty"`
+	MaxContextTokens int         `json:"max_context_tokens,omitempty"`
+	MaxOutputChars   int         `json:"max_output_chars,omitempty"`
+	WorkingTailSize  int         `json:"working_tail_size,omitempty"`
+	MCPConfig        *mcp.Config `json:"mcp_config,omitempty"`
+	Env              []string    `json:"env,omitempty"`
 }
 
 // ConversationResumeResult reports the attached conversation and current state.
@@ -170,13 +183,14 @@ type ConversationSyncParams struct {
 
 // ConversationTranscriptEntry is one durable user or assistant transcript item.
 type ConversationTranscriptEntry struct {
-	SubmissionID string `json:"submission_id,omitempty"`
-	TurnID       string `json:"turn_id,omitempty"`
-	Role         string `json:"role"`
-	Mode         string `json:"mode,omitempty"`
-	Status       string `json:"status,omitempty"`
-	Content      string `json:"content"`
-	CreatedAt    string `json:"created_at,omitempty"`
+	SubmissionID     string `json:"submission_id,omitempty"`
+	TurnID           string `json:"turn_id,omitempty"`
+	Role             string `json:"role"`
+	Mode             string `json:"mode,omitempty"`
+	Status           string `json:"status,omitempty"`
+	Content          string `json:"content"`
+	ContentTruncated bool   `json:"content_truncated,omitempty"`
+	CreatedAt        string `json:"created_at,omitempty"`
 }
 
 // ConversationTurnState reports the persisted lifecycle of one conversation turn.
@@ -203,6 +217,7 @@ type ConversationSyncResult struct {
 	NextPageToken    string                          `json:"next_page_token,omitempty"`
 	PendingApprovals []PermissionRequestNotification `json:"pending_approvals,omitempty"`
 	OutputIncomplete bool                            `json:"output_incomplete,omitempty"`
+	ExecutionBlocked string                          `json:"execution_blocked,omitempty"`
 }
 
 // ConversationListWorkspacesParams limits workspace discovery results.

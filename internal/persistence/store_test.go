@@ -34,8 +34,8 @@ func TestMigrationRunner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query user_version: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("expected user_version 4, got %d", version)
+	if version != 5 {
+		t.Errorf("expected user_version 5, got %d", version)
 	}
 }
 
@@ -86,8 +86,8 @@ func TestMigration003BackfillsExistingSessionsAsTasks(t *testing.T) {
 				t.Fatalf("expected legacy row kind %q, got %q", InteractionTask, kind)
 			}
 			var gotVersion int
-			if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&gotVersion); err != nil || gotVersion != 4 {
-				t.Fatalf("expected schema version 4, got %d (err=%v)", gotVersion, err)
+			if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&gotVersion); err != nil || gotVersion != 5 {
+				t.Fatalf("expected schema version 5, got %d (err=%v)", gotVersion, err)
 			}
 		})
 	}

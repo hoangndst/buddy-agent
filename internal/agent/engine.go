@@ -54,6 +54,15 @@ func WithReasoningEffort(effort string) EngineOption {
 	}
 }
 
+// WithProviderMetadata records nonsecret provider settings for safe conversation restore.
+func WithProviderMetadata(baseURL, apiType string, maxOutputChars int) EngineOption {
+	return func(e *Engine) {
+		e.providerBaseURL = baseURL
+		e.providerAPIType = apiType
+		e.maxOutputChars = maxOutputChars
+	}
+}
+
 // WithStore configures persistent SQLite storage for the Agent Engine.
 func WithStore(s persistence.Store) EngineOption {
 	return func(e *Engine) {
@@ -162,6 +171,9 @@ type Engine struct {
 	compClient               history.CompletionClient
 	model                    string
 	reasoningEffort          string
+	providerBaseURL          string
+	providerAPIType          string
+	maxOutputChars           int
 	maxSteps                 int
 	maxContextTokens         int
 	workingTailSize          int
@@ -222,6 +234,21 @@ func (e *Engine) Registry() *tools.Registry {
 func (e *Engine) WorkingTailSize() int {
 	return e.workingTailSize
 }
+
+// ProviderBaseURL returns the configured endpoint without credentials.
+func (e *Engine) ProviderBaseURL() string { return e.providerBaseURL }
+
+// ProviderAPIType returns the configured provider protocol.
+func (e *Engine) ProviderAPIType() string { return e.providerAPIType }
+
+// ReasoningEffort returns the configured model reasoning effort.
+func (e *Engine) ReasoningEffort() string { return e.reasoningEffort }
+
+// MaxContextTokens returns the engine's configured context limit.
+func (e *Engine) MaxContextTokens() int { return e.maxContextTokens }
+
+// MaxOutputChars returns the configured tool output limit.
+func (e *Engine) MaxOutputChars() int { return e.maxOutputChars }
 
 // PersistenceStore returns the store configured for this engine, if any.
 // Conversation runtimes use the same store as the engine so transcript writes

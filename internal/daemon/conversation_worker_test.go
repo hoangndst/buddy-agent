@@ -204,6 +204,94 @@ func TestConversationWorkerSyncTranscriptPaginationAdvances(t *testing.T) {
 	}
 }
 
+func TestConversationWorkerSyncBoundsTranscriptPagesByEncodedFrameSize(t *testing.T) {
+	ctx := context.Background()
+	store, err := persistence.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	largePrompt := strings.Repeat("x", 1200*1024)
+	fingerprint := persistence.SubmissionFingerprint(largePrompt, persistence.SubmissionQueue)
+	started, err := store.CreateConversation(ctx, &persistence.ConversationStartRequest{
+		Session: persistence.SessionRecord{ID: "large-page-test", WorkingDir: t.TempDir(), Model: "test-model"},
+		StartID: "large-page-start", PayloadFingerprint: fingerprint,
+		FirstSubmission: persistence.SubmissionRecord{SubmissionID: "large-submission", Prompt: largePrompt, Mode: persistence.SubmissionQueue, PayloadFingerprint: fingerprint, TurnID: ptrString("large-turn")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPrompt := strings.Repeat("y", 700*1024)
+	if _, err := store.AdmitSubmission(ctx, &persistence.SubmissionRecord{
+		ConversationID: started.ConversationID, SubmissionID: "second-submission", Prompt: secondPrompt, Mode: persistence.SubmissionQueue,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	worker := &ConversationWorker{conversationID: started.ConversationID, store: store, ring: NewEventRingBuffer(DefaultRingBufferCapacity), workerEpoch: "large-page-epoch"}
+	first, _, err := worker.Sync(ctx, protocol.ConversationSyncParams{ConversationID: started.ConversationID, PageSize: 100}, nil)
+	if err != nil {
+		t.Fatalf("sync oversized transcript entry: %v", err)
+	}
+	if len(first.Transcript) != 1 || !first.Transcript[0].ContentTruncated || first.NextPageToken == "" {
+		t.Fatalf("oversized entry was not bounded and marked: entries=%+v token=%q", first.Transcript, first.NextPageToken)
+	}
+	frame, err := protocol.NewResponse(strings.Repeat("x", 128), first)
+	if err != nil {
+		t.Fatalf("encode sync response: %v", err)
+	}
+	encoded, err := protocol.EncodeMessage(frame)
+	if err != nil || len(encoded) > protocol.DefaultMaxMessageSize {
+		t.Fatalf("sync frame size=%d limit=%d err=%v", len(encoded), protocol.DefaultMaxMessageSize, err)
+	}
+	second, _, err := worker.Sync(ctx, protocol.ConversationSyncParams{
+		ConversationID: started.ConversationID, HistoryRevision: first.HistoryRevision, PageToken: first.NextPageToken, PageSize: 100,
+	}, nil)
+	if err != nil {
+		t.Fatalf("sync next transcript page: %v", err)
+	}
+	if len(second.Transcript) != 1 || second.Transcript[0].Content != secondPrompt || second.NextPageToken != "" {
+		t.Fatalf("large page did not advance to the remaining prompt: %+v", second)
+	}
+}
+
+func TestConversationRestoreBlocksUnsafeEndpointWithoutForwardingCredentials(t *testing.T) {
+	record := &persistence.SessionRecord{ID: "unsafe-endpoint-conversation", Task: "prompt", Model: "test-model", MaxSteps: 3}
+	secret := "must-not-be-forwarded"
+	params, profile, blocked := conversationRestoreParams("/workspace", "", record, nil, protocol.ConversationResumeParams{
+		WorkspaceDir: "/workspace", Model: "test-model", BaseURL: "https://user:pass@example.com/v1?token=secret", APIType: "chat", APIKey: &secret,
+	})
+	if blocked == "" || !strings.Contains(blocked, "secret URL") {
+		t.Fatalf("unsafe endpoint did not fail closed: %q", blocked)
+	}
+	if params.BaseURL != "blocked://invalid" || params.APIKey != nil || strings.Contains(profile.BaseURL, "example.com") {
+		t.Fatalf("unsafe endpoint could fall back to a live provider: params=%+v profile=%+v", params, profile)
+	}
+}
+
+func TestConversationRestoreRequiresExplicitMCPAndEnvironmentReSupply(t *testing.T) {
+	record := &persistence.SessionRecord{ID: "settings-conversation", Task: "prompt", Model: "test-model", MaxSteps: 3}
+	baseProfile := persistence.ConversationProviderProfile{
+		BaseURL: "https://provider.example/v1", APIType: "chat", Model: "test-model", MaxSteps: 3,
+		CredentialSource: persistence.ConversationCredentialDaemonDefault,
+	}
+	for _, test := range []struct {
+		name    string
+		profile persistence.ConversationProviderProfile
+	}{
+		{name: "MCP config", profile: func() persistence.ConversationProviderProfile { p := baseProfile; p.RequiresMCPConfig = true; return p }()},
+		{name: "environment", profile: func() persistence.ConversationProviderProfile { p := baseProfile; p.RequiresEnv = true; return p }()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, blocked := conversationRestoreParams("/workspace", "", record, &test.profile, protocol.ConversationResumeParams{
+				WorkspaceDir: "/workspace", Model: test.profile.Model, BaseURL: test.profile.BaseURL, APIType: test.profile.APIType,
+			})
+			if blocked == "" {
+				t.Fatalf("restore silently discarded required %s", test.name)
+			}
+		})
+	}
+}
+
 func TestConversationWorkerPromotesLateSteerAheadOfQueuedPrompts(t *testing.T) {
 	ctx := context.Background()
 	store, err := persistence.NewSQLiteStore(":memory:")

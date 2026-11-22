@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,6 +25,109 @@ const (
 
 // EngineFactory defines a constructor function that builds an agent.Engine and cleanup closure for a session.
 type EngineFactory func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error)
+
+func conversationProviderProfile(engine *agent.Engine, params protocol.SessionStartParams) (*persistence.ConversationProviderProfile, error) {
+	baseURL := engine.ProviderBaseURL()
+	if !safeProviderEndpoint(baseURL) {
+		return nil, errors.New("provider endpoint contains URL userinfo, query, or fragment data and cannot be persisted safely")
+	}
+	source := persistence.ConversationCredentialDaemonDefault
+	if params.APIKey != nil {
+		source = persistence.ConversationCredentialEphemeral
+	}
+	effort := engine.ReasoningEffort()
+	if params.ReasoningEffort != nil {
+		effort = *params.ReasoningEffort
+	}
+	return &persistence.ConversationProviderProfile{
+		BaseURL: baseURL, APIType: engine.ProviderAPIType(), Model: engine.ModelName(),
+		ReasoningEffort: effort, MaxSteps: engine.MaxSteps(), MaxContextTokens: engine.MaxContextTokens(),
+		MaxOutputChars: engine.MaxOutputChars(), WorkingTailSize: engine.WorkingTailSize(),
+		CredentialSource: source, RequiresMCPConfig: params.MCPConfig != nil, RequiresEnv: params.Env != nil,
+	}, nil
+}
+
+func safeProviderEndpoint(baseURL string) bool {
+	if baseURL == "" {
+		return true
+	}
+	parsed, err := url.Parse(baseURL)
+	return err == nil && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == ""
+}
+
+func conversationRestoreParams(workspace, dbPath string, record *persistence.SessionRecord, profile *persistence.ConversationProviderProfile, supplied protocol.ConversationResumeParams) (protocol.SessionStartParams, *persistence.ConversationProviderProfile, string) {
+	blocked := ""
+	unsafeEndpoint := false
+	if profile != nil && !safeProviderEndpoint(profile.BaseURL) {
+		blocked = "saved provider endpoint contains secret URL data; replace it before execution"
+		unsafeEndpoint = true
+		profile.BaseURL = ""
+		profile.CredentialSource = persistence.ConversationCredentialEphemeral
+	}
+	if profile == nil {
+		profile = &persistence.ConversationProviderProfile{
+			BaseURL: supplied.BaseURL, APIType: supplied.APIType, Model: record.Model,
+			MaxSteps: record.MaxSteps, CredentialSource: persistence.ConversationCredentialEphemeral,
+		}
+		if supplied.Model != "" {
+			profile.Model = supplied.Model
+		}
+		profile.ReasoningEffort = derefStringValue(supplied.ReasoningEffort)
+		profile.MaxContextTokens, profile.MaxOutputChars, profile.WorkingTailSize = supplied.MaxContextTokens, supplied.MaxOutputChars, supplied.WorkingTailSize
+		profile.RequiresMCPConfig = supplied.MCPConfig != nil
+		profile.RequiresEnv = supplied.Env != nil
+		if !safeProviderEndpoint(profile.BaseURL) {
+			blocked = "provider endpoint contains secret URL data; replace it before execution"
+			unsafeEndpoint = true
+			profile.BaseURL = ""
+		}
+		if blocked == "" {
+			blocked = "conversation has no saved provider profile; re-supply provider settings and credentials before execution"
+		}
+		if !unsafeEndpoint && supplied.APIKey != nil && supplied.BaseURL != "" && supplied.APIType != "" {
+			blocked = ""
+		}
+	}
+	if unsafeEndpoint {
+		// The sentinel scheme cannot route to a real HTTP endpoint while a
+		// blocked worker restores its durable transcript.
+		profile.BaseURL = "blocked://invalid"
+	}
+	if !unsafeEndpoint && (supplied.Model != "" && supplied.Model != profile.Model || supplied.BaseURL != "" && supplied.BaseURL != profile.BaseURL || supplied.APIType != "" && supplied.APIType != profile.APIType) {
+		blocked = "current provider settings do not match the saved conversation profile"
+	}
+	if !unsafeEndpoint && (supplied.ReasoningEffort != nil && *supplied.ReasoningEffort != profile.ReasoningEffort || supplied.MaxSteps > 0 && supplied.MaxSteps != profile.MaxSteps || supplied.MaxContextTokens > 0 && supplied.MaxContextTokens != profile.MaxContextTokens || supplied.MaxOutputChars > 0 && supplied.MaxOutputChars != profile.MaxOutputChars || supplied.WorkingTailSize > 0 && supplied.WorkingTailSize != profile.WorkingTailSize) {
+		blocked = "current model settings do not match the saved conversation profile"
+	}
+	if profile.CredentialSource == persistence.ConversationCredentialEphemeral && supplied.APIKey == nil {
+		blocked = "conversation credentials are required again before execution"
+	}
+	if profile.RequiresMCPConfig && supplied.MCPConfig == nil {
+		blocked = "conversation requires its MCP configuration to be re-supplied before execution"
+	}
+	if profile.RequiresEnv && len(supplied.Env) == 0 {
+		blocked = "conversation requires its execution environment to be re-supplied before execution"
+	}
+	key := (*string)(nil)
+	if profile.CredentialSource == persistence.ConversationCredentialEphemeral && !unsafeEndpoint {
+		key = supplied.APIKey
+	}
+	effort := profile.ReasoningEffort
+	return protocol.SessionStartParams{
+		Task: record.Task, WorkspaceDir: workspace, DBPath: dbPath, Model: profile.Model, BaseURL: profile.BaseURL,
+		APIType: profile.APIType, APIKey: key, CredentialSource: profile.CredentialSource,
+		ReasoningEffort: &effort, MaxSteps: profile.MaxSteps, MaxContextTokens: profile.MaxContextTokens,
+		MaxOutputChars: profile.MaxOutputChars, WorkingTailSize: profile.WorkingTailSize,
+		MCPConfig: supplied.MCPConfig, Env: supplied.Env,
+	}, profile, blocked
+}
+
+func derefStringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
 
 // SessionManager tracks all active daemon sessions and manages headless execution lifecycles.
 type SessionManager struct {
@@ -183,6 +287,11 @@ func (sm *SessionManager) StartConversation(ctx context.Context, params protocol
 	turnID := generateWorkerID("turn")
 	createdAt := time.Now().UTC()
 	turnPointer := turnID
+	providerProfile, err := conversationProviderProfile(engine, startParams)
+	if err != nil {
+		cleanupEngine()
+		return nil, nil, err
+	}
 	request := &persistence.ConversationStartRequest{
 		Session: persistence.SessionRecord{
 			ID: conversationID, CreatedAt: createdAt, UpdatedAt: createdAt,
@@ -195,6 +304,7 @@ func (sm *SessionManager) StartConversation(ctx context.Context, params protocol
 			SubmissionID: params.SubmissionID, Prompt: params.Prompt, Mode: persistence.SubmissionQueue,
 			TurnID: &turnPointer, Status: persistence.SubmissionAttached, CreatedAt: createdAt,
 		},
+		ProviderProfile: providerProfile,
 	}
 	if err := sm.registerWorkspace(ctx, workspace, store); err != nil {
 		cleanupEngine()
@@ -313,6 +423,45 @@ func (sm *SessionManager) ResumeConversation(ctx context.Context, params protoco
 			if record.WorkingDir != workspace {
 				return nil, nil, persistence.ErrSessionNotFound
 			}
+			profile, err := worker.store.GetConversationProviderProfile(ctx, record.ID)
+			if err != nil {
+				return nil, nil, err
+			}
+			restoreParams, profile, blocked := conversationRestoreParams(workspace, params.DBPath, record, profile, params)
+			if worker.ExecutionBlocked() != "" && blocked == "" {
+				engine, cleanup, err := sm.engineFactory(record.ID, restoreParams, func(evt agent.Event) { worker.EmitEvent(evt) })
+				if err != nil {
+					return nil, nil, fmt.Errorf("reconfigure conversation execution: %w", err)
+				}
+				store := engine.PersistenceStore()
+				if store == nil {
+					if cleanup != nil {
+						cleanup()
+					}
+					return nil, nil, errors.New("conversation persistence is unavailable")
+				}
+				runtime, err := agent.RestoreConversationRuntime(ctx, engine, store, record.ID)
+				if err != nil {
+					if cleanup != nil {
+						cleanup()
+					}
+					return nil, nil, err
+				}
+				if profile != nil {
+					if err := worker.store.SaveConversationProviderProfile(ctx, record.ID, profile); err != nil {
+						if cleanup != nil {
+							cleanup()
+						}
+						return nil, nil, err
+					}
+				}
+				if err := worker.ReplaceBlockedExecution(engine, runtime, cleanup); err != nil {
+					if cleanup != nil {
+						cleanup()
+					}
+					return nil, nil, err
+				}
+			}
 			return worker, record, nil
 		}
 	}
@@ -365,17 +514,36 @@ func (sm *SessionManager) ResumeConversation(ctx context.Context, params protoco
 		closeEngine()
 		return existing, record, nil
 	}
+	profile, err := store.GetConversationProviderProfile(ctx, record.ID)
+	if err != nil {
+		closeEngine()
+		return nil, nil, err
+	}
+	hadProviderProfile := profile != nil
+	startParams, profile, executionBlocked := conversationRestoreParams(workspace, params.DBPath, record, profile, params)
 	closeEngine()
-	startParams.Task = record.Task
-	startParams.Model = record.Model
-	startParams.MaxSteps = record.MaxSteps
 	engine, cleanup, err = sm.engineFactory(record.ID, startParams, func(evt agent.Event) {
 		if worker != nil {
 			worker.EmitEvent(evt)
 		}
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("recreate conversation engine: %w", err)
+		if startParams.CredentialSource != persistence.ConversationCredentialDaemonDefault {
+			return nil, nil, fmt.Errorf("recreate conversation engine: %w", err)
+		}
+		// The saved endpoint no longer matches daemon-default credentials. Build
+		// a no-credential engine for transcript recovery and block execution.
+		startParams.CredentialSource = persistence.ConversationCredentialEphemeral
+		startParams.APIKey = nil
+		executionBlocked = "saved endpoint does not match the daemon-default provider endpoint; restore the daemon's saved provider configuration before execution"
+		engine, cleanup, err = sm.engineFactory(record.ID, startParams, func(evt agent.Event) {
+			if worker != nil {
+				worker.EmitEvent(evt)
+			}
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("recreate conversation engine for history: %w", err)
+		}
 	}
 	closeEngine = func() {
 		if cleanup != nil {
@@ -386,6 +554,12 @@ func (sm *SessionManager) ResumeConversation(ctx context.Context, params protoco
 	if store == nil {
 		closeEngine()
 		return nil, nil, errors.New("conversation persistence is unavailable")
+	}
+	if !hadProviderProfile && executionBlocked == "" {
+		if err := store.SaveConversationProviderProfile(ctx, record.ID, profile); err != nil {
+			closeEngine()
+			return nil, nil, err
+		}
 	}
 	runtime, err := agent.RestoreConversationRuntime(ctx, engine, store, record.ID)
 	if err != nil {
@@ -442,6 +616,9 @@ func (sm *SessionManager) ResumeConversation(ctx context.Context, params protoco
 		return nil, nil, err
 	}
 	worker.SetOnIdle(func() { sm.onConversationIdle(record.ID) })
+	if executionBlocked != "" {
+		worker.SetExecutionBlocked(executionBlocked)
+	}
 	sm.mu.Lock()
 	sm.conversations[record.ID] = worker
 	sm.mu.Unlock()

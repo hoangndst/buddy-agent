@@ -174,6 +174,12 @@ func buildEngineForSession(
 	if params.BaseURL != "" {
 		baseURL = params.BaseURL
 	}
+	if params.CredentialSource == persistence.ConversationCredentialDaemonDefault && baseURL != cfg.BaseURL {
+		return nil, nil, fmt.Errorf("conversation requires daemon-default credentials for endpoint %q, but daemon is configured for %q", baseURL, cfg.BaseURL)
+	}
+	if params.CredentialSource == persistence.ConversationCredentialEphemeral && params.APIKey == nil {
+		apiKey = ""
+	}
 	isLocal := cfg.IsLocal
 	if params.BaseURL != "" {
 		isLocal = config.IsLocalEndpoint(baseURL)
@@ -362,6 +368,7 @@ func buildEngineForSession(
 		agent.WithWorkingTailSize(workingTailSize),
 		agent.WithIsLocal(isLocal),
 		agent.WithReasoningEffort(effort),
+		agent.WithProviderMetadata(baseURL, apiType, outputLimit),
 		agent.WithStore(store),
 		agent.WithWorkspaceDir(wsDir),
 		agent.WithSessionIDOverride(sessionID),

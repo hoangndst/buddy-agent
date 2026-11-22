@@ -127,11 +127,34 @@ type SubmissionRecord struct {
 
 // ConversationStartRequest atomically creates a conversation and admits its first prompt.
 type ConversationStartRequest struct {
-	Session            SessionRecord    `json:"session"`
-	StartID            string           `json:"start_id"`
-	PayloadFingerprint string           `json:"payload_fingerprint"`
-	FirstSubmission    SubmissionRecord `json:"first_submission"`
+	Session            SessionRecord                `json:"session"`
+	StartID            string                       `json:"start_id"`
+	PayloadFingerprint string                       `json:"payload_fingerprint"`
+	FirstSubmission    SubmissionRecord             `json:"first_submission"`
+	ProviderProfile    *ConversationProviderProfile `json:"provider_profile,omitempty"`
 }
+
+// ConversationProviderProfile stores nonsecret execution settings required to restore a conversation.
+type ConversationProviderProfile struct {
+	BaseURL           string `json:"base_url"`
+	APIType           string `json:"api_type"`
+	Model             string `json:"model"`
+	ReasoningEffort   string `json:"reasoning_effort,omitempty"`
+	MaxSteps          int    `json:"max_steps"`
+	MaxContextTokens  int    `json:"max_context_tokens"`
+	MaxOutputChars    int    `json:"max_output_chars"`
+	WorkingTailSize   int    `json:"working_tail_size"`
+	CredentialSource  string `json:"credential_source"`
+	RequiresMCPConfig bool   `json:"requires_mcp_config,omitempty"`
+	RequiresEnv       bool   `json:"requires_env,omitempty"`
+}
+
+const (
+	// ConversationCredentialDaemonDefault means restore resolves credentials from daemon configuration.
+	ConversationCredentialDaemonDefault = "daemon-default"
+	// ConversationCredentialEphemeral means execution credentials must be supplied again on resume.
+	ConversationCredentialEphemeral = "ephemeral"
+)
 
 // ConversationStartResult identifies the durable conversation and first submission.
 type ConversationStartResult struct {
@@ -199,6 +222,8 @@ type Store interface {
 	// Sessions
 	CreateSession(ctx context.Context, session *SessionRecord) error
 	CreateConversation(ctx context.Context, request *ConversationStartRequest) (*ConversationStartResult, error)
+	GetConversationProviderProfile(ctx context.Context, conversationID string) (*ConversationProviderProfile, error)
+	SaveConversationProviderProfile(ctx context.Context, conversationID string, profile *ConversationProviderProfile) error
 	CreateConversationTurn(ctx context.Context, turn *ConversationTurnRecord) error
 	UpdateConversationTurn(ctx context.Context, turn *ConversationTurnRecord) error
 	ListConversationTurns(ctx context.Context, conversationID string) ([]*ConversationTurnRecord, error)

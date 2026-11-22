@@ -57,6 +57,7 @@ type ConversationWorker struct {
 	cleanup             func()
 	onIdle              func()
 	closed              bool
+	executionBlocked    string
 	cleanupOnce         sync.Once
 	doneOnce            sync.Once
 }
@@ -213,6 +214,16 @@ func (w *ConversationWorker) run() {
 			w.mu.Unlock()
 			return
 		}
+		if w.executionBlocked != "" {
+			w.active = false
+			w.mu.Unlock()
+			select {
+			case <-w.queueWake:
+				continue
+			case <-w.ctx.Done():
+				return
+			}
+		}
 		if len(w.queue) == 0 {
 			wasActive, idle := w.active, w.onIdle
 			w.active = false
@@ -283,6 +294,12 @@ func (w *ConversationWorker) Submit(ctx context.Context, submission *persistence
 		w.mu.Unlock()
 		w.eventMu.Unlock()
 		return nil, false, errors.New("conversation worker was evicted")
+	}
+	if w.executionBlocked != "" {
+		reason := w.executionBlocked
+		w.mu.Unlock()
+		w.eventMu.Unlock()
+		return nil, false, fmt.Errorf("conversation execution is blocked: %s", reason)
 	}
 	_, lookupErr := w.store.GetSubmission(ctx, w.conversationID, submission.SubmissionID)
 	existing := lookupErr == nil
@@ -389,6 +406,46 @@ func (w *ConversationWorker) beforeModelRequest(ctx context.Context, conversatio
 // IsActive reports whether the worker is executing a conversation turn.
 func (w *ConversationWorker) IsActive() bool { w.mu.Lock(); defer w.mu.Unlock(); return w.active }
 
+// SetExecutionBlocked pauses restored work until missing ephemeral settings are supplied.
+func (w *ConversationWorker) SetExecutionBlocked(reason string) {
+	w.mu.Lock()
+	w.executionBlocked = reason
+	w.mu.Unlock()
+	w.signalQueue()
+}
+
+// ExecutionBlocked reports why a restored worker cannot execute queued prompts.
+func (w *ConversationWorker) ExecutionBlocked() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.executionBlocked
+}
+
+// ReplaceBlockedExecution installs a newly configured engine/runtime on a blocked idle worker.
+func (w *ConversationWorker) ReplaceBlockedExecution(engine *agent.Engine, runtime *agent.ConversationRuntime, cleanup func()) error {
+	if engine == nil || runtime == nil {
+		return errors.New("replacement conversation execution requires an engine and runtime")
+	}
+	w.mu.Lock()
+	if w.executionBlocked == "" || w.active || w.closed {
+		w.mu.Unlock()
+		return errors.New("conversation worker is not blocked and idle")
+	}
+	previousCleanup := w.cleanup
+	w.engine, w.runtime, w.cleanup = engine, runtime, cleanup
+	w.executionBlocked = ""
+	engine.SetConversationCommitHook(w.commitWithEvents)
+	engine.SetConversationBoundaryHook(w.beforeModelRequest)
+	runtime.SetApplySubmissionHook(w.applySubmission)
+	runtime.SetTurnOutcomeHook(w.finishTurn)
+	w.mu.Unlock()
+	if previousCleanup != nil {
+		previousCleanup()
+	}
+	w.signalQueue()
+	return nil
+}
+
 // IsController reports whether c currently controls this conversation.
 func (w *ConversationWorker) IsController(c ClientConn) bool {
 	w.mu.Lock()
@@ -472,6 +529,7 @@ func (w *ConversationWorker) Sync(ctx context.Context, params protocol.Conversat
 		turnID = ""
 	}
 	lastDurableSequence := w.lastDurableSequence
+	executionBlocked := w.executionBlocked
 	var pendingApprovals []protocol.PermissionRequestNotification
 	if conn != nil && w.controller == conn && w.pendingApproval != nil {
 		pendingApprovals = []protocol.PermissionRequestNotification{boundedPermissionRequest(*w.pendingApproval)}
@@ -574,18 +632,6 @@ func (w *ConversationWorker) Sync(ctx context.Context, params protocol.Conversat
 	if pageSize > 100 {
 		pageSize = 100
 	}
-	end := offset + pageSize
-	if end > len(entries) {
-		end = len(entries)
-	}
-	transcript := make([]protocol.ConversationTranscriptEntry, 0, end-offset)
-	for _, entry := range entries[offset:end] {
-		transcript = append(transcript, entry.entry)
-	}
-	next := ""
-	if end < len(entries) {
-		next = base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d:%d", revision, end)))
-	}
 	state := "idle"
 	if active {
 		state = "running"
@@ -601,11 +647,79 @@ func (w *ConversationWorker) Sync(ctx context.Context, params protocol.Conversat
 	if active && turnID != "" && len(pendingApprovals) == 0 {
 		state = "running"
 	}
-	return &protocol.ConversationSyncResult{
-		ConversationID: w.conversationID, Role: role, WorkerEpoch: epoch, EventWatermark: watermark,
-		HistoryRevision: revision, State: state, ActiveTurnID: turnID, Transcript: transcript, Turns: turnStates, NextPageToken: next,
-		PendingApprovals: pendingApprovals, OutputIncomplete: incomplete,
-	}, role, nil
+	makeResult := func(transcript []protocol.ConversationTranscriptEntry, end int) *protocol.ConversationSyncResult {
+		next := ""
+		if end < len(entries) {
+			next = base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d:%d", revision, end)))
+		}
+		return &protocol.ConversationSyncResult{
+			ConversationID: w.conversationID, Role: role, WorkerEpoch: epoch, EventWatermark: watermark,
+			HistoryRevision: revision, State: state, ActiveTurnID: turnID, Transcript: transcript, Turns: turnStates, NextPageToken: next,
+			PendingApprovals: pendingApprovals, OutputIncomplete: incomplete, ExecutionBlocked: executionBlocked,
+		}
+	}
+	transcript := make([]protocol.ConversationTranscriptEntry, 0, min(pageSize, len(entries)-offset))
+	end := offset
+	for end < len(entries) && len(transcript) < pageSize {
+		candidate := append(transcript, entries[end].entry)
+		if conversationSyncFrameSize(makeResult(candidate, end+1)) <= protocol.DefaultMaxMessageSize {
+			transcript = candidate
+			end++
+			continue
+		}
+		if len(transcript) > 0 {
+			break
+		}
+		bounded, ok := boundTranscriptEntry(entries[end].entry, func(candidate protocol.ConversationTranscriptEntry) bool {
+			return conversationSyncFrameSize(makeResult([]protocol.ConversationTranscriptEntry{candidate}, end+1)) <= protocol.DefaultMaxMessageSize
+		})
+		if !ok {
+			return nil, "", errors.New("conversation metadata exceeds maximum JSON-RPC frame size")
+		}
+		transcript = append(transcript, bounded)
+		end++
+		break
+	}
+	result := makeResult(transcript, end)
+	if conversationSyncFrameSize(result) > protocol.DefaultMaxMessageSize {
+		return nil, "", errors.New("conversation sync metadata exceeds maximum JSON-RPC frame size")
+	}
+	return result, role, nil
+}
+
+func conversationSyncFrameSize(result *protocol.ConversationSyncResult) int {
+	msg, err := protocol.NewResponse(strings.Repeat("x", 128), result)
+	if err != nil {
+		return protocol.DefaultMaxMessageSize + 1
+	}
+	encoded, err := protocol.EncodeMessage(msg)
+	if err != nil {
+		return protocol.DefaultMaxMessageSize + 1
+	}
+	return len(encoded)
+}
+
+const transcriptTruncationMarker = "…[content truncated to fit sync frame]"
+
+func boundTranscriptEntry(entry protocol.ConversationTranscriptEntry, fits func(protocol.ConversationTranscriptEntry) bool) (protocol.ConversationTranscriptEntry, bool) {
+	entry.ContentTruncated = true
+	original := entry.Content
+	low, high := 0, len(original)
+	var best protocol.ConversationTranscriptEntry
+	found := false
+	for low <= high {
+		mid := low + (high-low)/2
+		prefixLength := utf8SafePrefix(original, mid)
+		candidate := entry
+		candidate.Content = original[:prefixLength] + transcriptTruncationMarker
+		if fits(candidate) {
+			best, found = candidate, true
+			low = mid + 1
+		} else {
+			high = mid - 1
+		}
+	}
+	return best, found
 }
 
 // Detach removes a client connection and releases its controller role if held.

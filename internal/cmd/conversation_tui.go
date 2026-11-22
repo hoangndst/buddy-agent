@@ -97,8 +97,9 @@ type conversationListMsg struct {
 	err           error
 }
 type conversationResumedMsg struct {
-	result *protocol.ConversationSyncResult
-	err    error
+	result    *protocol.ConversationSyncResult
+	workspace string
+	err       error
 }
 type conversationSyncMsg struct {
 	result *protocol.ConversationSyncResult
@@ -147,7 +148,7 @@ func runConversationTUI(ctx context.Context, f *cmdutil.Factory, socketPath stri
 	input.Focus()
 	m := &conversationTUI{ctx: ctx, client: api, workspace: workspace, startParams: params, databasePath: params.DBPath, standalone: standalone, state: "ready", textarea: input, width: 80, height: 24}
 	if continueLatest {
-		result, resumeErr := api.ResumeConversation(protocol.ConversationResumeParams{WorkspaceDir: workspace, DBPath: params.DBPath})
+		result, resumeErr := api.ResumeConversation(conversationResumeParams(workspace, "", params))
 		if resumeErr != nil {
 			if isConversationNotFound(resumeErr) {
 				return fmt.Errorf("no conversations found in workspace %q; run bare buddy to start one", workspace)
@@ -194,7 +195,7 @@ func runConversationLines(ctx context.Context, f *cmdutil.Factory, socketPath st
 	}
 	conversationID := ""
 	if continueLatest {
-		resumed, err := cl.ResumeConversation(protocol.ConversationResumeParams{WorkspaceDir: workspace, DBPath: params.DBPath})
+		resumed, err := cl.ResumeConversation(conversationResumeParams(workspace, "", params))
 		if err != nil {
 			if isConversationNotFound(err) {
 				return fmt.Errorf("no conversations found in workspace %q; run bare buddy to start one", workspace)
@@ -467,7 +468,9 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.choosing = ""
-		m.workspace = m.selectedWorkspace
+		if msg.workspace != "" {
+			m.workspace = msg.workspace
+		}
 		m.loadSync(msg.result)
 		return m, tea.Batch(m.watchEvent(), m.watchPermission())
 	case conversationSyncMsg:
@@ -720,6 +723,11 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 		return
 	}
 	m.conversation, m.state = result.ConversationID, result.State
+	if result.ExecutionBlocked != "" {
+		m.errorText = "Execution is paused: " + result.ExecutionBlocked
+	} else if strings.HasPrefix(m.errorText, "Execution is paused: ") {
+		m.errorText = ""
+	}
 	if len(result.PendingApprovals) > 0 {
 		request := result.PendingApprovals[0]
 		m.pendingApproval = &request
@@ -769,24 +777,37 @@ func (m *conversationTUI) listConversations(workspace string) tea.Cmd {
 func (m *conversationTUI) resumeSelected(selected protocol.ConversationSummary) tea.Cmd {
 	workspace := m.selectedWorkspace
 	return func() tea.Msg {
-		_, err := m.client.ResumeConversation(protocol.ConversationResumeParams{WorkspaceDir: workspace, ConversationID: selected.ConversationID, DBPath: selected.DBPath})
+		resumeParams := conversationResumeParams(workspace, selected.ConversationID, m.startParams)
+		resumeParams.DBPath = selected.DBPath
+		_, err := m.client.ResumeConversation(resumeParams)
 		if err != nil {
 			return conversationResumedMsg{err: err}
 		}
 		result, err := readConversationSnapshot(m.client, selected.ConversationID)
-		return conversationResumedMsg{result: result, err: err}
+		return conversationResumedMsg{result: result, workspace: workspace, err: err}
 	}
 }
 
 func (m *conversationTUI) resumeEvictedConversation() tea.Cmd {
 	workspace, conversationID, databasePath := m.workspace, m.conversation, m.databasePath
 	return func() tea.Msg {
-		_, err := m.client.ResumeConversation(protocol.ConversationResumeParams{WorkspaceDir: workspace, ConversationID: conversationID, DBPath: databasePath})
+		resumeParams := conversationResumeParams(workspace, conversationID, m.startParams)
+		resumeParams.DBPath = databasePath
+		_, err := m.client.ResumeConversation(resumeParams)
 		if err != nil {
 			return conversationResumedMsg{err: err}
 		}
 		result, err := readConversationSnapshot(m.client, conversationID)
 		return conversationResumedMsg{result: result, err: err}
+	}
+}
+
+func conversationResumeParams(workspace, conversationID string, start protocol.ConversationStartParams) protocol.ConversationResumeParams {
+	return protocol.ConversationResumeParams{
+		WorkspaceDir: workspace, ConversationID: conversationID, DBPath: start.DBPath,
+		Model: start.Model, BaseURL: start.BaseURL, APIType: start.APIType, APIKey: start.APIKey,
+		ReasoningEffort: start.ReasoningEffort, MaxSteps: start.MaxSteps, MaxContextTokens: start.MaxContextTokens,
+		MaxOutputChars: start.MaxOutputChars, WorkingTailSize: start.WorkingTailSize, MCPConfig: start.MCPConfig, Env: start.Env,
 	}
 }
 
@@ -845,8 +866,8 @@ func buildConversationStartParams(f *cmdutil.Factory) (protocol.ConversationStar
 		reasoning := cfg.ReasoningEffort
 		params.ReasoningEffort = &reasoning
 		params.BaseURL, params.APIType, params.DBPath = cfg.BaseURL, cfg.APIType, cfg.DBPath
-		apiKey := cfg.APIKey
-		params.APIKey = &apiKey
+		// The daemon resolves its configured credential. Do not send API keys on
+		// ordinary starts; explicit API clients may supply an ephemeral key.
 	}
 	params.WorkspaceDir = workspace
 	if params.DBPath != "" && params.DBPath != ":memory:" && !strings.HasPrefix(params.DBPath, "file:") && !filepath.IsAbs(params.DBPath) && f.WorkDir != nil {
