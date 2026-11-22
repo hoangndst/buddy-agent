@@ -108,3 +108,19 @@ func TestFormatMarkdownTableMinimumColumnReservation(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatMarkdownTableEscapedPipes(t *testing.T) {
+	lines := []string{
+		"| Pattern | Match |",
+		"| --- | --- |",
+		`| a\|b | matched_val |`,
+	}
+
+	res := FormatMarkdownTable(lines, 80, 200)
+	if !strings.Contains(res.Rendered, "a|b") {
+		t.Fatalf("escaped pipe was not preserved in cell content: %s", res.Rendered)
+	}
+	if !strings.Contains(res.Rendered, "matched_val") {
+		t.Fatalf("second column dropped due to escaped pipe splitting: %s", res.Rendered)
+	}
+}

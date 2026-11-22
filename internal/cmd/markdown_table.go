@@ -90,11 +90,37 @@ func splitRowCells(line string) []string {
 	trimmed := strings.TrimSpace(line)
 	trimmed = strings.TrimPrefix(trimmed, "|")
 	trimmed = strings.TrimSuffix(trimmed, "|")
-	parts := strings.Split(trimmed, "|")
-	cells := make([]string, len(parts))
-	for i, p := range parts {
-		cells[i] = strings.TrimSpace(p)
+
+	var cells []string
+	var cur strings.Builder
+	escaped := false
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if escaped {
+			if ch == '|' {
+				cur.WriteByte('|')
+			} else {
+				cur.WriteByte('\\')
+				cur.WriteByte(ch)
+			}
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '|' {
+			cells = append(cells, strings.TrimSpace(cur.String()))
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(ch)
 	}
+	if escaped {
+		cur.WriteByte('\\')
+	}
+	cells = append(cells, strings.TrimSpace(cur.String()))
 	return cells
 }
 

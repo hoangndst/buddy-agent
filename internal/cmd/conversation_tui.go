@@ -1436,25 +1436,22 @@ func (m *conversationTUI) computeVisibleLines() []string {
 	}
 	vpHeight := m.viewportHeight()
 
-	type blockLinesEntry struct {
-		lines []string
-	}
-	entries := make([]blockLinesEntry, len(m.blocks))
+	// 1. Calculate total lines using cached line counts without allocating wrapped lines for off-screen blocks
 	totalLines := 0
+	lineCounts := make([]int, len(m.blocks))
 	for i, b := range m.blocks {
-		wLines := m.getWrappedLines(b, width)
-		linesWithSep := make([]string, len(wLines)+1)
-		copy(linesWithSep, wLines)
-		linesWithSep[len(wLines)] = ""
-		entries[i] = blockLinesEntry{lines: linesWithSep}
-		totalLines += len(linesWithSep)
+		lc := m.getBlockLineCount(b, width)
+		lineCounts[i] = lc
+		totalLines += lc
 	}
 
 	if totalLines <= vpHeight {
 		m.scrollOffset = 0
 		var allLines []string
-		for _, e := range entries {
-			allLines = append(allLines, e.lines...)
+		for _, b := range m.blocks {
+			wLines := m.getWrappedLines(b, width)
+			allLines = append(allLines, wLines...)
+			allLines = append(allLines, "")
 		}
 		return allLines
 	}
@@ -1470,19 +1467,31 @@ func (m *conversationTUI) computeVisibleLines() []string {
 	windowBottom := totalLines - m.scrollOffset
 	windowTop := max(0, windowBottom-vpHeight)
 
+	// 2. Assemble lines ONLY from intersecting blocks
 	var visibleLines []string
 	curLine := 0
-	for _, e := range entries {
+	for i, b := range m.blocks {
 		blockStart := curLine
-		blockEnd := curLine + len(e.lines)
+		blockEnd := curLine + lineCounts[i]
 		curLine = blockEnd
 
-		if blockEnd > windowTop && blockStart < windowBottom {
-			sliceStart := max(0, windowTop-blockStart)
-			sliceEnd := min(len(e.lines), windowBottom-blockStart)
-			if sliceStart < sliceEnd {
-				visibleLines = append(visibleLines, e.lines[sliceStart:sliceEnd]...)
-			}
+		// Skip blocks entirely before or after the visible window
+		if blockEnd <= windowTop {
+			continue
+		}
+		if blockStart >= windowBottom {
+			break
+		}
+
+		wLines := m.getWrappedLines(b, width)
+		linesWithSep := make([]string, len(wLines)+1)
+		copy(linesWithSep, wLines)
+		linesWithSep[len(wLines)] = ""
+
+		sliceStart := max(0, windowTop-blockStart)
+		sliceEnd := min(len(linesWithSep), windowBottom-blockStart)
+		if sliceStart < sliceEnd {
+			visibleLines = append(visibleLines, linesWithSep[sliceStart:sliceEnd]...)
 		}
 	}
 	return visibleLines
