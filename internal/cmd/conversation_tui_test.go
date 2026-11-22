@@ -248,7 +248,7 @@ func TestWaitConversationSubmissionDoesNotDuplicateRenderedFinalText(t *testing.
 	streams, _, out, _ := cmdutil.TestIOStreams()
 	factory := &cmdutil.Factory{IOStreams: streams}
 	events := make(chan protocol.SessionEventNotification, 1)
-	events <- protocol.SessionEventNotification{ConversationID: "conversation-1", TurnID: "target-turn", Type: string(agent.EventTextComplete), Content: "final answer"}
+	events <- protocol.SessionEventNotification{ConversationID: "conversation-1", TurnID: "target-turn", Type: string(agent.EventTextComplete), Content: "final answer", Data: map[string]any{"step": 2}}
 	snapshotCalls := 0
 	snapshot := func() (*protocol.ConversationSyncResult, error) {
 		snapshotCalls++
@@ -262,7 +262,7 @@ func TestWaitConversationSubmissionDoesNotDuplicateRenderedFinalText(t *testing.
 	}
 	fullSnapshot := func() (*protocol.ConversationSyncResult, error) {
 		return &protocol.ConversationSyncResult{Transcript: []protocol.ConversationTranscriptEntry{{
-			Role: "assistant", TurnID: "target-turn", Content: "final answer",
+			Role: "assistant", TurnID: "target-turn", StepNumber: 2, Content: "final answer",
 		}}}, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -274,6 +274,43 @@ func TestWaitConversationSubmissionDoesNotDuplicateRenderedFinalText(t *testing.
 	}
 	if got := strings.Count(out.String(), "final answer"); got != 1 {
 		t.Fatalf("final answer was rendered %d times; output=%q", got, out.String())
+	}
+}
+
+func TestWaitConversationSubmissionRecoversFinalAfterCommentaryTextComplete(t *testing.T) {
+	streams, _, out, _ := cmdutil.TestIOStreams()
+	factory := &cmdutil.Factory{IOStreams: streams}
+	events := make(chan protocol.SessionEventNotification, 1)
+	events <- protocol.SessionEventNotification{ConversationID: "conversation-1", TurnID: "target-turn", Type: string(agent.EventTextComplete), Content: "checking the files now", Data: map[string]any{"step": 1}}
+	snapshotCalls := 0
+	snapshot := func() (*protocol.ConversationSyncResult, error) {
+		snapshotCalls++
+		status := string(persistence.StatusRunning)
+		if snapshotCalls > 1 {
+			status = string(persistence.StatusCompleted)
+		}
+		return &protocol.ConversationSyncResult{Turns: []protocol.ConversationTurnState{{
+			SubmissionID: "target-submission", TurnID: "target-turn", Status: status,
+		}}}, nil
+	}
+	fullSnapshot := func() (*protocol.ConversationSyncResult, error) {
+		return &protocol.ConversationSyncResult{Transcript: []protocol.ConversationTranscriptEntry{
+			{Role: "assistant", TurnID: "target-turn", StepNumber: 1, Content: "checking the files now"},
+			{Role: "assistant", TurnID: "target-turn", StepNumber: 2, Content: "the final answer"},
+		}}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := waitConversationSubmissionEvents(ctx, factory, "conversation-1", "target-submission", "target-turn", persistence.SubmissionQueue,
+		events, nil, snapshot, fullSnapshot, func() error { return nil })
+	if err != nil {
+		t.Fatalf("wait for final answer after commentary: %v", err)
+	}
+	if got := strings.Count(out.String(), "checking the files now"); got != 1 {
+		t.Fatalf("commentary was rendered %d times; output=%q", got, out.String())
+	}
+	if got := strings.Count(out.String(), "the final answer"); got != 1 {
+		t.Fatalf("final transcript answer was rendered %d times; output=%q", got, out.String())
 	}
 }
 

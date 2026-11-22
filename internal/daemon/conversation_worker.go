@@ -607,7 +607,7 @@ func (w *ConversationWorker) Sync(ctx context.Context, params protocol.Conversat
 	}
 	for _, turn := range turns {
 		entries = append(entries, orderedEntry{revision: turn.HistoryRevision, step: turn.StepNumber, entry: protocol.ConversationTranscriptEntry{
-			TurnID: turn.ConversationTurnID, Role: turn.Role, Content: turn.Content, CreatedAt: turn.CreatedAt.UTC().Format(time.RFC3339Nano),
+			TurnID: turn.ConversationTurnID, StepNumber: turn.StepNumber, Role: turn.Role, Content: turn.Content, CreatedAt: turn.CreatedAt.UTC().Format(time.RFC3339Nano),
 		}})
 	}
 	sort.SliceStable(entries, func(i, j int) bool {

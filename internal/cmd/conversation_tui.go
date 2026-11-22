@@ -303,7 +303,7 @@ func waitConversationSubmissionEvents(ctx context.Context, f *cmdutil.Factory, c
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	terminalTurns := make(map[string]bool)
-	renderedFinalText := make(map[string]bool)
+	renderedAssistantSteps := make(map[string]map[int]bool)
 	turnStatus, turnError := "", ""
 	resolveTurn := func() error {
 		if submissionID == "" && turnID == "" {
@@ -340,11 +340,20 @@ func waitConversationSubmissionEvents(ctx context.Context, f *cmdutil.Factory, c
 			return err
 		}
 		if turnID != "" && turnStatus != "" && turnStatus != string(persistence.StatusRunning) {
-			if !terminalTurns[turnID] && !renderedFinalText[turnID] {
+			if !terminalTurns[turnID] {
 				if history, err := fullSnapshot(); err == nil {
 					for _, entry := range history.Transcript {
 						if entry.Role == "assistant" && entry.TurnID == turnID {
+							if renderedAssistantSteps[turnID][entry.StepNumber] {
+								continue
+							}
 							_, _ = fmt.Fprintln(f.IOStreams.Out, entry.Content)
+							if entry.StepNumber > 0 {
+								if renderedAssistantSteps[turnID] == nil {
+									renderedAssistantSteps[turnID] = make(map[int]bool)
+								}
+								renderedAssistantSteps[turnID][entry.StepNumber] = true
+							}
 						}
 					}
 				}
@@ -372,7 +381,12 @@ func waitConversationSubmissionEvents(ctx context.Context, f *cmdutil.Factory, c
 			}
 			renderEvent(f, evt)
 			if evt.Type == string(agent.EventTextComplete) && evt.TurnID != "" && evt.Content != "" {
-				renderedFinalText[evt.TurnID] = true
+				if step := conversationEventStep(evt); step > 0 {
+					if renderedAssistantSteps[evt.TurnID] == nil {
+						renderedAssistantSteps[evt.TurnID] = make(map[int]bool)
+					}
+					renderedAssistantSteps[evt.TurnID][step] = true
+				}
 			}
 			terminal := evt.Type == string(agent.EventFinished) || evt.Type == string(agent.EventError) && evt.Data["terminal"] == true
 			if terminal {
@@ -390,6 +404,20 @@ func waitConversationSubmissionEvents(ctx context.Context, f *cmdutil.Factory, c
 			}
 		case <-ticker.C:
 		}
+	}
+}
+
+func conversationEventStep(event protocol.SessionEventNotification) int {
+	if event.Data == nil {
+		return 0
+	}
+	switch step := event.Data["step"].(type) {
+	case int:
+		return step
+	case float64:
+		return int(step)
+	default:
+		return 0
 	}
 }
 

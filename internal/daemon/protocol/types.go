@@ -185,6 +185,7 @@ type ConversationSyncParams struct {
 type ConversationTranscriptEntry struct {
 	SubmissionID     string `json:"submission_id,omitempty"`
 	TurnID           string `json:"turn_id,omitempty"`
+	StepNumber       int    `json:"step_number,omitempty"`
 	Role             string `json:"role"`
 	Mode             string `json:"mode,omitempty"`
 	Status           string `json:"status,omitempty"`
