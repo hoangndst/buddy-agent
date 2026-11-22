@@ -74,15 +74,58 @@ func newCmdStart(f *cmdutil.Factory) *cobra.Command {
 
 			// Foreground execution mode
 			sockMgr := daemon.NewSocketManager(socketPath)
+			storePool := daemon.NewStorePool()
+			userHome := ""
+			var homeErr error
+			if f.UserHome != nil {
+				userHome, homeErr = f.UserHome()
+			} else {
+				userHome, homeErr = os.UserHomeDir()
+			}
+			if homeErr != nil {
+				return fmt.Errorf("resolve user home for conversation catalog: %w", homeErr)
+			}
+			workspaceCatalog, err := persistence.NewWorkspaceCatalog(filepath.Join(userHome, ".buddy", "workspaces.db"))
+			if err != nil {
+				return fmt.Errorf("open conversation workspace catalog: %w", err)
+			}
+			daemonFactory := *f
+			if openStore := f.StoreForWorkspace; openStore != nil {
+				daemonFactory.StoreForWorkspace = func(workspace string, customDBPath ...string) (persistence.Store, func(), error) {
+					dbPath := ""
+					if len(customDBPath) > 0 {
+						dbPath = customDBPath[0]
+					}
+					if dbPath == "" {
+						if workspace == "" {
+							workspace = "."
+						}
+						dbPath = filepath.Join(workspace, ".buddy", "history.db")
+					}
+					key, err := filepath.Abs(filepath.Clean(dbPath))
+					if err != nil {
+						return nil, nil, err
+					}
+					if resolved, err := filepath.EvalSymlinks(key); err == nil {
+						key = resolved
+					}
+					return storePool.Get(key, func() (persistence.Store, func(), error) {
+						return openStore(workspace, customDBPath...)
+					})
+				}
+			}
 
 			engineFactory := func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
-				return buildEngineForSession(c.Context(), f, sessionID, params, emitHandler)
+				return buildEngineForSession(c.Context(), &daemonFactory, sessionID, params, emitHandler)
 			}
 
 			sessionMgr := daemon.NewSessionManager(engineFactory)
+			sessionMgr.SetStorePool(storePool)
+			sessionMgr.SetWorkspaceCatalog(workspaceCatalog)
 			server := daemon.NewServer(sockMgr, sessionMgr)
 
 			if err := server.Start(); err != nil {
+				sessionMgr.Drain(0)
 				return fmt.Errorf("daemon failed to start: %w", err)
 			}
 
@@ -331,4 +374,16 @@ func buildEngineForSession(
 	}
 
 	return eng, cleanup, nil
+}
+
+// BuildEngineForSession constructs a session engine for the in-process standalone
+// conversation runtime. The daemon command uses the same builder for RPC workers.
+func BuildEngineForSession(
+	ctx context.Context,
+	f *cmdutil.Factory,
+	sessionID string,
+	params protocol.SessionStartParams,
+	emitHandler agent.EventHandler,
+) (*agent.Engine, func(), error) {
+	return buildEngineForSession(ctx, f, sessionID, params, emitHandler)
 }

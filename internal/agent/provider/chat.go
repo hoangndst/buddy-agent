@@ -28,6 +28,41 @@ func (p *ChatCompletionsProvider) Protocol() string {
 
 // Generate executes a chat completion step.
 func (p *ChatCompletionsProvider) Generate(ctx context.Context, req GenerateRequest) (*GenerateResponse, error) {
+	params, opts := chatCompletionParams(req)
+	resp, err := p.client.Chat.Completions.New(ctx, params, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeChatCompletion(resp)
+}
+
+// GenerateStream streams user-visible text while buffering tool arguments until
+// the provider has completed the response.
+func (p *ChatCompletionsProvider) GenerateStream(ctx context.Context, req GenerateRequest, onTextDelta func(string) error) (*GenerateResponse, error) {
+	params, opts := chatCompletionParams(req)
+	params.StreamOptions = openai.ChatCompletionStreamOptionsParam{IncludeUsage: openai.Bool(true)}
+	stream := p.client.Chat.Completions.NewStreaming(ctx, params, opts...)
+	defer stream.Close()
+
+	var accumulated openai.ChatCompletionAccumulator
+	for stream.Next() {
+		chunk := stream.Current()
+		if !accumulated.AddChunk(chunk) {
+			return nil, fmt.Errorf("chat completion stream returned inconsistent chunks")
+		}
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" && onTextDelta != nil {
+			if err := onTextDelta(chunk.Choices[0].Delta.Content); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := stream.Err(); err != nil {
+		return nil, err
+	}
+	return normalizeChatCompletion(&accumulated.ChatCompletion)
+}
+
+func chatCompletionParams(req GenerateRequest) (openai.ChatCompletionNewParams, []option.RequestOption) {
 	params := openai.ChatCompletionNewParams{
 		Model:    req.Model,
 		Messages: req.Messages,
@@ -59,11 +94,10 @@ func (p *ChatCompletionsProvider) Generate(ctx context.Context, req GenerateRequ
 		opts = append(opts, option.WithJSONSet("reasoning_effort", req.ReasoningEffort))
 	}
 
-	resp, err := p.client.Chat.Completions.New(ctx, params, opts...)
-	if err != nil {
-		return nil, err
-	}
+	return params, opts
+}
 
+func normalizeChatCompletion(resp *openai.ChatCompletion) (*GenerateResponse, error) {
 	if len(resp.Choices) == 0 {
 		return nil, fmt.Errorf("received empty choices array from chat completions API")
 	}

@@ -35,37 +35,42 @@ type EventType string
 
 // Supported agent event types.
 const (
-	EventStepStart        EventType = "step_start"
-	EventReasoning        EventType = "reasoning"
-	EventThought          EventType = "reasoning" // Deprecated alias for backward test compatibility
-	EventTextDelta        EventType = "text_delta" // Reserved for Milestone 9 streaming tokens
-	EventTextComplete     EventType = "text_complete"
-	EventToolCall         EventType = "tool_call"
-	EventToolResult       EventType = "tool_result"
-	EventFinished         EventType = "finished"
-	EventError            EventType = "error"
-	EventCompactionStart  EventType = "compaction_start"
-	EventCompactionDone   EventType = "compaction_done"
-	EventMicroPruning     EventType = "micro_pruning"
-	EventContextRetrying  EventType = "context_retrying"
-	EventContextExhausted EventType = "context_exhausted"
+	EventStepStart          EventType = "step_start"
+	EventReasoning          EventType = "reasoning"
+	EventThought            EventType = "reasoning"  // Deprecated alias for backward test compatibility
+	EventTextDelta          EventType = "text_delta" // Reserved for Milestone 9 streaming tokens
+	EventTextComplete       EventType = "text_complete"
+	EventStepCommitted      EventType = "step_committed"
+	EventSnapshotCommitted  EventType = "snapshot_committed"
+	EventSubmissionAccepted EventType = "submission_accepted"
+	EventSubmissionApplied  EventType = "submission_applied"
+	EventToolCall           EventType = "tool_call"
+	EventToolResult         EventType = "tool_result"
+	EventFinished           EventType = "finished"
+	EventError              EventType = "error"
+	EventCompactionStart    EventType = "compaction_start"
+	EventCompactionDone     EventType = "compaction_done"
+	EventMicroPruning       EventType = "micro_pruning"
+	EventContextRetrying    EventType = "context_retrying"
+	EventContextExhausted   EventType = "context_exhausted"
 )
 
 // Event conveys real-time execution telemetry to listeners.
 type Event struct {
-	Type         EventType
-	Step         int
-	Timestamp    time.Time
-	Duration     time.Duration
-	Protocol     string
-	Content      string
-	ToolCallID   string
-	ToolName     string
-	ToolArgs     string
-	ToolResult   string
-	ToolExitCode int
-	Usage        provider.TokenUsage
-	Error        error
+	Type            EventType
+	Step            int
+	Timestamp       time.Time
+	Duration        time.Duration
+	Protocol        string
+	Content         string
+	ToolCallID      string
+	ToolName        string
+	ToolArgs        string
+	ToolResult      string
+	ToolExitCode    int
+	Usage           provider.TokenUsage
+	HistoryRevision int64
+	Error           error
 }
 
 // EventHandler receives agent lifecycle events.

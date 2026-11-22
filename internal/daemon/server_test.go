@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 )
 
@@ -172,6 +174,122 @@ func TestSessionManager_BoundCompletedRetention(t *testing.T) {
 	if _, ok := sm.GetSession(workers[2].SessionID()); !ok {
 		t.Errorf("expected session 2 (%s) to be retained", workers[2].SessionID())
 	}
+}
+
+func TestSessionManager_StartConversationAndQueueSubmissions(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := persistence.NewSQLiteStore(filepath.Join(workspace, "buddy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	factory := func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		eng := agent.NewEngine(&mockProvider{}, "test-model", 3, tools.NewRegistry(1000), nil, emitHandler,
+			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID))
+		return eng, nil, nil
+	}
+	manager := NewSessionManager(factory)
+	params := protocol.ConversationStartParams{StartID: "start-stable", SubmissionID: "submission-first", Prompt: "first prompt", WorkspaceDir: workspace}
+	worker, started, err := manager.StartConversation(t.Context(), params, nil)
+	if err != nil {
+		t.Fatalf("start conversation: %v", err)
+	}
+	if started.ConversationID == "" || started.TurnID == "" || started.SessionID != started.ConversationID {
+		t.Fatalf("invalid start result: %+v", started)
+	}
+
+	// A retry must return the same durable conversation and first turn.
+	workerRetry, retry, err := manager.StartConversation(t.Context(), params, nil)
+	if err != nil {
+		t.Fatalf("retry conversation.start: %v", err)
+	}
+	if workerRetry != worker || !retry.Existing || retry.ConversationID != started.ConversationID || retry.TurnID != started.TurnID {
+		t.Fatalf("conversation.start retry did not reuse the original worker/result: worker=%p retry=%+v", workerRetry, retry)
+	}
+	changed := params
+	changed.Prompt = "changed payload"
+	if _, _, err := manager.StartConversation(t.Context(), changed, nil); !errors.Is(err, persistence.ErrSubmissionConflict) {
+		t.Fatalf("expected changed start payload to conflict, got %v", err)
+	}
+
+	waitForConversationTurns(t, store, started.ConversationID, 1)
+	second, existing, err := worker.Submit(t.Context(), &persistence.SubmissionRecord{
+		ConversationID: started.ConversationID, SubmissionID: "submission-second", Prompt: "follow-up", Mode: persistence.SubmissionQueue,
+	})
+	if err != nil {
+		t.Fatalf("submit follow-up: %v", err)
+	}
+	if existing || second.Sequence != 2 {
+		t.Fatalf("unexpected accepted submission: %+v existing=%v", second, existing)
+	}
+	waitForConversationTurns(t, store, started.ConversationID, 2)
+	second, err = store.GetSubmission(t.Context(), started.ConversationID, "submission-second")
+	if err != nil || second.TurnID == nil || *second.TurnID == "" {
+		t.Fatalf("queued prompt was not assigned when its turn started: submission=%+v err=%v", second, err)
+	}
+
+	duplicate, existing, err := worker.Submit(t.Context(), &persistence.SubmissionRecord{
+		ConversationID: started.ConversationID, SubmissionID: "submission-second", Prompt: "follow-up", Mode: persistence.SubmissionQueue,
+	})
+	if err != nil {
+		t.Fatalf("retry conversation.submit: %v", err)
+	}
+	if !existing || duplicate.Sequence != second.Sequence || duplicate.TurnID == nil || *duplicate.TurnID != *second.TurnID {
+		t.Fatalf("submission retry did not preserve accepted identity: %+v existing=%v", duplicate, existing)
+	}
+
+	session, err := store.GetSession(t.Context(), started.ConversationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.InteractionKind != persistence.InteractionConversation || session.Depth != 0 || session.ParentSessionID != nil {
+		t.Fatalf("conversation persisted with wrong interaction kind/role: %+v", session)
+	}
+	manager.Drain(time.Second)
+
+	restartedManager := NewSessionManager(factory)
+	restored, record, err := restartedManager.ResumeConversation(t.Context(), protocol.ConversationResumeParams{
+		WorkspaceDir: workspace, ConversationID: started.ConversationID,
+	}, nil)
+	if err != nil {
+		t.Fatalf("restore conversation after daemon restart: %v", err)
+	}
+	if record.ID != started.ConversationID || record.InteractionKind != persistence.InteractionConversation {
+		t.Fatalf("restored wrong conversation record: %+v", record)
+	}
+	if _, _, err := restored.Submit(t.Context(), &persistence.SubmissionRecord{
+		ConversationID: started.ConversationID, SubmissionID: "submission-after-restore", Prompt: "continue after restore", Mode: persistence.SubmissionQueue,
+	}); err != nil {
+		t.Fatalf("submit after restore: %v", err)
+	}
+	waitForConversationTurns(t, store, started.ConversationID, 3)
+	restartedManager.Drain(time.Second)
+}
+
+func waitForConversationTurns(t *testing.T, store persistence.Store, conversationID string, count int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		turns, err := store.ListConversationTurns(t.Context(), conversationID)
+		if err == nil && len(turns) >= count {
+			ready := true
+			for _, turn := range turns[:count] {
+				if turn.Status != persistence.StatusCompleted {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	turns, err := store.ListConversationTurns(t.Context(), conversationID)
+	t.Fatalf("conversation did not complete %d turns: turns=%+v err=%v", count, turns, err)
 }
 
 func TestServer_DoneSignalsAfterDrain(t *testing.T) {

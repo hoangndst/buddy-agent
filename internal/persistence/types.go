@@ -4,6 +4,8 @@ package persistence
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -18,6 +20,9 @@ var (
 
 	// ErrSessionCompleted is returned when attempting to resume a session that already completed successfully.
 	ErrSessionCompleted = errors.New("session already completed")
+
+	// ErrSubmissionNotFound is returned when a conversation submission does not exist.
+	ErrSubmissionNotFound = errors.New("conversation submission not found")
 )
 
 // SessionStatus represents the operational status of an agent execution session.
@@ -34,6 +39,40 @@ const (
 	StatusInterrupted SessionStatus = "interrupted"
 )
 
+// InteractionKind distinguishes legacy one-shot task executions from M9 conversations.
+type InteractionKind string
+
+const (
+	InteractionTask         InteractionKind = "task"
+	InteractionConversation InteractionKind = "conversation"
+)
+
+// SubmissionMode is the delivery behavior selected for a conversation input.
+type SubmissionMode string
+
+const (
+	SubmissionQueue SubmissionMode = "queue"
+	SubmissionSteer SubmissionMode = "steer"
+)
+
+// SubmissionStatus tracks an accepted user input through turn execution.
+type SubmissionStatus string
+
+const (
+	SubmissionQueued       SubmissionStatus = "queued"
+	SubmissionSteerPending SubmissionStatus = "steer_pending"
+	SubmissionAttached     SubmissionStatus = "attached"
+	SubmissionConsumed     SubmissionStatus = "consumed"
+)
+
+var ErrSubmissionConflict = errors.New("submission ID already exists with a different payload")
+
+// SubmissionFingerprint returns a stable SHA-256 fingerprint of a prompt and delivery mode.
+func SubmissionFingerprint(prompt string, mode SubmissionMode) string {
+	hash := sha256.Sum256([]byte(string(mode) + "\x00" + prompt))
+	return hex.EncodeToString(hash[:])
+}
+
 // TokenUsage aggregates token metrics across model generation turns.
 type TokenUsage struct {
 	PromptTokens     int64 `json:"prompt_tokens"`
@@ -44,20 +83,65 @@ type TokenUsage struct {
 
 // SessionRecord stores lifecycle metadata and token totals for an execution session.
 type SessionRecord struct {
-	ID              string        `json:"id"`
-	CreatedAt       time.Time     `json:"created_at"`
-	UpdatedAt       time.Time     `json:"updated_at"`
+	ID              string          `json:"id"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	Status          SessionStatus   `json:"status"`
+	Task            string          `json:"task"`
+	Model           string          `json:"model"`
+	WorkingDir      string          `json:"working_dir"`
+	MaxSteps        int             `json:"max_steps"`
+	TotalSteps      int             `json:"total_steps"`
+	TokenUsage      TokenUsage      `json:"usage"`
+	ErrorMessage    *string         `json:"error_message,omitempty"`
+	ParentSessionID *string         `json:"parent_session_id,omitempty"`
+	Role            string          `json:"role"`
+	Depth           int             `json:"depth"`
+	InteractionKind InteractionKind `json:"interaction_kind"`
+}
+
+// SubmissionRecord stores one accepted user prompt and its queue/steer delivery state.
+type SubmissionRecord struct {
+	ConversationID         string           `json:"conversation_id"`
+	SubmissionID           string           `json:"submission_id"`
+	Prompt                 string           `json:"prompt"`
+	Mode                   SubmissionMode   `json:"mode"`
+	PayloadFingerprint     string           `json:"payload_fingerprint"`
+	Sequence               int64            `json:"sequence"`
+	TurnID                 *string          `json:"turn_id,omitempty"`
+	Status                 SubmissionStatus `json:"status"`
+	CreatedAt              time.Time        `json:"created_at"`
+	HistoryRevision        int64            `json:"history_revision"`
+	AppliedAfterStep       *int             `json:"applied_after_step,omitempty"`
+	AppliedHistoryRevision int64            `json:"applied_history_revision,omitempty"`
+}
+
+// ConversationStartRequest atomically creates a conversation and admits its first prompt.
+type ConversationStartRequest struct {
+	Session            SessionRecord    `json:"session"`
+	StartID            string           `json:"start_id"`
+	PayloadFingerprint string           `json:"payload_fingerprint"`
+	FirstSubmission    SubmissionRecord `json:"first_submission"`
+}
+
+// ConversationStartResult identifies the durable conversation and first submission.
+type ConversationStartResult struct {
+	ConversationID string `json:"conversation_id"`
+	SubmissionID   string `json:"submission_id"`
+	TurnID         string `json:"turn_id,omitempty"`
+	Existing       bool   `json:"existing"`
+}
+
+// ConversationTurnRecord tracks one user-facing agent execution separately from ReAct steps.
+type ConversationTurnRecord struct {
+	ConversationID  string        `json:"conversation_id"`
+	TurnID          string        `json:"turn_id"`
+	SubmissionID    string        `json:"submission_id"`
 	Status          SessionStatus `json:"status"`
-	Task            string        `json:"task"`
-	Model           string        `json:"model"`
-	WorkingDir      string        `json:"working_dir"`
-	MaxSteps        int           `json:"max_steps"`
-	TotalSteps      int           `json:"total_steps"`
-	TokenUsage      TokenUsage    `json:"usage"`
+	StartedAt       time.Time     `json:"started_at"`
+	FinishedAt      *time.Time    `json:"finished_at,omitempty"`
 	ErrorMessage    *string       `json:"error_message,omitempty"`
-	ParentSessionID *string       `json:"parent_session_id,omitempty"`
-	Role            string        `json:"role"`
-	Depth           int           `json:"depth"`
+	HistoryRevision int64         `json:"history_revision"`
 }
 
 // ToolCallRecord captures an individual tool invocation and its execution result.
@@ -71,15 +155,17 @@ type ToolCallRecord struct {
 
 // TurnRecord captures an atomic conversational step matching TurnBlock.
 type TurnRecord struct {
-	SessionID        string           `json:"session_id"`
-	StepNumber       int              `json:"step_number"`
-	Role             string           `json:"role"`
-	Content          string           `json:"content"`
-	ReasoningContent string           `json:"reasoning_content,omitempty"`
-	ToolCalls        []ToolCallRecord `json:"tool_calls,omitempty"`
-	TokenUsage       TokenUsage       `json:"usage"`
-	DurationMs       int64            `json:"duration_ms"`
-	CreatedAt        time.Time        `json:"created_at"`
+	SessionID          string           `json:"session_id"`
+	ConversationTurnID string           `json:"turn_id,omitempty"`
+	HistoryRevision    int64            `json:"history_revision,omitempty"`
+	StepNumber         int              `json:"step_number"`
+	Role               string           `json:"role"`
+	Content            string           `json:"content"`
+	ReasoningContent   string           `json:"reasoning_content,omitempty"`
+	ToolCalls          []ToolCallRecord `json:"tool_calls,omitempty"`
+	TokenUsage         TokenUsage       `json:"usage"`
+	DurationMs         int64            `json:"duration_ms"`
+	CreatedAt          time.Time        `json:"created_at"`
 }
 
 // SnapshotRecord captures an immutable checkpoint of the Three-Partition context state
@@ -92,6 +178,7 @@ type SnapshotRecord struct {
 	StateTrackerJSON   string    `json:"state_tracker"`
 	CurrentTokens      int       `json:"current_tokens"`
 	CreatedAt          time.Time `json:"created_at"`
+	HistoryRevision    int64     `json:"history_revision"`
 }
 
 // Store defines thread-safe persistence and recovery operations over SQLite.
@@ -102,6 +189,18 @@ type Store interface {
 
 	// Sessions
 	CreateSession(ctx context.Context, session *SessionRecord) error
+	CreateConversation(ctx context.Context, request *ConversationStartRequest) (*ConversationStartResult, error)
+	CreateConversationTurn(ctx context.Context, turn *ConversationTurnRecord) error
+	UpdateConversationTurn(ctx context.Context, turn *ConversationTurnRecord) error
+	ListConversationTurns(ctx context.Context, conversationID string) ([]*ConversationTurnRecord, error)
+	AdmitSubmission(ctx context.Context, submission *SubmissionRecord) (*SubmissionRecord, error)
+	ApplySubmission(ctx context.Context, conversationID, submissionID, turnID string, appliedAfterStep int) (*SubmissionRecord, error)
+	UpdateSubmissionStatus(ctx context.Context, conversationID, submissionID string, status SubmissionStatus, turnID string) error
+	GetSubmission(ctx context.Context, conversationID, submissionID string) (*SubmissionRecord, error)
+	ListSubmissions(ctx context.Context, conversationID string) ([]*SubmissionRecord, error)
+	ListSubmissionsThroughRevision(ctx context.Context, conversationID string, revision int64) ([]*SubmissionRecord, error)
+	ListConversations(ctx context.Context, workingDir string, limit int) ([]*SessionRecord, error)
+	GetHistoryRevision(ctx context.Context, conversationID string) (int64, error)
 	GetSession(ctx context.Context, idOrPrefix string) (*SessionRecord, error)
 	GetLatestResumableSession(ctx context.Context, workingDir string) (*SessionRecord, error)
 	ListSessions(ctx context.Context, workingDir string, limit int) ([]*SessionRecord, error)
@@ -114,11 +213,13 @@ type Store interface {
 	// Turns
 	CommitTurn(ctx context.Context, turn *TurnRecord, totalSteps int, sessionUsage TokenUsage) error
 	GetTurnsAfterStep(ctx context.Context, sessionID string, afterStep int) ([]*TurnRecord, error)
+	GetTurnsThroughRevision(ctx context.Context, conversationID string, revision int64) ([]*TurnRecord, error)
 	GetAllTurns(ctx context.Context, sessionID string) ([]*TurnRecord, error)
 
 	// Snapshots
 	SaveSnapshot(ctx context.Context, snapshot *SnapshotRecord) error
 	GetLatestSnapshot(ctx context.Context, sessionID string) (*SnapshotRecord, error)
+	GetSnapshotThroughRevision(ctx context.Context, conversationID string, revision int64) (*SnapshotRecord, error)
 }
 
 // AmbiguousIDError provides detailed candidate matches when a prefix query collides.

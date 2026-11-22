@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -236,6 +237,23 @@ func createEventNotification(sessionID string, eventID uint64, evt agent.Event, 
 	}
 }
 
+func createConversationEventNotification(conversationID, workerEpoch string, sequence uint64, turnID string, evt agent.Event, terminal bool) (*protocol.JSONRPCMessage, error) {
+	msg, err := createEventNotification(conversationID, sequence, evt, terminal)
+	if err != nil {
+		return nil, err
+	}
+	var event protocol.SessionEventNotification
+	if err := json.Unmarshal(msg.Params, &event); err != nil {
+		return nil, err
+	}
+	event.ConversationID = conversationID
+	event.TurnID = turnID
+	event.WorkerEpoch = workerEpoch
+	event.Sequence = sequence
+	event.HistoryRevision = evt.HistoryRevision
+	return protocol.NewNotification(protocol.NotifyConversationEvent, event)
+}
+
 // EmitEvent appends an event to the ring buffer and broadcasts it to all subscribers.
 func (w *SessionWorker) EmitEvent(evt agent.Event) {
 	w.emitEvent(evt, false)
@@ -357,6 +375,9 @@ func (w *SessionWorker) RequestPermission(tool string, args map[string]any) (boo
 
 // RespondPermission fulfills a pending human-in-the-loop permission request.
 func (w *SessionWorker) RespondPermission(requestID, decision string) error {
+	if decision != "allow" && decision != "deny" {
+		return fmt.Errorf("permission decision must be allow or deny")
+	}
 	w.pendingMu.Lock()
 	defer w.pendingMu.Unlock()
 

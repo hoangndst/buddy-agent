@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/hoangndst/buddy-agent/internal/tools"
@@ -18,9 +19,158 @@ type mockTool struct {
 	desc string
 }
 
-func (m *mockTool) Name() string                               { return m.name }
-func (m *mockTool) Description() string                        { return m.desc }
-func (m *mockTool) Parameters() any                            { return map[string]any{"type": "object"} }
+func TestChatCompletionsProvider_StreamAssemblesTextAndToolArguments(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeChunk := func(delta map[string]any, finish any) {
+			chunk := map[string]any{"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1, "model": "test-model", "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
+			data, _ := json.Marshal(chunk)
+			_, _ = w.Write(append(append([]byte("data: "), data...), []byte("\n\n")...))
+		}
+		writeChunk(map[string]any{"role": "assistant", "content": "Hello "}, nil)
+		writeChunk(map[string]any{"content": "world", "tool_calls": []any{map[string]any{"index": 0, "id": "call_1", "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{"q":"`}}}}, nil)
+		writeChunk(map[string]any{"tool_calls": []any{map[string]any{"index": 0, "function": map[string]any{"arguments": `x"}`}}}}, "tool_calls")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+	client := openai.NewClient(option.WithBaseURL(server.URL), option.WithAPIKey("test"))
+	provider := NewChatCompletionsProvider(&client)
+	var text strings.Builder
+	resp, err := provider.GenerateStream(context.Background(), GenerateRequest{Model: "test-model"}, func(delta string) error {
+		text.WriteString(delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("GenerateStream failed: %v", err)
+	}
+	if text.String() != "Hello world" || resp.Content != "Hello world" {
+		t.Fatalf("text deltas/final response = %q/%q", text.String(), resp.Content)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Arguments != `{"q":"x"}` {
+		t.Fatalf("tool call arguments were not assembled: %+v", resp.ToolCalls)
+	}
+}
+
+func TestResponsesProvider_StreamReturnsCompletedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\",\"sequence_number\":1,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"logprobs\":[]}\n\n"))
+		_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_1\",\"created_at\":1234567890,\"object\":\"response\",\"status\":\"completed\",\"model\":\"test-model\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"))
+	}))
+	defer server.Close()
+	client := openai.NewClient(option.WithBaseURL(server.URL), option.WithAPIKey("test"))
+	provider := NewResponsesProvider(&client)
+	var text strings.Builder
+	resp, err := provider.GenerateStream(context.Background(), GenerateRequest{Model: "test-model"}, func(delta string) error {
+		text.WriteString(delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("GenerateStream failed: %v", err)
+	}
+	if text.String() != "Hi" || resp.Content != "Hi" || resp.Usage.TotalTokens != 3 {
+		t.Fatalf("stream/final response mismatch: deltas=%q response=%+v", text.String(), resp)
+	}
+}
+
+func TestAutoProvider_StreamFallsBackBeforeFirstDelta(t *testing.T) {
+	chatRequests, responseRequests := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/chat/completions":
+			chatRequests++
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "function tools with reasoning_effort are not supported; use /v1/responses"}})
+		case "/responses":
+			responseRequests++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "resp_1", "created_at": 1234567890, "object": "response", "status": "completed", "model": "test-model",
+				"output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "fallback"}}}},
+				"usage":  map[string]any{"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+			})
+		default:
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := openai.NewClient(option.WithBaseURL(server.URL), option.WithAPIKey("test"))
+	auto := NewAutoProvider(NewChatCompletionsProvider(&client), NewResponsesProvider(&client), false)
+	var visible strings.Builder
+	resp, err := auto.GenerateStream(context.Background(), GenerateRequest{Model: "test-model", Tools: []tools.Tool{&mockTool{name: "lookup"}}, ReasoningEffort: "high"}, func(delta string) error {
+		visible.WriteString(delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected pre-output capability fallback: %v", err)
+	}
+	if visible.Len() != 0 || resp.Content != "fallback" || resp.Protocol != "responses" || chatRequests != 2 || responseRequests != 1 {
+		t.Fatalf("unexpected fallback result: visible=%q response=%+v chat=%d responses=%d", visible.String(), resp, chatRequests, responseRequests)
+	}
+}
+
+func TestAutoProvider_StreamDoesNotRetryAfterVisibleDelta(t *testing.T) {
+	chatRequests, responseRequests := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/responses" {
+			responseRequests++
+			http.Error(w, "unexpected fallback", http.StatusInternalServerError)
+			return
+		}
+		chatRequests++
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeChunk := map[string]any{"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1, "model": "test-model", "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": "partial"}, "finish_reason": nil}}}
+		data, _ := json.Marshal(writeChunk)
+		_, _ = w.Write(append(append([]byte("data: "), data...), []byte("\n\n")...))
+		_, _ = w.Write([]byte("data: {broken-json\n\n"))
+	}))
+	defer server.Close()
+	client := openai.NewClient(option.WithBaseURL(server.URL), option.WithAPIKey("test"))
+	auto := NewAutoProvider(NewChatCompletionsProvider(&client), NewResponsesProvider(&client), false)
+	var visible strings.Builder
+	_, err := auto.GenerateStream(context.Background(), GenerateRequest{Model: "test-model"}, func(delta string) error {
+		visible.WriteString(delta)
+		return nil
+	})
+	if err == nil || visible.String() != "partial" || chatRequests != 1 || responseRequests != 0 {
+		t.Fatalf("stream failure was replayed: err=%v visible=%q chat=%d responses=%d", err, visible.String(), chatRequests, responseRequests)
+	}
+}
+
+func TestChatCompletionsProvider_StreamHonorsCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunk := map[string]any{"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1, "model": "test-model", "choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": "partial"}, "finish_reason": nil}}}
+		data, _ := json.Marshal(chunk)
+		_, _ = w.Write(append(append([]byte("data: "), data...), []byte("\n\n")...))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	client := openai.NewClient(option.WithBaseURL(server.URL), option.WithAPIKey("test"))
+	provider := NewChatCompletionsProvider(&client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var visible strings.Builder
+	_, err := provider.GenerateStream(ctx, GenerateRequest{Model: "test-model"}, func(delta string) error {
+		visible.WriteString(delta)
+		cancel()
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) || visible.String() != "partial" {
+		t.Fatalf("cancellation result: err=%v visible=%q", err, visible.String())
+	}
+}
+
+func (m *mockTool) Name() string        { return m.name }
+func (m *mockTool) Description() string { return m.desc }
+func (m *mockTool) Parameters() any     { return map[string]any{"type": "object"} }
 func (m *mockTool) Execute(_ context.Context, _ json.RawMessage) (string, error) {
 	return "ok", nil
 }

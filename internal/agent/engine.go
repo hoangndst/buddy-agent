@@ -158,26 +158,53 @@ type ExecutionResult struct {
 
 // Engine orchestrates the ReAct loop: prompting, tool execution, and memory feedback.
 type Engine struct {
-	provider             provider.ModelProvider
-	compClient           history.CompletionClient
-	model                string
-	reasoningEffort      string
-	maxSteps             int
-	maxContextTokens     int
-	workingTailSize      int
-	isLocal              bool
-	registry             *tools.Registry
-	memoryMgr            *memory.Manager
-	eventHandler         EventHandler
-	store                persistence.Store
-	workspaceDir         string
-	depth                int
-	parentSessionID      string
-	sessionIDOverride   string
-	role                 string
-	systemPromptOverride string
-	inheritedInvariants  []string
-	lastExecutionResult  *ExecutionResult
+	provider                 provider.ModelProvider
+	compClient               history.CompletionClient
+	model                    string
+	reasoningEffort          string
+	maxSteps                 int
+	maxContextTokens         int
+	workingTailSize          int
+	isLocal                  bool
+	registry                 *tools.Registry
+	memoryMgr                *memory.Manager
+	eventHandler             EventHandler
+	store                    persistence.Store
+	workspaceDir             string
+	depth                    int
+	parentSessionID          string
+	sessionIDOverride        string
+	role                     string
+	systemPromptOverride     string
+	inheritedInvariants      []string
+	lastExecutionResult      *ExecutionResult
+	conversationCommitHook   func(func() error, []Event) error
+	conversationBoundaryHook func(context.Context, string, string, *history.Session, int) error
+}
+
+// SetConversationCommitHook orders revision-advancing persistence writes with
+// their associated worker events for a resident conversation.
+func (e *Engine) SetConversationCommitHook(hook func(func() error, []Event) error) {
+	e.conversationCommitHook = hook
+}
+
+func (e *Engine) SetConversationBoundaryHook(hook func(context.Context, string, string, *history.Session, int) error) {
+	e.conversationBoundaryHook = hook
+}
+
+func (e *Engine) commitAndEmit(commit func() error, events ...Event) error {
+	if e.conversationCommitHook != nil {
+		return e.conversationCommitHook(commit, events)
+	}
+	if commit != nil {
+		if err := commit(); err != nil {
+			return err
+		}
+	}
+	for _, event := range events {
+		e.eventHandler(event)
+	}
+	return nil
 }
 
 // LastExecutionResult returns the execution result from the most recent Run invocation.
@@ -193,6 +220,28 @@ func (e *Engine) Registry() *tools.Registry {
 // WorkingTailSize returns the configured unpruned active turn tail size.
 func (e *Engine) WorkingTailSize() int {
 	return e.workingTailSize
+}
+
+// PersistenceStore returns the store configured for this engine, if any.
+// Conversation runtimes use the same store as the engine so transcript writes
+// and turn execution share one persistence boundary.
+func (e *Engine) PersistenceStore() persistence.Store {
+	return e.store
+}
+
+// WorkspaceDir returns the workspace configured for this engine.
+func (e *Engine) WorkspaceDir() string {
+	return e.workspaceDir
+}
+
+// ModelName returns the provider model configured for this engine.
+func (e *Engine) ModelName() string {
+	return e.model
+}
+
+// MaxSteps returns the per-turn step budget configured for this engine.
+func (e *Engine) MaxSteps() int {
+	return e.maxSteps
 }
 
 // NewEngine creates a new Agent Engine.
@@ -240,29 +289,11 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 	if task == "" {
 		return "", errors.New("task cannot be empty")
 	}
+	e.lastExecutionResult = nil
 
-	// 1. Build initial system prompt from memory and skills or override
-	var systemPrompt string
-	if e.systemPromptOverride != "" {
-		systemPrompt = e.systemPromptOverride
-	} else if e.memoryMgr != nil {
-		var err error
-		systemPrompt, err = e.memoryMgr.LoadSystemPrompt()
-		if err != nil {
-			return "", fmt.Errorf("failed to load system prompt: %w", err)
-		}
-	}
-
-	session := history.NewSession(
-		systemPrompt,
-		task,
-		history.WithMaxContextTokens(e.maxContextTokens),
-		history.WithWorkingTailSize(e.workingTailSize),
-	)
-	if len(e.inheritedInvariants) > 0 {
-		for _, inv := range e.inheritedInvariants {
-			session.Tracker().AddInvariant(inv)
-		}
+	session, err := e.NewHistorySession(task)
+	if err != nil {
+		return "", err
 	}
 
 	sessionID := generateSessionID()
@@ -328,7 +359,95 @@ func (e *Engine) Run(ctx context.Context, task string) (string, error) {
 		return "", fmt.Errorf("initial context validation failed: %w", err)
 	}
 
-	return e.executeLoop(ctx, sessionID, session, 1, e.maxSteps, persistence.TokenUsage{})
+	return e.executeLoop(ctx, sessionID, "", session, 1, e.maxSteps, persistence.TokenUsage{})
+}
+
+// NewHistorySession creates an in-memory history with the engine's current system prompt and limits.
+func (e *Engine) NewHistorySession(rootPrompt string) (*history.Session, error) {
+	if rootPrompt == "" {
+		return nil, errors.New("root prompt cannot be empty")
+	}
+	systemPrompt, err := e.currentSystemPrompt()
+	if err != nil {
+		return nil, err
+	}
+	session := history.NewSession(
+		systemPrompt,
+		rootPrompt,
+		history.WithMaxContextTokens(e.maxContextTokens),
+		history.WithWorkingTailSize(e.workingTailSize),
+	)
+	for _, invariant := range e.inheritedInvariants {
+		session.Tracker().AddInvariant(invariant)
+	}
+	return session, nil
+}
+
+func (e *Engine) currentSystemPrompt() (string, error) {
+	var systemPrompt string
+	if e.systemPromptOverride != "" {
+		systemPrompt = e.systemPromptOverride
+	} else if e.memoryMgr != nil {
+		var err error
+		systemPrompt, err = e.memoryMgr.LoadSystemPrompt()
+		if err != nil {
+			return "", fmt.Errorf("failed to load system prompt: %w", err)
+		}
+	}
+	return systemPrompt, nil
+}
+
+// RunConversationTurn executes one user-facing turn against an existing conversation history.
+// Step numbers remain global to the persisted session while the step budget resets for this turn.
+func (e *Engine) RunConversationTurn(
+	ctx context.Context,
+	sessionID, conversationTurnID string,
+	session *history.Session,
+	startStep, stepBudget int,
+	initialUsage persistence.TokenUsage,
+) (string, error) {
+	if sessionID == "" || conversationTurnID == "" || session == nil {
+		return "", errors.New("conversation turn requires session ID, turn ID, and history")
+	}
+	if startStep <= 0 {
+		startStep = 1
+	}
+	if stepBudget <= 0 {
+		stepBudget = e.maxSteps
+	}
+	e.lastExecutionResult = nil
+	if e.memoryMgr != nil && e.systemPromptOverride == "" {
+		prompt, err := e.memoryMgr.LoadSystemPrompt()
+		if err != nil {
+			return "", fmt.Errorf("failed to refresh system prompt: %w", err)
+		}
+		session.ReloadSystemAnchor(prompt)
+	}
+	if e.registry != nil {
+		if tool, ok := e.registry.Get("invoke_subagent"); ok {
+			if subTool, ok := tool.(*InvokeSubagentTool); ok {
+				subTool.SetParentSessionID(sessionID)
+				subTool.SetParentTracker(session.Tracker())
+				subTool.Reset()
+			}
+		}
+	}
+	if e.store != nil {
+		if err := e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusRunning, startStep-1, initialUsage, ""); err != nil {
+			return "", fmt.Errorf("failed to mark conversation active: %w", err)
+		}
+	}
+	if err := session.EnsureWatermarks(ctx, e.compClient, e.model); err != nil {
+		if e.store != nil {
+			status := persistence.StatusFailed
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				status = persistence.StatusInterrupted
+			}
+			_ = e.store.UpdateSessionStatus(context.Background(), sessionID, status, startStep-1, initialUsage, err.Error())
+		}
+		return "", err
+	}
+	return e.executeLoop(ctx, sessionID, conversationTurnID, session, startStep, startStep+stepBudget-1, initialUsage)
 }
 
 // Resume restores an interrupted or failed session from persistence and continues execution.
@@ -340,6 +459,9 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 	sessionRec, err := e.store.GetSession(ctx, sessionID)
 	if err != nil {
 		return "", fmt.Errorf("failed to load session %q: %w", sessionID, err)
+	}
+	if sessionRec.InteractionKind == persistence.InteractionConversation {
+		return "", fmt.Errorf("session %q is a conversation; resume it with the conversation interface", sessionID)
 	}
 
 	if sessionRec.Status == persistence.StatusCompleted {
@@ -490,12 +612,13 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 		return "", fmt.Errorf("resumed context validation failed: %w", err)
 	}
 
-	return e.executeLoop(ctx, sessionRec.ID, session, startStep, totalMaxSteps, sessionRec.TokenUsage)
+	return e.executeLoop(ctx, sessionRec.ID, "", session, startStep, totalMaxSteps, sessionRec.TokenUsage)
 }
 
 func (e *Engine) executeLoop(
 	ctx context.Context,
 	sessionID string,
+	conversationTurnID string,
 	session *history.Session,
 	startStep, totalMaxSteps int,
 	initialUsage persistence.TokenUsage,
@@ -551,6 +674,11 @@ func (e *Engine) executeLoop(
 
 		// Bounded reactive recovery completion loop
 		for retry := 0; retry <= maxTurnRetries; retry++ {
+			if e.conversationBoundaryHook != nil {
+				if err := e.conversationBoundaryHook(ctx, sessionID, conversationTurnID, session, step); err != nil {
+					return "", err
+				}
+			}
 			genReq := provider.GenerateRequest{
 				Model:           e.model,
 				Messages:        session.CompileMessages(),
@@ -561,7 +689,18 @@ func (e *Engine) executeLoop(
 			}
 
 			startCall := time.Now()
-			resp, err := e.provider.Generate(ctx, genReq)
+			var resp *provider.GenerateResponse
+			var err error
+			if streamingProvider, ok := e.provider.(provider.StreamModelProvider); ok {
+				resp, err = streamingProvider.GenerateStream(ctx, genReq, func(delta string) error {
+					if delta != "" {
+						e.eventHandler(Event{Type: EventTextDelta, Step: step, Timestamp: time.Now(), Content: delta, Protocol: e.provider.Protocol()})
+					}
+					return ctx.Err()
+				})
+			} else {
+				resp, err = e.provider.Generate(ctx, genReq)
+			}
 			callDuration := time.Since(startCall)
 
 			if err == nil {
@@ -662,13 +801,15 @@ func (e *Engine) executeLoop(
 		// If no tools called, task has concluded
 		if len(genResp.ToolCalls) == 0 {
 			session.CommitSimpleAssistant(genResp.ToChatMessage())
+			var turnRec *persistence.TurnRecord
 			if e.store != nil && sessionID != "" {
-				turnRec := &persistence.TurnRecord{
-					SessionID:        sessionID,
-					StepNumber:       step,
-					Role:             "assistant",
-					Content:          genResp.Content,
-					ReasoningContent: genResp.ReasoningContent,
+				turnRec = &persistence.TurnRecord{
+					SessionID:          sessionID,
+					ConversationTurnID: conversationTurnID,
+					StepNumber:         step,
+					Role:               "assistant",
+					Content:            genResp.Content,
+					ReasoningContent:   genResp.ReasoningContent,
 					TokenUsage: persistence.TokenUsage{
 						PromptTokens:     genResp.Usage.PromptTokens,
 						CompletionTokens: genResp.Usage.CompletionTokens,
@@ -678,25 +819,34 @@ func (e *Engine) executeLoop(
 					DurationMs: time.Since(stepStartTime).Milliseconds(),
 					CreatedAt:  time.Now().UTC(),
 				}
-				_ = e.store.CommitTurn(ctx, turnRec, step, getBillingUsage())
-				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusCompleted, step, getBillingUsage(), "")
 			}
-			e.eventHandler(Event{
+			textComplete := Event{
 				Type:      EventTextComplete,
 				Step:      step,
 				Timestamp: time.Now(),
 				Content:   genResp.Content,
 				Protocol:  genResp.Protocol,
 				Usage:     genResp.Usage,
-			})
-			e.eventHandler(Event{
+			}
+			finished := Event{
 				Type:      EventFinished,
 				Step:      step,
 				Timestamp: time.Now(),
 				Content:   genResp.Content,
 				Protocol:  genResp.Protocol,
 				Usage:     genResp.Usage,
-			})
+			}
+			var commit func() error
+			if turnRec != nil {
+				commit = func() error { return e.store.CommitTurn(ctx, turnRec, step, getBillingUsage()) }
+			}
+			if err := e.commitAndEmit(commit, textComplete, finished); err != nil {
+				e.eventHandler(Event{Type: EventError, Step: step, Error: err})
+				return "", fmt.Errorf("persist completed conversation step: %w", err)
+			}
+			if e.store != nil && sessionID != "" {
+				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusCompleted, step, getBillingUsage(), "")
+			}
 			e.lastExecutionResult = &ExecutionResult{
 				SessionID:     sessionID,
 				Status:        persistence.StatusCompleted,
@@ -815,12 +965,13 @@ func (e *Engine) executeLoop(
 				}
 			}
 			turnRec := &persistence.TurnRecord{
-				SessionID:        sessionID,
-				StepNumber:       step,
-				Role:             "assistant",
-				Content:          genResp.Content,
-				ReasoningContent: genResp.ReasoningContent,
-				ToolCalls:        toolCalls,
+				SessionID:          sessionID,
+				ConversationTurnID: conversationTurnID,
+				StepNumber:         step,
+				Role:               "assistant",
+				Content:            genResp.Content,
+				ReasoningContent:   genResp.ReasoningContent,
+				ToolCalls:          toolCalls,
 				TokenUsage: persistence.TokenUsage{
 					PromptTokens:     genResp.Usage.PromptTokens,
 					CompletionTokens: genResp.Usage.CompletionTokens,
@@ -831,8 +982,13 @@ func (e *Engine) executeLoop(
 				CreatedAt:  time.Now().UTC(),
 			}
 			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			_ = e.store.CommitTurn(persistCtx, turnRec, step, getBillingUsage())
+			commitErr := e.commitAndEmit(func() error { return e.store.CommitTurn(persistCtx, turnRec, step, getBillingUsage()) }, Event{
+				Type: EventStepCommitted, Step: step, Timestamp: time.Now(), Content: genResp.Content, Protocol: genResp.Protocol,
+			})
 			cancel()
+			if commitErr != nil {
+				return "", fmt.Errorf("persist conversation tool step: %w", commitErr)
+			}
 		}
 
 		if ctx.Err() != nil {
@@ -878,7 +1034,11 @@ func (e *Engine) executeLoop(
 					CurrentTokens:      currentTokens,
 					CreatedAt:          time.Now().UTC(),
 				}
-				_ = e.store.SaveSnapshot(ctx, snapRec)
+				if err := e.commitAndEmit(func() error { return e.store.SaveSnapshot(ctx, snapRec) }, Event{
+					Type: EventSnapshotCommitted, Step: snapRec.StepNumber, Timestamp: time.Now(),
+				}); err != nil {
+					return "", fmt.Errorf("persist conversation snapshot: %w", err)
+				}
 			}
 		}
 	}
@@ -908,10 +1068,11 @@ func (e *Engine) executeLoop(
 			synthStep := totalMaxSteps + 1
 			if e.store != nil && sessionID != "" {
 				turnRec := &persistence.TurnRecord{
-					SessionID:  sessionID,
-					StepNumber: synthStep,
-					Role:       "assistant",
-					Content:    synthResp.Content,
+					SessionID:          sessionID,
+					ConversationTurnID: conversationTurnID,
+					StepNumber:         synthStep,
+					Role:               "assistant",
+					Content:            synthResp.Content,
 					TokenUsage: persistence.TokenUsage{
 						PromptTokens:     synthResp.Usage.PromptTokens,
 						CompletionTokens: synthResp.Usage.CompletionTokens,
@@ -921,7 +1082,11 @@ func (e *Engine) executeLoop(
 					DurationMs: 0,
 					CreatedAt:  time.Now().UTC(),
 				}
-				_ = e.store.CommitTurn(ctx, turnRec, synthStep, getBillingUsage())
+				if err := e.commitAndEmit(func() error { return e.store.CommitTurn(ctx, turnRec, synthStep, getBillingUsage()) }, Event{
+					Type: EventStepCommitted, Step: synthStep, Content: synthResp.Content, Timestamp: time.Now(),
+				}); err != nil {
+					return "", fmt.Errorf("persist synthesized step: %w", err)
+				}
 				_ = e.store.UpdateSessionStatus(ctx, sessionID, persistence.StatusFailed, synthStep, getBillingUsage(), "maximum step budget reached (synthesized)")
 			}
 			e.lastExecutionResult = &ExecutionResult{

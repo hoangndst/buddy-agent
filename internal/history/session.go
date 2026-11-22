@@ -18,6 +18,7 @@ type Session struct {
 
 	systemAnchor      string        // Partition 1: Immutable System Anchor
 	episodicNarrative string        // Partition 2: Distilled narrative summary
+	rootPromptID      string        // Identity of the initial task block while it remains in active history.
 	tracker           *StateTracker // Partition 2: Deterministic state table
 	blocks            []TurnBlock   // Partition 3 (and staged intermediate history)
 	config            SessionConfig
@@ -45,6 +46,7 @@ func NewSession(systemPrompt, task string, opts ...Option) *Session {
 	rootBlock := NewUserBlock(task)
 	rootBlock.EstimatedTokens = EstimateBlock(&rootBlock)
 	s.blocks = append(s.blocks, rootBlock)
+	s.rootPromptID = rootBlock.ID
 
 	initialTokens := EstimateContent(systemPrompt) + rootBlock.EstimatedTokens
 	s.estimator = NewUsageTracker(initialTokens)
@@ -82,7 +84,7 @@ func (s *Session) CompileMessages() []openai.ChatCompletionMessageParamUnion {
 		// [F-02] If the oldest uncompacted turn in s.blocks is the initial root user task (BlockKindUser),
 		// coalesce it into Partition 2 (which already contains the Root Objective) rather than emitting
 		// two consecutive User turns, preserving strict provider alternating role invariants.
-		if len(s.blocks) > 0 && s.blocks[0].Kind == BlockKindUser {
+		if len(s.blocks) > 0 && s.blocks[0].Kind == BlockKindUser && s.blocks[0].ID == s.rootPromptID {
 			startIndex = 1
 		}
 
@@ -101,6 +103,22 @@ func (s *Session) CompileMessages() []openai.ChatCompletionMessageParamUnion {
 	}
 
 	return msgs
+}
+
+// AppendUserPrompt adds a follow-up user message without changing the root objective.
+func (s *Session) AppendUserPrompt(prompt string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return fmt.Errorf("user prompt must not be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	block := NewUserBlock(prompt)
+	block.EstimatedTokens = EstimateBlock(&block)
+	s.blocks = append(s.blocks, block)
+	s.estimator.AddDelta(block.EstimatedTokens)
+	s.eagerMicroPruneBoundaryLocked()
+	return nil
 }
 
 // CalibrateUsage synchronizes baseline token tracking with exact prompt tokens from the API response.
@@ -516,6 +534,7 @@ func RestoreSession(state RestoredState, opts ...Option) (*Session, error) {
 		rootBlock := NewUserBlock(state.Task)
 		rootBlock.EstimatedTokens = EstimateBlock(&rootBlock)
 		s.blocks = append(s.blocks, rootBlock)
+		s.rootPromptID = rootBlock.ID
 	}
 
 	s.blocks = append(s.blocks, state.TrailingTurns...)

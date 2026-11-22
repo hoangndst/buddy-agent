@@ -16,6 +16,12 @@ type ModelProvider interface {
 	Generate(ctx context.Context, req GenerateRequest) (*GenerateResponse, error)
 }
 
+// StreamModelProvider is an optional provider capability. Providers that do not
+// implement it continue to work through ModelProvider.Generate.
+type StreamModelProvider interface {
+	GenerateStream(ctx context.Context, req GenerateRequest, onTextDelta func(string) error) (*GenerateResponse, error)
+}
+
 // GenerateRequest defines canonical parameters for an LLM turn.
 type GenerateRequest struct {
 	Model           string

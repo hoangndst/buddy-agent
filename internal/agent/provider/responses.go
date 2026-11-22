@@ -29,6 +29,53 @@ func (p *ResponsesProvider) Protocol() string {
 
 // Generate executes a response generation step.
 func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (*GenerateResponse, error) {
+	params, opts := responseParams(req)
+	resp, err := p.client.Responses.New(ctx, params, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeResponse(resp)
+}
+
+// GenerateStream streams text deltas and returns only the completed normalized
+// response. Tool argument events are intentionally buffered by the API response
+// and are dispatched by the engine only after completion.
+func (p *ResponsesProvider) GenerateStream(ctx context.Context, req GenerateRequest, onTextDelta func(string) error) (*GenerateResponse, error) {
+	params, opts := responseParams(req)
+	stream := p.client.Responses.NewStreaming(ctx, params, opts...)
+	defer stream.Close()
+
+	var completed *responses.Response
+	for stream.Next() {
+		event := stream.Current()
+		switch event.Type {
+		case "response.output_text.delta", "response.refusal.delta":
+			delta := event.Delta.OfString
+			if delta != "" && onTextDelta != nil {
+				if err := onTextDelta(delta); err != nil {
+					return nil, err
+				}
+			}
+		case "response.completed":
+			resp := event.Response
+			completed = &resp
+		case "response.failed", "error":
+			if event.Message != "" {
+				return nil, fmt.Errorf("responses stream failed: %s", event.Message)
+			}
+			return nil, fmt.Errorf("responses stream failed (%s)", event.Type)
+		}
+	}
+	if err := stream.Err(); err != nil {
+		return nil, err
+	}
+	if completed == nil {
+		return nil, fmt.Errorf("responses stream ended without a completed response")
+	}
+	return normalizeResponse(completed)
+}
+
+func responseParams(req GenerateRequest) (responses.ResponseNewParams, []option.RequestOption) {
 	inputItems := mapMessagesToResponseInputs(req.Messages)
 
 	params := responses.ResponseNewParams{
@@ -59,11 +106,10 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 		}
 	}
 
-	resp, err := p.client.Responses.New(ctx, params, opts...)
-	if err != nil {
-		return nil, err
-	}
+	return params, opts
+}
 
+func normalizeResponse(resp *responses.Response) (*GenerateResponse, error) {
 	var reasoningParts []string
 	var toolCalls []ToolCall
 

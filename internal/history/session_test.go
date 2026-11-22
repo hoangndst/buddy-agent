@@ -935,6 +935,36 @@ func TestRestoreSession_WithCompactedSnapshot(t *testing.T) {
 	}
 }
 
+func TestAppendUserPromptAfterRootCompactionRemainsInModelContext(t *testing.T) {
+	session := NewSession("You are Buddy.", "Initial objective")
+	session.CommitSimpleAssistant(openai.ChatCompletionMessage{
+		Role:    "assistant",
+		Content: "The initial objective is underway.",
+	})
+	if err := session.AppendUserPrompt("Follow-up question"); err != nil {
+		t.Fatalf("AppendUserPrompt failed: %v", err)
+	}
+	if err := session.AppendUserPrompt("  "); err == nil {
+		t.Fatal("expected an empty follow-up prompt to fail")
+	}
+
+	session.tracker.RecordFileAccess("main.go", "inspected")
+	session.mu.Lock()
+	session.episodicNarrative = "The initial objective is underway."
+	// Simulate compaction removing the original root prompt while retaining its assistant turn
+	// and the newer user prompt in the working history tail.
+	session.blocks = session.blocks[1:]
+	session.mu.Unlock()
+
+	messages := session.CompileMessages()
+	if len(messages) != 4 {
+		t.Fatalf("expected system, episodic anchor, assistant, and follow-up messages; got %d", len(messages))
+	}
+	if messages[3].OfUser == nil || messages[3].OfUser.Content.OfString.Value != "Follow-up question" {
+		t.Fatalf("follow-up prompt was lost or miscompiled after root compaction: %+v", messages[3])
+	}
+}
+
 func TestCompaction_LastCompactedStepTracking(t *testing.T) {
 	session := NewSession(
 		"You are Buddy.",
@@ -982,4 +1012,3 @@ func TestCompaction_LastCompactedStepTracking(t *testing.T) {
 		t.Fatalf("expected 2 blocks in working tail, got %d", session.BlockCount())
 	}
 }
-

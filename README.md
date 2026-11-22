@@ -15,6 +15,7 @@ A robust, self-evolving autonomous agent harness built in pure Go, supporting bo
 - **Provider Agnostic**: OpenAI-compatible REST integration using official `openai-go` SDK supporting local inference runners and cloud providers.
 - **Durable Memory & Persona**: Context-aware memory layer using file-backed storage (`SOUL.md`, `MEMORY.md`, `USER.md`) alongside structured episodic records.
 - **Pure Go SQLite State Persistence & Crash Recovery**: Embedded pure Go SQLite trajectory ledger (`modernc.org/sqlite`) with dual connection pools, atomic turn persistence (`turns.tool_calls JSON`), secret redaction, and seamless session resumption (`buddy resume`).
+- **Conversation TUI**: Bubble Tea terminal conversations with durable multi-turn history, queued prompts by default, explicit `/steer`, project-scoped `/resume`, and `buddy --continue`.
 - **Self-Improving Skill System**: Dynamically captures discovered procedures and workflows into an extensible `skills/` library.
 - **Zero CGO**: Pure Go for fast, static single-binary compilation across platforms (`linux`, `darwin`, `windows`).
 
@@ -26,11 +27,12 @@ Approved milestone design specifications are maintained under [`docs/designs/`](
 - [`docs/designs/04_model_context_protocol.md`](docs/designs/04_model_context_protocol.md): Supervised MCP client integration and two-tier tool configuration.
 - [`docs/designs/05_universal_model_protocols_and_ux.md`](docs/designs/05_universal_model_protocols_and_ux.md): Dual protocol engine, reasoning visibility, and clean REPL UX.
 - [`docs/designs/06_sqlite_state_persistence.md`](docs/designs/06_sqlite_state_persistence.md): Pure Go SQLite episodic trajectory store, atomic turn persistence, secret redaction, and crash recovery.
+- [`docs/designs/09_terminal_user_interface.md`](docs/designs/09_terminal_user_interface.md): Bubble Tea conversation UI, queue and steer behavior, daemon reconnection, and standalone conversation runtime.
 
 ## Getting Started
 
 ### Prerequisites
-- Go 1.22+
+- Go 1.25.4+
 - An OpenAI-compatible API endpoint (local runner or cloud provider)
 
 ### Setup
@@ -45,6 +47,14 @@ Approved milestone design specifications are maintained under [`docs/designs/`](
    go build -o bin/buddy-agent ./cmd/buddy
    ```
 4. Run:
+   ```bash
+   ./bin/buddy-agent
+   ```
+   This opens an interactive conversation when run in a terminal. Continue the latest conversation in the current workspace with:
+   ```bash
+   ./bin/buddy-agent --continue
+   ```
+   One-shot tasks remain available:
    ```bash
    ./bin/buddy-agent "Inspect the repository and run all tests"
    ```

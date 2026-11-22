@@ -10,6 +10,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/daemon"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 )
 
@@ -17,6 +18,138 @@ type mockProvider struct{}
 
 func (m *mockProvider) Protocol() string {
 	return "chat"
+}
+
+func TestClient_ConversationStartAndSubmit(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := persistence.NewSQLiteStore(filepath.Join(workspace, "buddy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	catalog, err := persistence.NewWorkspaceCatalog(filepath.Join(workspace, "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sockPath := filepath.Join(workspace, "conversation.sock")
+	factory := func(sessionID string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		eng := agent.NewEngine(&mockProvider{}, "test-model", 3, tools.NewRegistry(1000), nil, emitHandler,
+			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID))
+		return eng, nil, nil
+	}
+	manager := daemon.NewSessionManager(factory)
+	manager.SetWorkspaceCatalog(catalog)
+	server := daemon.NewServer(daemon.NewSocketManager(sockPath), manager)
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = server.Stop() }()
+	client, err := Connect(sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	started, err := client.StartConversation(protocol.ConversationStartParams{
+		StartID: "stable-start", SubmissionID: "first-submission", Prompt: "first prompt", WorkspaceDir: workspace,
+	})
+	if err != nil {
+		t.Fatalf("start conversation: %v", err)
+	}
+	capabilities, err := client.Capabilities()
+	if err != nil {
+		t.Fatalf("daemon capabilities: %v", err)
+	}
+	if !containsString(capabilities.Methods, protocol.MethodConversationSync) {
+		t.Fatalf("daemon did not advertise conversation.sync: %+v", capabilities)
+	}
+	workspaces, err := client.ListConversationWorkspaces(10)
+	if err != nil {
+		t.Fatalf("list conversation workspaces: %v", err)
+	}
+	if len(workspaces.Workspaces) != 1 || workspaces.Workspaces[0].WorkspaceDir != workspace {
+		t.Fatalf("unexpected workspaces: %+v", workspaces.Workspaces)
+	}
+	conversations, err := client.ListConversations(protocol.ConversationListParams{WorkspaceDir: workspace, Limit: 10})
+	if err != nil {
+		t.Fatalf("list conversations: %v", err)
+	}
+	if len(conversations.Conversations) != 1 || conversations.Conversations[0].DBPath == "" {
+		t.Fatalf("unexpected conversations: %+v", conversations.Conversations)
+	}
+	queued, err := client.SubmitConversation(protocol.ConversationSubmitParams{
+		ConversationID: started.ConversationID, SubmissionID: "second-submission", Prompt: "follow-up", Mode: "queue",
+	})
+	if err != nil {
+		t.Fatalf("submit follow-up: %v", err)
+	}
+	if queued.Sequence != 2 {
+		t.Fatalf("invalid queued submission result: %+v", queued)
+	}
+
+	terminalTurns := map[string]bool{}
+	timer := time.NewTimer(4 * time.Second)
+	defer timer.Stop()
+	for len(terminalTurns) < 2 {
+		select {
+		case evt, ok := <-client.ConversationEvents():
+			if !ok {
+				t.Fatal("conversation event stream closed")
+			}
+			if evt.ConversationID != started.ConversationID || evt.SessionID != started.ConversationID || evt.WorkerEpoch == "" || evt.Sequence == 0 {
+				t.Fatalf("conversation event missing compatibility/cursor fields: %+v", evt)
+			}
+			if evt.Data["terminal"] == true {
+				if evt.HistoryRevision == 0 {
+					t.Fatalf("terminal event missing committed history revision: %+v", evt)
+				}
+				terminalTurns[evt.TurnID] = true
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for both turn terminals; received %v", terminalTurns)
+		}
+	}
+
+	firstPage, err := client.SyncConversation(protocol.ConversationSyncParams{ConversationID: started.ConversationID, PageSize: 2})
+	if err != nil {
+		t.Fatalf("sync conversation: %v", err)
+	}
+	if firstPage.HistoryRevision == 0 || firstPage.WorkerEpoch == "" || firstPage.EventWatermark == 0 || firstPage.NextPageToken == "" {
+		t.Fatalf("sync response missing revision/cursor/page state: %+v", firstPage)
+	}
+	if firstPage.OutputIncomplete {
+		t.Fatalf("completed durable conversation unexpectedly needs output recovery: %+v", firstPage)
+	}
+	secondPage, err := client.SyncConversation(protocol.ConversationSyncParams{
+		ConversationID: started.ConversationID, HistoryRevision: firstPage.HistoryRevision,
+		WorkerEpoch: firstPage.WorkerEpoch, AfterSequence: firstPage.EventWatermark,
+		PageToken: firstPage.NextPageToken, PageSize: 2,
+	})
+	if err != nil {
+		t.Fatalf("fetch pinned transcript page: %v", err)
+	}
+	if len(firstPage.Transcript) != 2 || len(secondPage.Transcript) < 1 || secondPage.HistoryRevision != firstPage.HistoryRevision {
+		t.Fatalf("revision-pinned transcript pagination failed: first=%+v second=%+v", firstPage, secondPage)
+	}
+	resumed, err := client.ResumeConversation(protocol.ConversationResumeParams{WorkspaceDir: workspace, ConversationID: started.ConversationID, DBPath: conversations.Conversations[0].DBPath})
+	if err != nil {
+		t.Fatalf("resume conversation: %v", err)
+	}
+	if resumed.ConversationID != started.ConversationID || resumed.HistoryRevision != firstPage.HistoryRevision {
+		t.Fatalf("resume did not preserve conversation identity/revision: %+v", resumed)
+	}
+}
+
+func containsString(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *mockProvider) Generate(_ context.Context, _ provider.GenerateRequest) (*provider.GenerateResponse, error) {
