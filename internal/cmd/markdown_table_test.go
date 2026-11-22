@@ -77,6 +77,22 @@ func TestProcessMarkdownTablesInText(t *testing.T) {
 	}
 }
 
+func TestProcessMarkdownTablesPreservesFencedCodeBlocks(t *testing.T) {
+	content := "Before\n```markdown\n| a | b |\n| --- | --- |\n| very long content that would otherwise be formatted or truncated | 2 |\n```\nAfter"
+	processed := ProcessMarkdownTables(content, 40, 200)
+
+	if !strings.Contains(processed, "| very long content that would otherwise be formatted or truncated | 2 |") {
+		t.Fatalf("expected literal table source inside code fence preserved, got: %s", processed)
+	}
+
+	tildeContent := "Before\n~~~markdown\n| a | b |\n| --- | --- |\n| very long content that would otherwise be formatted or truncated | 2 |\n~~~\nAfter"
+	tildeProcessed := ProcessMarkdownTables(tildeContent, 40, 200)
+
+	if !strings.Contains(tildeProcessed, "| very long content that would otherwise be formatted or truncated | 2 |") {
+		t.Fatalf("expected literal table source inside tilde fence preserved, got: %s", tildeProcessed)
+	}
+}
+
 func TestFormatMarkdownTableCJKWidth(t *testing.T) {
 	lines := []string{
 		"| 项目 | 描述 |",

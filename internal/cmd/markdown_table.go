@@ -18,7 +18,7 @@ type FormattedTable struct {
 }
 
 // ProcessMarkdownTables detects markdown table blocks in text and renders them with
-// width-aware column allocation and row truncation capping.
+// width-aware column allocation and row truncation capping. Fenced code blocks are preserved intact.
 func ProcessMarkdownTables(text string, maxWidth int, maxRows int) string {
 	if maxWidth <= 0 {
 		maxWidth = 80
@@ -31,6 +31,9 @@ func ProcessMarkdownTables(text string, maxWidth int, maxRows int) string {
 	var out []string
 	var tableLines []string
 	inTable := false
+	inCodeBlock := false
+	activeFenceChar := ""
+	activeFenceLen := 0
 
 	flushTable := func() {
 		if len(tableLines) == 0 {
@@ -44,6 +47,33 @@ func ProcessMarkdownTables(text string, maxWidth int, maxRows int) string {
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
+
+		if isFence, fenceChar, fenceLen := parseCodeFence(trimmed); isFence {
+			if !inCodeBlock {
+				if inTable {
+					flushTable()
+				}
+				inCodeBlock = true
+				activeFenceChar = fenceChar
+				activeFenceLen = fenceLen
+				out = append(out, line)
+				continue
+			} else if fenceChar == activeFenceChar && fenceLen >= activeFenceLen {
+				if strings.TrimSpace(trimmed[fenceLen:]) == "" {
+					inCodeBlock = false
+					activeFenceChar = ""
+					activeFenceLen = 0
+					out = append(out, line)
+					continue
+				}
+			}
+		}
+
+		if inCodeBlock {
+			out = append(out, line)
+			continue
+		}
+
 		if isTableLine(trimmed) {
 			inTable = true
 			tableLines = append(tableLines, line)
@@ -59,6 +89,24 @@ func ProcessMarkdownTables(text string, maxWidth int, maxRows int) string {
 	}
 
 	return strings.Join(out, "\n")
+}
+
+func parseCodeFence(trimmed string) (bool, string, int) {
+	if len(trimmed) < 3 {
+		return false, "", 0
+	}
+	ch := trimmed[0]
+	if ch != '`' && ch != '~' {
+		return false, "", 0
+	}
+	count := 0
+	for count < len(trimmed) && trimmed[count] == ch {
+		count++
+	}
+	if count < 3 {
+		return false, "", 0
+	}
+	return true, string(ch), count
 }
 
 func isTableLine(line string) bool {
