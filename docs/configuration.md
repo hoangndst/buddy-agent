@@ -1,49 +1,13 @@
 # Configuration Reference
 
-Buddy Agent loads configuration from YAML files, environment variables, and CLI flags with deterministic precedence:
+Buddy Agent loads configuration from environment variables (including `.env` files) and CLI flags with deterministic precedence:
 1. **CLI Flags** (highest priority)
-2. **Environment Variables**
-3. **Configuration File** (`buddy.yaml` or `.buddy/config.yaml`)
-4. **Built-in Defaults** (lowest priority)
-
-## Configuration File (`buddy.yaml`)
-
-An example `buddy.yaml` file located in the workspace root or `~/.buddy/config.yaml`:
-
-```yaml
-# Model and Provider Settings
-model: "gpt-4o"
-base_url: "https://api.openai.com/v1"
-api_key: "${OPENAI_API_KEY}"
-api_type: "chat"              # "chat" (/v1/chat/completions), "responses" (/v1/responses), or auto-detect
-reasoning_effort: "medium"    # "low", "medium", "high" (for reasoning models)
-
-# Execution Constraints
-max_steps: 30                 # Maximum ReAct steps per turn
-max_context_tokens: 64000     # Context window capacity ceiling
-max_output_chars: 25000       # Maximum output characters per tool result
-working_tail_size: 10         # Number of active turn blocks retained before compaction
-
-# Environment and Workspace
-workspace_dir: "."
-socket_path: "~/.buddy/daemon.sock"
-db_path: "~/.buddy/history.db"
-
-# Model Context Protocol (MCP) Servers
-mcp_servers:
-  filesystem:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
-  github:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
-```
-
----
+2. **Environment Variables** (or `.env` in the current working directory)
+3. **Built-in Defaults** (lowest priority)
 
 ## Environment Variables
+
+Buddy Agent automatically loads a `.env` file in the working directory on startup if present. You can configure provider settings, workspace boundaries, and execution constraints using environment variables:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
@@ -54,12 +18,42 @@ mcp_servers:
 | `BUDDY_REASONING_EFFORT` | `""` | Reasoning effort for reasoning models (`low`, `medium`, `high`). |
 | `BUDDY_SOCKET_PATH` | `~/.buddy/daemon.sock` | Unix domain socket path for daemon IPC. |
 | `BUDDY_DB_PATH` | `~/.buddy/history.db` | Path to the SQLite trajectory database. |
-| `BUDDY_WORKSPACE_DIR` | `.` | Target workspace directory. |
+| `BUDDY_WORKSPACE` | `.` | Target workspace directory. |
 | `BUDDY_MAX_STEPS` | `30` | Maximum steps per turn. |
-| `BUDDY_MAX_CONTEXT_TOKENS` | `64000` | Context token limit before compaction triggers. |
+| `BUDDY_MAX_CONTEXT_TOKENS` | `64000` (cloud) / `16384` (local) | Context token limit before compaction triggers. |
 | `BUDDY_MAX_OUTPUT_CHARS` | `25000` | Tool output truncation limit. |
-| `BUDDY_WORKING_TAIL_SIZE` | `10` | Unpruned turn blocks retained in working tail. |
-| `BUDDY_NOTIFICATIONS` | `unfocused` | Desktop notifications: `unfocused`, `always`, or `never`. |
+| `BUDDY_WORKING_TAIL_SIZE` | `10` | Active turn blocks retained before compaction. |
+| `BUDDY_DEBUG` | `false` | Enable verbose debug logging. |
+
+### Example `.env` File
+
+```bash
+# Model and Provider Settings
+OPENAI_API_KEY=sk-...
+BUDDY_MODEL=gpt-4o
+BUDDY_BASE_URL=https://api.openai.com/v1
+
+# Execution Constraints
+BUDDY_MAX_STEPS=30
+BUDDY_MAX_CONTEXT_TOKENS=64000
+BUDDY_MAX_OUTPUT_CHARS=25000
+
+# Daemon and Persistence
+BUDDY_SOCKET_PATH=~/.buddy/daemon.sock
+BUDDY_DB_PATH=~/.buddy/history.db
+```
+
+---
+
+## Model Context Protocol (MCP) Configuration
+
+MCP servers are configured via JSON documents loaded from:
+* Global configuration: `~/.buddy/mcp.json`
+* Project configuration: `<workspace>/.buddy/mcp.json`
+
+Project configuration merges on top of global configuration by server name, allowing individual projects to add servers or disable global servers via `"disabled": true`.
+
+See [MCP Integration](mcp.md) for complete schema documentation and server configuration examples.
 
 ---
 

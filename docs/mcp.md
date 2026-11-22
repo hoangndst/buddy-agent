@@ -36,27 +36,31 @@ Buddy Agent implements first-party client support for the Model Context Protocol
 
 ## Configuration
 
-MCP servers are defined under the `mcp_servers` section of `buddy.yaml`:
+MCP servers are configured via JSON files located at `~/.buddy/mcp.json` (global) or `<workspace>/.buddy/mcp.json` (project-specific). Configurations declare servers under the `mcpServers` object key:
 
-```yaml
-mcp_servers:
-  # Stdio server with environment expansion
-  github:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
-
-  # Stdio server with custom working directory
-  postgres:
-    command: "docker"
-    args: ["run", "-i", "--rm", "mcp/postgres", "postgresql://localhost/mydb"]
-
-  # Remote SSE server
-  remote_service:
-    url: "https://mcp.internal.example.com/sse"
-    headers:
-      Authorization: "Bearer ${INTERNAL_API_KEY}"
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..."
+      }
+    },
+    "postgres": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "mcp/postgres", "postgresql://localhost/mydb"],
+      "workDir": "."
+    },
+    "remote_service": {
+      "url": "https://mcp.internal.example.com/sse",
+      "headers": {
+        "Authorization": "Bearer token..."
+      }
+    }
+  }
+}
 ```
 
 ---

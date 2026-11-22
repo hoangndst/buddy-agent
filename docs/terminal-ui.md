@@ -65,6 +65,6 @@ When a tool call requires user confirmation (e.g. destructive shell commands), a
 | `Esc` | Modal / Popup | Dismiss overlay / cancel popup without losing draft. |
 | `Esc` | Active Turn | Interrupt the currently running turn. |
 | `Ctrl+D` | Any | Detach from the session without stopping daemon execution. |
-| `Ctrl+C` | Editing | Clear current composer draft; double-press exits client. |
+| `Ctrl+C` | Any | Immediately exit the client. |
 | `Ctrl+P` / `Ctrl+N` | Composer | Traverse prompt history ring (previous / next). |
 | `PageUp` / `PageDown` | Viewport | Scroll conversation transcript history. |
