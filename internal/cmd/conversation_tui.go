@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -944,6 +945,27 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return errorMessage(err)
 				}
 			}
+			if text == "/copy" {
+				var full strings.Builder
+				for _, block := range m.blocks {
+					if full.Len() > 0 {
+						full.WriteString("\n\n")
+					}
+					full.WriteString(block.Body)
+				}
+				encoded := base64.StdEncoding.EncodeToString([]byte(full.String()))
+				osc52 := fmt.Sprintf("\x1b]52;c;%s\x07", encoded)
+				m.transcript = append(m.transcript, uiBuddyStyle.Render("Buddy")+"\nCopied full transcript to clipboard.")
+				m.appendBlock(TranscriptBlock{
+					ID:        newConversationID("block"),
+					Kind:      BlockAssistantMessage,
+					Role:      "assistant",
+					Header:    "Buddy",
+					Body:      "Copied full transcript to clipboard.",
+					CreatedAt: time.Now(),
+				})
+				return m, tea.Printf("%s", osc52)
+			}
 			if strings.HasPrefix(text, "/steer ") {
 				return m, m.submit(strings.TrimSpace(strings.TrimPrefix(text, "/steer ")), persistence.SubmissionSteer)
 			}
@@ -980,9 +1002,9 @@ func (m *conversationTUI) View() tea.View {
 		}
 	} else {
 		if len(m.blocks) > 0 {
-			visible := m.computeVisibleBlocks()
-			for _, block := range visible {
-				b.WriteString(m.renderBlock(block, m.width) + "\n\n")
+			lines := m.computeVisibleLines()
+			for _, line := range lines {
+				b.WriteString(line + "\n")
 			}
 		} else {
 			visible := max(4, m.height-12)
@@ -1265,28 +1287,9 @@ func (m *conversationTUI) getBlockLineCount(b TranscriptBlock, width int) int {
 			return count
 		}
 	}
-	if m.wrapCache != nil {
-		if lines, ok := m.wrapCache[key]; ok {
-			count := len(lines) + 1
-			if m.lineCountCache == nil {
-				m.lineCountCache = make(map[string]int)
-			}
-			m.lineCountCache[key] = count
-			return count
-		}
-	}
-	// Fast line count estimation for off-screen blocks without executing full markdown formatting passes.
-	lines := strings.Split(b.Body, "\n")
-	count := 1 // header line
-	for _, l := range lines {
-		w := len(l)
-		if w == 0 {
-			count++
-		} else {
-			count += (w + width - 1) / width
-		}
-	}
-	count++ // separator newline
+	// Use rendered wrapped lines to accurately capture preview truncations and table capping
+	lines := m.getWrappedLines(b, width)
+	count := len(lines) + 1 // separator newline
 	if m.lineCountCache == nil {
 		m.lineCountCache = make(map[string]int)
 	}
@@ -1421,6 +1424,68 @@ func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {
 		}
 	}
 	return visible
+}
+
+func (m *conversationTUI) computeVisibleLines() []string {
+	if len(m.blocks) == 0 {
+		return nil
+	}
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	vpHeight := m.viewportHeight()
+
+	type blockLinesEntry struct {
+		lines []string
+	}
+	entries := make([]blockLinesEntry, len(m.blocks))
+	totalLines := 0
+	for i, b := range m.blocks {
+		wLines := m.getWrappedLines(b, width)
+		linesWithSep := make([]string, len(wLines)+1)
+		copy(linesWithSep, wLines)
+		linesWithSep[len(wLines)] = ""
+		entries[i] = blockLinesEntry{lines: linesWithSep}
+		totalLines += len(linesWithSep)
+	}
+
+	if totalLines <= vpHeight {
+		m.scrollOffset = 0
+		var allLines []string
+		for _, e := range entries {
+			allLines = append(allLines, e.lines...)
+		}
+		return allLines
+	}
+
+	maxScroll := max(0, totalLines-vpHeight)
+	if m.scrollOffset > maxScroll {
+		m.scrollOffset = maxScroll
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
+
+	windowBottom := totalLines - m.scrollOffset
+	windowTop := max(0, windowBottom-vpHeight)
+
+	var visibleLines []string
+	curLine := 0
+	for _, e := range entries {
+		blockStart := curLine
+		blockEnd := curLine + len(e.lines)
+		curLine = blockEnd
+
+		if blockEnd > windowTop && blockStart < windowBottom {
+			sliceStart := max(0, windowTop-blockStart)
+			sliceEnd := min(len(e.lines), windowBottom-blockStart)
+			if sliceStart < sliceEnd {
+				visibleLines = append(visibleLines, e.lines[sliceStart:sliceEnd]...)
+			}
+		}
+	}
+	return visibleLines
 }
 
 func (m *conversationTUI) listWorkspaces() tea.Cmd {

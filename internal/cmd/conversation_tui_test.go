@@ -629,3 +629,85 @@ func TestConversationTUIToolEventHyperlink(t *testing.T) {
 		t.Fatalf("toolBlock Header missing file and line: %s", toolBlock.Header)
 	}
 }
+
+func TestConversationTUICopyCommand(t *testing.T) {
+	model := &conversationTUI{
+		textarea:       textarea.New(),
+		width:          80,
+		height:         24,
+		lineCountCache: make(map[string]int),
+		wrapCache:      make(map[string][]string),
+	}
+	model.appendBlock(TranscriptBlock{
+		ID:        "msg-1",
+		Kind:      BlockAssistantMessage,
+		Role:      "assistant",
+		Header:    "Buddy",
+		Body:      "Secret transcript content for clipboard copy",
+		CreatedAt: time.Now(),
+	})
+
+	model.textarea.SetValue("/copy")
+	updated, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	model = updated.(*conversationTUI)
+
+	if cmd == nil {
+		t.Fatal("expected OSC 52 command returned on /copy")
+	}
+	if len(model.blocks) < 2 {
+		t.Fatal("expected notification block appended after /copy")
+	}
+	lastBlock := model.blocks[len(model.blocks)-1]
+	if !strings.Contains(lastBlock.Body, "Copied full transcript to clipboard") {
+		t.Fatalf("expected copy confirmation, got: %s", lastBlock.Body)
+	}
+}
+
+func TestConversationTUILongBlockClipping(t *testing.T) {
+	model := &conversationTUI{
+		textarea:       textarea.New(),
+		width:          80,
+		height:         24,
+		lineCountCache: make(map[string]int),
+		wrapCache:      make(map[string][]string),
+	}
+
+	// 100-line single assistant response
+	var longLines []string
+	for i := 1; i <= 100; i++ {
+		longLines = append(longLines, fmt.Sprintf("Response line %d", i))
+	}
+	model.appendBlock(TranscriptBlock{
+		ID:        "long-response",
+		Kind:      BlockAssistantMessage,
+		Role:      "assistant",
+		Header:    "Buddy",
+		Body:      strings.Join(longLines, "\n"),
+		CreatedAt: time.Now(),
+	})
+
+	// At bottom (scrollOffset = 0)
+	model.scrollOffset = 0
+	linesBottom := model.computeVisibleLines()
+	if len(linesBottom) >= 100 {
+		t.Fatalf("visible lines should be clipped to viewport height, got %d", len(linesBottom))
+	}
+	bottomText := strings.Join(linesBottom, "\n")
+	if !strings.Contains(bottomText, "Response line 100") {
+		t.Fatalf("bottom view missing last response line: %s", bottomText)
+	}
+	if strings.Contains(bottomText, "Response line 1\n") {
+		t.Fatalf("bottom view should not contain first response line: %s", bottomText)
+	}
+
+	// Scroll up
+	model.scrollOffset = 1000 // clamped to top
+	linesTop := model.computeVisibleLines()
+	topText := strings.Join(linesTop, "\n")
+	if !strings.Contains(topText, "Response line 1") {
+		t.Fatalf("top view missing first response line: %s", topText)
+	}
+	if strings.Contains(topText, "Response line 100") {
+		t.Fatalf("top view should not contain last response line: %s", topText)
+	}
+}

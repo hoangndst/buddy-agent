@@ -76,3 +76,35 @@ func TestProcessMarkdownTablesInText(t *testing.T) {
 		t.Fatalf("table missing: %s", processed)
 	}
 }
+
+func TestFormatMarkdownTableCJKWidth(t *testing.T) {
+	lines := []string{
+		"| 项目 | 描述 |",
+		"| --- | --- |",
+		"| 测试 | 中文字符终端单元格宽度测试 |",
+	}
+
+	res := FormatMarkdownTable(lines, 40, 200)
+	for _, row := range strings.Split(res.Rendered, "\n") {
+		w := cellWidth(row)
+		if w > 40 {
+			t.Fatalf("row exceeded maxWidth 40: cellWidth=%d, row=%q", w, row)
+		}
+	}
+}
+
+func TestFormatMarkdownTableMinimumColumnReservation(t *testing.T) {
+	lines := []string{
+		"| Col1 | Col2 | Col3 |",
+		"| --- | --- | --- |",
+		"| " + strings.Repeat("A", 1000) + " | B | C |",
+	}
+
+	res := FormatMarkdownTable(lines, 80, 200)
+	for _, row := range strings.Split(res.Rendered, "\n") {
+		w := cellWidth(row)
+		if w > 80 {
+			t.Fatalf("row exceeded maxWidth 80: cellWidth=%d, row=%q", w, row)
+		}
+	}
+}

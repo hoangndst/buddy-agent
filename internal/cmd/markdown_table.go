@@ -3,7 +3,8 @@ package cmd
 import (
 	"fmt"
 	"strings"
-	"unicode/utf8"
+
+	"charm.land/lipgloss/v2"
 )
 
 // DefaultMaxTableRows is the maximum number of markdown table rows rendered visually.
@@ -120,11 +121,11 @@ func FormatMarkdownTable(lines []string, maxWidth int, maxRows int) FormattedTab
 	numCols := len(rawRows[0])
 	colWidths := make([]int, numCols)
 
-	// Measure content widths
+	// Measure content widths in terminal cells
 	for _, row := range rawRows {
 		for i, cell := range row {
 			if i < numCols {
-				w := utf8.RuneCountInString(cell)
+				w := cellWidth(cell)
 				if w > colWidths[i] {
 					colWidths[i] = w
 				}
@@ -132,7 +133,7 @@ func FormatMarkdownTable(lines []string, maxWidth int, maxRows int) FormattedTab
 		}
 	}
 
-	// Ensure min width for delimiters
+	// Ensure min width of 3 for each column
 	for i := range colWidths {
 		if colWidths[i] < 3 {
 			colWidths[i] = 3
@@ -146,22 +147,40 @@ func FormatMarkdownTable(lines []string, maxWidth int, maxRows int) FormattedTab
 		totalNeeded += w
 	}
 
-	// If table exceeds maxWidth, distribute available budget proportionately
+	// If table exceeds maxWidth, distribute available budget proportionately while reserving minWidth=3
 	if totalNeeded > maxWidth && maxWidth > overhead {
 		availableForContent := maxWidth - overhead
-		if availableForContent < numCols*3 {
-			availableForContent = numCols * 3
-		}
-		sumOriginal := 0
-		for _, w := range colWidths {
-			sumOriginal += w
-		}
-		for i := range colWidths {
-			scaled := (colWidths[i] * availableForContent) / sumOriginal
-			if scaled < 3 {
-				scaled = 3
+		minContentNeeded := numCols * 3
+		if availableForContent <= minContentNeeded {
+			for i := range colWidths {
+				colWidths[i] = 3
 			}
-			colWidths[i] = scaled
+		} else {
+			remainingBudget := availableForContent - minContentNeeded
+			excess := make([]int, numCols)
+			sumExcess := 0
+			for i, w := range colWidths {
+				if w > 3 {
+					excess[i] = w - 3
+					sumExcess += excess[i]
+				}
+			}
+			if sumExcess > 0 {
+				allocated := 0
+				for i := range colWidths {
+					add := (excess[i] * remainingBudget) / sumExcess
+					colWidths[i] = 3 + add
+					allocated += add
+				}
+				remainder := remainingBudget - allocated
+				for i := 0; i < remainder && i < numCols; i++ {
+					colWidths[i]++
+				}
+			} else {
+				for i := range colWidths {
+					colWidths[i] = 3
+				}
+			}
 		}
 	}
 
@@ -190,20 +209,11 @@ func FormatMarkdownTable(lines []string, maxWidth int, maxRows int) FormattedTab
 			if isDelim {
 				b.WriteString(strings.Repeat("-", width))
 			} else {
-				cellLen := utf8.RuneCountInString(cell)
-				if cellLen > width {
-					if width > 3 {
-						runes := []rune(cell)
-						cell = string(runes[:width-3]) + "..."
-					} else {
-						runes := []rune(cell)
-						cell = string(runes[:width])
-					}
-					cellLen = utf8.RuneCountInString(cell)
-				}
-				b.WriteString(cell)
-				if width > cellLen {
-					b.WriteString(strings.Repeat(" ", width-cellLen))
+				cellText := truncateToCellWidth(cell, width)
+				cellW := cellWidth(cellText)
+				b.WriteString(cellText)
+				if width > cellW {
+					b.WriteString(strings.Repeat(" ", width-cellW))
 				}
 			}
 			b.WriteString(" |")
@@ -228,4 +238,42 @@ func FormatMarkdownTable(lines []string, maxWidth int, maxRows int) FormattedTab
 		TotalRows:   len(dataRows),
 		OmittedRows: omitted,
 	}
+}
+
+func cellWidth(s string) int {
+	return lipgloss.Width(s)
+}
+
+func truncateToCellWidth(s string, targetWidth int) string {
+	if lipgloss.Width(s) <= targetWidth {
+		return s
+	}
+	if targetWidth <= 0 {
+		return ""
+	}
+	if targetWidth >= 3 {
+		var b strings.Builder
+		cur := 0
+		for _, r := range s {
+			rw := lipgloss.Width(string(r))
+			if cur+rw+3 > targetWidth {
+				break
+			}
+			b.WriteRune(r)
+			cur += rw
+		}
+		b.WriteString("...")
+		return b.String()
+	}
+	var b strings.Builder
+	cur := 0
+	for _, r := range s {
+		rw := lipgloss.Width(string(r))
+		if cur+rw > targetWidth {
+			break
+		}
+		b.WriteRune(r)
+		cur += rw
+	}
+	return b.String()
 }
