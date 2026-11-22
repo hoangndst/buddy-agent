@@ -45,6 +45,7 @@ var (
 func NewRootCmd(f *cmdutil.Factory) *cobra.Command {
 	var standalone bool
 	var socketPath string
+	var continueConversation bool
 
 	rootCmd := &cobra.Command{
 		Use:   "buddy [task]",
@@ -54,15 +55,25 @@ three-partition context memory compaction, and Model Context Protocol (MCP) inte
 		SilenceUsage: true,
 		Args:         cobra.ArbitraryArgs,
 		RunE: func(c *cobra.Command, args []string) error {
+			if continueConversation && len(args) > 0 {
+				return fmt.Errorf("--continue cannot be combined with a task argument")
+			}
 			if len(args) > 0 {
 				return runTask(c.Context(), f, args, standalone, socketPath)
 			}
-			return runREPL(c.Context(), f)
+			if isInteractive(f.IOStreams.In) && isInteractive(f.IOStreams.Out) {
+				return runConversationTUI(c.Context(), f, socketPath, continueConversation, standalone)
+			}
+			if standalone {
+				return runConversationStandalone(c.Context(), f, continueConversation)
+			}
+			return runConversationLines(c.Context(), f, socketPath, continueConversation)
 		},
 	}
 
-	rootCmd.PersistentFlags().BoolVar(&standalone, "standalone", false, "Run task in-process without connecting to the background daemon")
+	rootCmd.PersistentFlags().BoolVar(&standalone, "standalone", false, "Run tasks and conversations in-process without the background daemon")
 	rootCmd.PersistentFlags().StringVar(&socketPath, "socket", "", "Path to the Unix domain socket")
+	rootCmd.Flags().BoolVar(&continueConversation, "continue", false, "Continue the latest conversation in the current workspace")
 
 	rootCmd.AddCommand(mcpcmd.NewCmdMCP(f))
 	rootCmd.AddCommand(doc.NewCmdDoc(f))
@@ -465,42 +476,4 @@ func streamClientEvents(ctx context.Context, f *cmdutil.Factory, cl *client.Clie
 			}
 		}
 	}
-}
-
-func runREPL(ctx context.Context, f *cmdutil.Factory) error {
-	engine, cleanup, err := setupEngine(ctx, f)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	cfg, _ := f.ConfigLoader()
-	model := "unknown"
-	workspace := "."
-	if cfg != nil {
-		model = cfg.Model
-		workspace = cfg.WorkspaceDir
-	}
-
-	_, _ = fmt.Fprintln(f.IOStreams.Out, doneStyle.Render("=== buddy-agent CLI ready ==="))
-	_, _ = fmt.Fprintf(f.IOStreams.Out, "Model: %s | Workspace: %s\n", model, workspace)
-	_, _ = fmt.Fprintln(f.IOStreams.Out, "Enter your prompt (or 'exit' to quit):")
-
-	scanner := bufio.NewScanner(f.IOStreams.In)
-	for {
-		_, _ = fmt.Fprint(f.IOStreams.Out, "\nbuddy> ")
-		if !scanner.Scan() {
-			break
-		}
-		input := strings.TrimSpace(scanner.Text())
-		if input == "" {
-			continue
-		}
-		if input == "exit" || input == "quit" {
-			break
-		}
-
-		_, _ = engine.Run(ctx, input)
-	}
-	return nil
 }

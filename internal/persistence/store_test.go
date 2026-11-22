@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,8 +34,217 @@ func TestMigrationRunner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query user_version: %v", err)
 	}
-	if version != 2 {
-		t.Errorf("expected user_version 2, got %d", version)
+	if version != 5 {
+		t.Errorf("expected user_version 5, got %d", version)
+	}
+}
+
+func TestMigration003BackfillsExistingSessionsAsTasks(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("from_v%d", version), func(t *testing.T) {
+			dsn := fmt.Sprintf("file:migration_%d_%d?mode=memory&cache=shared&_pragma=foreign_keys(ON)", version, time.Now().UnixNano())
+			db, err := sql.Open("sqlite", dsn)
+			if err != nil {
+				t.Fatalf("failed to open legacy database: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			db.SetMaxOpenConns(1)
+			ctx := context.Background()
+			legacySchema := `
+				CREATE TABLE sessions (id TEXT PRIMARY KEY, working_dir TEXT, updated_at DATETIME);
+				CREATE TABLE turns (session_id TEXT, step_number INTEGER);
+				CREATE TABLE episodic_snapshots (session_id TEXT, step_number INTEGER);
+			`
+			if version >= 2 {
+				legacySchema = `
+					CREATE TABLE sessions (id TEXT PRIMARY KEY, working_dir TEXT, updated_at DATETIME, parent_session_id TEXT, role TEXT, depth INTEGER);
+					CREATE INDEX idx_sessions_parent ON sessions(parent_session_id);
+					CREATE INDEX idx_sessions_depth ON sessions(depth);
+					CREATE TABLE turns (session_id TEXT, step_number INTEGER);
+					CREATE TABLE episodic_snapshots (session_id TEXT, step_number INTEGER);
+				`
+			}
+			if _, err := db.ExecContext(ctx, legacySchema); err != nil {
+				t.Fatalf("failed to create v%d schema: %v", version, err)
+			}
+			if _, err := db.ExecContext(ctx, `INSERT INTO sessions(id, working_dir) VALUES ('legacy-task', '/legacy')`); err != nil {
+				t.Fatalf("failed to seed v%d session: %v", version, err)
+			}
+			if _, err := db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, version)); err != nil {
+				t.Fatalf("failed to set v%d schema version: %v", version, err)
+			}
+
+			store := &SQLiteStore{writerDB: db, readerDB: db, isMemory: true}
+			if err := store.Migrate(ctx); err != nil {
+				t.Fatalf("migration from v%d failed: %v", version, err)
+			}
+			var kind string
+			if err := db.QueryRowContext(ctx, `SELECT interaction_kind FROM sessions WHERE id = 'legacy-task'`).Scan(&kind); err != nil {
+				t.Fatalf("failed to read backfilled interaction kind: %v", err)
+			}
+			if kind != string(InteractionTask) {
+				t.Fatalf("expected legacy row kind %q, got %q", InteractionTask, kind)
+			}
+			var gotVersion int
+			if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&gotVersion); err != nil || gotVersion != 5 {
+				t.Fatalf("expected schema version 5, got %d (err=%v)", gotVersion, err)
+			}
+		})
+	}
+}
+
+func TestApplySubmissionPersistsTurnBoundaryAtomically(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	conversationID := "conv_apply_boundary"
+	firstTurnID := "turn-first"
+	_, err := store.CreateConversation(ctx, &ConversationStartRequest{
+		Session:         SessionRecord{ID: conversationID, WorkingDir: "/apply/workspace", Model: "test"},
+		StartID:         "start-apply",
+		FirstSubmission: SubmissionRecord{SubmissionID: "sub-first", Prompt: "root prompt", TurnID: &firstTurnID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := store.AdmitSubmission(ctx, &SubmissionRecord{
+		ConversationID: conversationID, SubmissionID: "sub-next", Prompt: "follow-up", Mode: SubmissionQueue,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.TurnID != nil || queued.Status != SubmissionQueued {
+		t.Fatalf("admission assigned execution identity too early: %+v", queued)
+	}
+
+	applied, err := store.ApplySubmission(ctx, conversationID, queued.SubmissionID, "turn-next", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.Status != SubmissionAttached || applied.TurnID == nil || *applied.TurnID != "turn-next" || applied.AppliedAfterStep == nil || *applied.AppliedAfterStep != 7 {
+		t.Fatalf("submission boundary not persisted: %+v", applied)
+	}
+	if applied.AppliedHistoryRevision <= applied.HistoryRevision {
+		t.Fatalf("apply revision should follow admission revision: %+v", applied)
+	}
+	retry, err := store.ApplySubmission(ctx, conversationID, queued.SubmissionID, "turn-next", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.AppliedHistoryRevision != applied.AppliedHistoryRevision {
+		t.Fatalf("idempotent apply changed revision: before=%d after=%d", applied.AppliedHistoryRevision, retry.AppliedHistoryRevision)
+	}
+	revision, err := store.GetHistoryRevision(ctx, conversationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision != applied.AppliedHistoryRevision {
+		t.Fatalf("session and submission revisions diverged: got=%d applied=%d", revision, applied.AppliedHistoryRevision)
+	}
+}
+
+func TestConversationStartSubmissionIdempotencyAndHistoryRevision(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	turnID := "turn-1"
+	prompt := "start a conversation"
+	fingerprint := SubmissionFingerprint(prompt, SubmissionQueue)
+	request := &ConversationStartRequest{
+		Session: SessionRecord{
+			ID:         "conv_persist_01",
+			WorkingDir: "/test/conversation-workspace",
+			Model:      "test-model",
+		},
+		StartID:            "start-01",
+		PayloadFingerprint: fingerprint,
+		FirstSubmission: SubmissionRecord{
+			SubmissionID:       "sub-01",
+			Prompt:             prompt,
+			Mode:               SubmissionQueue,
+			PayloadFingerprint: fingerprint,
+			TurnID:             &turnID,
+		},
+	}
+
+	created, err := store.CreateConversation(ctx, request)
+	if err != nil {
+		t.Fatalf("CreateConversation failed: %v", err)
+	}
+	if created.ConversationID != request.Session.ID || created.TurnID != turnID || created.Existing {
+		t.Fatalf("unexpected create result: %+v", created)
+	}
+
+	retried, err := store.CreateConversation(ctx, request)
+	if err != nil {
+		t.Fatalf("idempotent CreateConversation retry failed: %v", err)
+	}
+	if !retried.Existing || retried.ConversationID != created.ConversationID || retried.TurnID != turnID {
+		t.Fatalf("retry did not return original conversation: %+v", retried)
+	}
+
+	changedStart := *request
+	changedStart.FirstSubmission.Prompt = "different prompt"
+	if _, err := store.CreateConversation(ctx, &changedStart); !errors.Is(err, ErrSubmissionConflict) {
+		t.Fatalf("expected changed start payload conflict, got %v", err)
+	}
+
+	revision, err := store.GetHistoryRevision(ctx, created.ConversationID)
+	if err != nil || revision != 1 {
+		t.Fatalf("expected initial history revision 1, got revision=%d err=%v", revision, err)
+	}
+
+	second := &SubmissionRecord{
+		ConversationID: created.ConversationID,
+		SubmissionID:   "sub-02",
+		Prompt:         "follow-up prompt",
+		Mode:           SubmissionQueue,
+	}
+	accepted, err := store.AdmitSubmission(ctx, second)
+	if err != nil {
+		t.Fatalf("AdmitSubmission failed: %v", err)
+	}
+	if accepted.Sequence != 2 || accepted.HistoryRevision != 2 || accepted.Status != SubmissionQueued {
+		t.Fatalf("unexpected accepted submission: %+v", accepted)
+	}
+	duplicate, err := store.AdmitSubmission(ctx, &SubmissionRecord{
+		ConversationID: created.ConversationID,
+		SubmissionID:   "sub-02",
+		Prompt:         "follow-up prompt",
+		Mode:           SubmissionQueue,
+	})
+	if err != nil || duplicate.Sequence != 2 {
+		t.Fatalf("same-payload retry should return original submission: record=%+v err=%v", duplicate, err)
+	}
+	if _, err := store.AdmitSubmission(ctx, &SubmissionRecord{
+		ConversationID: created.ConversationID,
+		SubmissionID:   "sub-02",
+		Prompt:         "changed prompt",
+		Mode:           SubmissionQueue,
+	}); !errors.Is(err, ErrSubmissionConflict) {
+		t.Fatalf("expected changed submission payload conflict, got %v", err)
+	}
+
+	if err := store.UpdateSubmissionStatus(ctx, created.ConversationID, "sub-02", SubmissionAttached, "turn-2"); err != nil {
+		t.Fatalf("failed to attach submission to turn: %v", err)
+	}
+	if err := store.UpdateSubmissionStatus(ctx, created.ConversationID, "sub-02", SubmissionConsumed, "turn-2"); err != nil {
+		t.Fatalf("failed to consume submission: %v", err)
+	}
+	if err := store.UpdateSubmissionStatus(ctx, created.ConversationID, "sub-02", SubmissionQueued, ""); err == nil {
+		t.Fatal("expected invalid submission status transition to fail")
+	}
+
+	throughOne, err := store.ListSubmissionsThroughRevision(ctx, created.ConversationID, 1)
+	if err != nil || len(throughOne) != 1 {
+		t.Fatalf("revision 1 should expose only the first prompt: count=%d err=%v", len(throughOne), err)
+	}
+	throughTwo, err := store.ListSubmissionsThroughRevision(ctx, created.ConversationID, 2)
+	if err != nil || len(throughTwo) != 2 {
+		t.Fatalf("revision 2 should expose both prompts: count=%d err=%v", len(throughTwo), err)
+	}
+
+	listed, err := store.ListConversations(ctx, request.Session.WorkingDir, 10)
+	if err != nil || len(listed) != 1 || listed[0].InteractionKind != InteractionConversation {
+		t.Fatalf("expected only the M9 conversation in the conversation list: rows=%+v err=%v", listed, err)
 	}
 }
 

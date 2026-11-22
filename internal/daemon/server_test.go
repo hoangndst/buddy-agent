@@ -2,7 +2,10 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,10 +16,22 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 )
 
 type mockProvider struct{}
+
+type resumeTestProvider struct{ calls chan struct{} }
+
+func (p resumeTestProvider) Protocol() string { return "chat" }
+func (p resumeTestProvider) Generate(context.Context, provider.GenerateRequest) (*provider.GenerateResponse, error) {
+	select {
+	case p.calls <- struct{}{}:
+	default:
+	}
+	return &provider.GenerateResponse{Protocol: "chat", Content: "restored answer"}, nil
+}
 
 func (m *mockProvider) Protocol() string {
 	return "chat"
@@ -172,6 +187,428 @@ func TestSessionManager_BoundCompletedRetention(t *testing.T) {
 	if _, ok := sm.GetSession(workers[2].SessionID()); !ok {
 		t.Errorf("expected session 2 (%s) to be retained", workers[2].SessionID())
 	}
+}
+
+func TestSessionManager_StartConversationAndQueueSubmissions(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := persistence.NewSQLiteStore(filepath.Join(workspace, "buddy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	factory := func(sessionID string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		eng := agent.NewEngine(&mockProvider{}, "test-model", 3, tools.NewRegistry(1000), nil, emitHandler,
+			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID))
+		return eng, nil, nil
+	}
+	manager := NewSessionManager(factory)
+	params := protocol.ConversationStartParams{StartID: "start-stable", SubmissionID: "submission-first", Prompt: "first prompt", WorkspaceDir: workspace}
+	worker, started, err := manager.StartConversation(t.Context(), params, nil)
+	if err != nil {
+		t.Fatalf("start conversation: %v", err)
+	}
+	if started.ConversationID == "" || started.TurnID == "" || started.SessionID != started.ConversationID {
+		t.Fatalf("invalid start result: %+v", started)
+	}
+
+	// A retry must return the same durable conversation and first turn.
+	workerRetry, retry, err := manager.StartConversation(t.Context(), params, nil)
+	if err != nil {
+		t.Fatalf("retry conversation.start: %v", err)
+	}
+	if workerRetry != worker || !retry.Existing || retry.ConversationID != started.ConversationID || retry.TurnID != started.TurnID {
+		t.Fatalf("conversation.start retry did not reuse the original worker/result: worker=%p retry=%+v", workerRetry, retry)
+	}
+	changed := params
+	changed.Prompt = "changed payload"
+	if _, _, err := manager.StartConversation(t.Context(), changed, nil); !errors.Is(err, persistence.ErrSubmissionConflict) {
+		t.Fatalf("expected changed start payload to conflict, got %v", err)
+	}
+
+	waitForConversationTurns(t, store, started.ConversationID, 1)
+	second, existing, err := worker.Submit(t.Context(), &persistence.SubmissionRecord{
+		ConversationID: started.ConversationID, SubmissionID: "submission-second", Prompt: "follow-up", Mode: persistence.SubmissionQueue,
+	})
+	if err != nil {
+		t.Fatalf("submit follow-up: %v", err)
+	}
+	if existing || second.Sequence != 2 {
+		t.Fatalf("unexpected accepted submission: %+v existing=%v", second, existing)
+	}
+	waitForConversationTurns(t, store, started.ConversationID, 2)
+	second, err = store.GetSubmission(t.Context(), started.ConversationID, "submission-second")
+	if err != nil || second.TurnID == nil || *second.TurnID == "" {
+		t.Fatalf("queued prompt was not assigned when its turn started: submission=%+v err=%v", second, err)
+	}
+
+	duplicate, existing, err := worker.Submit(t.Context(), &persistence.SubmissionRecord{
+		ConversationID: started.ConversationID, SubmissionID: "submission-second", Prompt: "follow-up", Mode: persistence.SubmissionQueue,
+	})
+	if err != nil {
+		t.Fatalf("retry conversation.submit: %v", err)
+	}
+	if !existing || duplicate.Sequence != second.Sequence || duplicate.TurnID == nil || *duplicate.TurnID != *second.TurnID {
+		t.Fatalf("submission retry did not preserve accepted identity: %+v existing=%v", duplicate, existing)
+	}
+
+	session, err := store.GetSession(t.Context(), started.ConversationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.InteractionKind != persistence.InteractionConversation || session.Depth != 0 || session.ParentSessionID != nil {
+		t.Fatalf("conversation persisted with wrong interaction kind/role: %+v", session)
+	}
+	manager.Drain(time.Second)
+
+	restartedManager := NewSessionManager(factory)
+	restored, record, err := restartedManager.ResumeConversation(t.Context(), protocol.ConversationResumeParams{
+		WorkspaceDir: workspace, ConversationID: started.ConversationID,
+	}, nil)
+	if err != nil {
+		t.Fatalf("restore conversation after daemon restart: %v", err)
+	}
+	if record.ID != started.ConversationID || record.InteractionKind != persistence.InteractionConversation {
+		t.Fatalf("restored wrong conversation record: %+v", record)
+	}
+	if _, _, err := restored.Submit(t.Context(), &persistence.SubmissionRecord{
+		ConversationID: started.ConversationID, SubmissionID: "submission-after-restore", Prompt: "continue after restore", Mode: persistence.SubmissionQueue,
+	}); err != nil {
+		t.Fatalf("submit after restore: %v", err)
+	}
+	waitForConversationTurns(t, store, started.ConversationID, 3)
+	restartedManager.Drain(time.Second)
+}
+
+func TestResumeConversationRequiresEphemeralCredentialAndReconfigures(t *testing.T) {
+	workspace := t.TempDir()
+	dbPath := filepath.Join(workspace, "buddy.db")
+	store, err := persistence.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	calls := make(chan struct{}, 4)
+	factory := func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		eng := agent.NewEngine(resumeTestProvider{calls: calls}, params.Model, 3, tools.NewRegistry(1000), nil, emitHandler,
+			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID),
+			agent.WithProviderMetadata(params.BaseURL, params.APIType, 1000))
+		return eng, nil, nil
+	}
+	secret := "ephemeral-test-secret"
+	manager := NewSessionManager(factory)
+	_, started, err := manager.StartConversation(t.Context(), protocol.ConversationStartParams{
+		StartID: "ephemeral-start", SubmissionID: "ephemeral-first", Prompt: "first prompt", WorkspaceDir: workspace,
+		Model: "test-model", BaseURL: "https://provider.example/v1", APIType: "chat", APIKey: &secret,
+	}, nil)
+	if err != nil {
+		t.Fatalf("start conversation: %v", err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial provider request did not run")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		submission, getErr := store.GetSubmission(t.Context(), started.ConversationID, "ephemeral-first")
+		if getErr == nil && submission.Status == persistence.SubmissionConsumed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	profile, err := store.GetConversationProviderProfile(t.Context(), started.ConversationID)
+	if err != nil || profile == nil || profile.CredentialSource != persistence.ConversationCredentialEphemeral || profile.BaseURL != "https://provider.example/v1" || profile.APIType != "chat" {
+		t.Fatalf("provider profile did not preserve safe settings/source: profile=%+v err=%v", profile, err)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", profile), secret) {
+		t.Fatal("ephemeral API key appeared in the persisted provider profile")
+	}
+	var hasAPIKeyColumn int
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM pragma_table_info('conversation_provider_profiles') WHERE name = 'api_key'`).Scan(&hasAPIKeyColumn); err != nil || hasAPIKeyColumn != 0 {
+		t.Fatalf("provider profile schema stores an API key column: count=%d err=%v", hasAPIKeyColumn, err)
+	}
+	manager.Drain(time.Second)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = persistence.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	restoredManager := NewSessionManager(func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		eng := agent.NewEngine(resumeTestProvider{calls: calls}, params.Model, 3, tools.NewRegistry(1000), nil, emitHandler,
+			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID),
+			agent.WithProviderMetadata(params.BaseURL, params.APIType, 1000))
+		return eng, nil, nil
+	})
+	resume := protocol.ConversationResumeParams{
+		WorkspaceDir: workspace, ConversationID: started.ConversationID, DBPath: dbPath,
+		Model: "test-model", BaseURL: "https://provider.example/v1", APIType: "chat",
+	}
+	restored, _, err := restoredManager.ResumeConversation(t.Context(), resume, nil)
+	if err != nil {
+		t.Fatalf("restore history without ephemeral key: %v", err)
+	}
+	if reason := restored.ExecutionBlocked(); !strings.Contains(reason, "credentials") {
+		t.Fatalf("restore did not block execution pending credentials: %q", reason)
+	}
+	snapshot, _, err := restored.Sync(t.Context(), protocol.ConversationSyncParams{ConversationID: started.ConversationID}, nil)
+	if err != nil || snapshot.ExecutionBlocked == "" || len(snapshot.Transcript) == 0 {
+		t.Fatalf("blocked restore did not expose history and reason: snapshot=%+v err=%v", snapshot, err)
+	}
+	resume.APIKey = &secret
+	resume.ConversationID = ""
+	if _, _, err := restoredManager.ResumeConversation(t.Context(), resume, nil); err != nil {
+		t.Fatalf("resume latest with re-supplied ephemeral key: %v", err)
+	}
+	if reason := restored.ExecutionBlocked(); reason != "" {
+		t.Fatalf("execution remained blocked after credentials were supplied: %q", reason)
+	}
+	if _, _, err := restored.Submit(t.Context(), &persistence.SubmissionRecord{
+		ConversationID: started.ConversationID, SubmissionID: "after-restore", Prompt: "continue", Mode: persistence.SubmissionQueue,
+	}); err != nil {
+		t.Fatalf("submit after reconfiguration: %v", err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider request did not run after credentials were re-supplied")
+	}
+	restoredManager.Drain(time.Second)
+}
+
+func TestStartConversationRetryRestoresSavedProviderProfile(t *testing.T) {
+	workspace := t.TempDir()
+	dbPath := filepath.Join(workspace, "retry-profile.db")
+	store, err := persistence.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	calls := make(chan struct{}, 4)
+	makeFactory := func(captured chan<- protocol.SessionStartParams) EngineFactory {
+		return func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+			if captured != nil {
+				captured <- params
+			}
+			eng := agent.NewEngine(resumeTestProvider{calls: calls}, params.Model, 3, tools.NewRegistry(1000), nil, emitHandler,
+				agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID),
+				agent.WithProviderMetadata(params.BaseURL, params.APIType, 1000))
+			return eng, nil, nil
+		}
+	}
+	secret := "retry-ephemeral-key"
+	initial := protocol.ConversationStartParams{
+		StartID: "retry-profile-start", SubmissionID: "retry-profile-submission", Prompt: "retain this conversation", WorkspaceDir: workspace,
+		Model: "original-model", BaseURL: "https://original.example/v1", APIType: "chat", APIKey: &secret,
+	}
+	firstManager := NewSessionManager(makeFactory(nil))
+	_, started, err := firstManager.StartConversation(t.Context(), initial, nil)
+	if err != nil {
+		t.Fatalf("start original conversation: %v", err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("original provider request did not run")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		submission, getErr := store.GetSubmission(t.Context(), started.ConversationID, initial.SubmissionID)
+		if getErr == nil && submission.Status == persistence.SubmissionConsumed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	firstManager.Drain(time.Second)
+
+	captured := make(chan protocol.SessionStartParams, 4)
+	retryManager := NewSessionManager(makeFactory(captured))
+	retry := initial
+	retry.APIKey = nil
+	retry.Model = "incoming-wrong-model"
+	retry.BaseURL = "https://incoming-wrong.example/v1"
+	retry.APIType = "responses"
+	worker, result, err := retryManager.StartConversation(t.Context(), retry, nil)
+	if err != nil {
+		t.Fatalf("retry existing conversation without its ephemeral key: %v", err)
+	}
+	if !result.Existing || worker.ConversationID() != started.ConversationID {
+		t.Fatalf("retry did not reuse the persisted conversation: result=%+v worker=%q", result, worker.ConversationID())
+	}
+	if reason := worker.ExecutionBlocked(); !strings.Contains(reason, "credentials") || reason == "" {
+		t.Fatalf("retry did not block execution pending original credentials: %q", reason)
+	}
+	var lastFactoryParams protocol.SessionStartParams
+	for {
+		select {
+		case lastFactoryParams = <-captured:
+		default:
+			goto capturedParams
+		}
+	}
+capturedParams:
+	if lastFactoryParams.Model != "original-model" || lastFactoryParams.BaseURL != "https://original.example/v1" || lastFactoryParams.APIType != "chat" || lastFactoryParams.APIKey != nil {
+		t.Fatalf("retry restored using incoming settings instead of persisted profile: %+v", lastFactoryParams)
+	}
+	snapshot, _, err := worker.Sync(t.Context(), protocol.ConversationSyncParams{ConversationID: started.ConversationID}, nil)
+	if err != nil || snapshot.ExecutionBlocked == "" || len(snapshot.Transcript) == 0 {
+		t.Fatalf("blocked retry did not preserve history: snapshot=%+v err=%v", snapshot, err)
+	}
+
+	retry.APIKey = &secret
+	retry.Model = "original-model"
+	retry.BaseURL = "https://original.example/v1"
+	retry.APIType = "chat"
+	if _, result, err = retryManager.StartConversation(t.Context(), retry, nil); err != nil || !result.Existing {
+		t.Fatalf("retry with original ephemeral credentials: result=%+v err=%v", result, err)
+	}
+	if reason := worker.ExecutionBlocked(); reason != "" {
+		t.Fatalf("retry with credentials left execution blocked: %q", reason)
+	}
+	retryManager.Drain(time.Second)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRestoredIdleConversationsParticipateInEvictionCap(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := persistence.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	calls := make(chan struct{}, 4)
+	factory := func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		eng := agent.NewEngine(resumeTestProvider{calls: calls}, params.Model, 3, tools.NewRegistry(1000), nil, emitHandler,
+			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID),
+			agent.WithProviderMetadata(params.BaseURL, params.APIType, 1000))
+		return eng, nil, nil
+	}
+	initialManager := NewSessionManager(factory)
+	var conversationIDs []string
+	for i := 0; i < 2; i++ {
+		prompt := fmt.Sprintf("prompt-%d", i)
+		_, started, err := initialManager.StartConversation(t.Context(), protocol.ConversationStartParams{
+			StartID: fmt.Sprintf("start-%d", i), SubmissionID: fmt.Sprintf("submission-%d", i), Prompt: prompt, WorkspaceDir: workspace,
+			Model: "test-model",
+		}, nil)
+		if err != nil {
+			t.Fatalf("create conversation %d: %v", i, err)
+		}
+		conversationIDs = append(conversationIDs, started.ConversationID)
+		select {
+		case <-calls:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("provider request for conversation %d did not run", i)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			submission, getErr := store.GetSubmission(t.Context(), started.ConversationID, started.SubmissionID)
+			if getErr == nil && submission.Status == persistence.SubmissionConsumed {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	initialManager.Drain(time.Second)
+
+	restoredManager := NewSessionManager(factory)
+	restoredManager.SetMaxCompletedSessions(1)
+	first, _, err := restoredManager.ResumeConversation(t.Context(), protocol.ConversationResumeParams{
+		WorkspaceDir: workspace, ConversationID: conversationIDs[0],
+	}, nil)
+	if err != nil {
+		t.Fatalf("restore first idle conversation: %v", err)
+	}
+	waitForIdleConversationCount(t, restoredManager, 1)
+	second, _, err := restoredManager.ResumeConversation(t.Context(), protocol.ConversationResumeParams{
+		WorkspaceDir: workspace, ConversationID: conversationIDs[1],
+	}, nil)
+	if err != nil {
+		t.Fatalf("restore second idle conversation: %v", err)
+	}
+	waitForConversationEvicted(t, restoredManager, conversationIDs[0])
+	if got, ok := restoredManager.GetConversation(conversationIDs[1]); !ok || got != second {
+		t.Fatalf("most recently restored idle worker should remain resident: worker=%p ok=%v", got, ok)
+	}
+	if _, ok := restoredManager.GetConversation(conversationIDs[0]); ok {
+		t.Fatal("oldest idle worker remained resident")
+	}
+	select {
+	case <-first.done:
+	default:
+		t.Fatal("evicted idle worker did not finish cleanup")
+	}
+	restoredManager.Drain(time.Second)
+}
+
+func waitForIdleConversationCount(t *testing.T, manager *SessionManager, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.RLock()
+		got := len(manager.idleConversationOrder)
+		manager.mu.RUnlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("idle conversation count did not reach %d", want)
+}
+
+func waitForConversationEvicted(t *testing.T, manager *SessionManager, conversationID string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := manager.GetConversation(conversationID); !ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("conversation %s was not evicted", conversationID)
+}
+
+func waitForConversationTurns(t *testing.T, store persistence.Store, conversationID string, count int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		turns, err := store.ListConversationTurns(t.Context(), conversationID)
+		if err == nil && len(turns) >= count {
+			ready := true
+			for _, turn := range turns[:count] {
+				if turn.Status != persistence.StatusCompleted {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	turns, err := store.ListConversationTurns(t.Context(), conversationID)
+	t.Fatalf("conversation did not complete %d turns: turns=%+v err=%v", count, turns, err)
 }
 
 func TestServer_DoneSignalsAfterDrain(t *testing.T) {

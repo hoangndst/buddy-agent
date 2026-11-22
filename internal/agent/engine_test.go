@@ -153,6 +153,111 @@ func TestEngineExecutionFlow(t *testing.T) {
 	}
 }
 
+func TestConversationRuntimeRunsSequentialTurnsAgainstSharedHistory(t *testing.T) {
+	store, err := persistence.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("create conversation store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	firstPrompt := "inspect the project"
+	firstTurnID := "conversation-turn-1"
+	firstFingerprint := persistence.SubmissionFingerprint(firstPrompt, persistence.SubmissionQueue)
+	start, err := store.CreateConversation(context.Background(), &persistence.ConversationStartRequest{
+		Session: persistence.SessionRecord{
+			ID:         "conversation-runtime-test",
+			WorkingDir: t.TempDir(),
+			Model:      "test-model",
+		},
+		StartID:            "start-runtime-test",
+		PayloadFingerprint: firstFingerprint,
+		FirstSubmission: persistence.SubmissionRecord{
+			SubmissionID:       "submission-1",
+			Prompt:             firstPrompt,
+			Mode:               persistence.SubmissionQueue,
+			PayloadFingerprint: firstFingerprint,
+			TurnID:             &firstTurnID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create conversation: %v", err)
+	}
+
+	provider := &mockChatClient{responses: []*openai.ChatCompletion{
+		{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Role: "assistant", Content: "The project is a Go service."}}}},
+		{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Role: "assistant", Content: "It uses SQLite for persistence."}}}},
+	}}
+	engine := NewEngine(provider, "test-model", 5, tools.NewRegistry(1000), nil, nil, WithStore(store))
+	conversationHistory, err := engine.NewHistorySession(firstPrompt)
+	if err != nil {
+		t.Fatalf("create history: %v", err)
+	}
+	runtime, err := NewConversationRuntime(context.Background(), engine, store, start.ConversationID, start.SubmissionID, conversationHistory)
+	if err != nil {
+		t.Fatalf("create conversation runtime: %v", err)
+	}
+	if _, err := runtime.RunTurn(context.Background(), start.SubmissionID, firstTurnID); err != nil {
+		t.Fatalf("run first conversation turn: %v", err)
+	}
+
+	secondPrompt := "which persistence layer does it use?"
+	second, err := store.AdmitSubmission(context.Background(), &persistence.SubmissionRecord{
+		ConversationID: start.ConversationID,
+		SubmissionID:   "submission-2",
+		Prompt:         secondPrompt,
+		Mode:           persistence.SubmissionQueue,
+	})
+	if err != nil {
+		t.Fatalf("admit second prompt: %v", err)
+	}
+	secondTurnID := "conversation-turn-2"
+	if _, err := runtime.RunTurn(context.Background(), second.SubmissionID, secondTurnID); err != nil {
+		t.Fatalf("run second conversation turn: %v", err)
+	}
+
+	if provider.calls != 2 {
+		t.Fatalf("expected one model request per user turn, got %d", provider.calls)
+	}
+	messages := runtime.History().CompileMessages()
+	if len(messages) != 4 {
+		t.Fatalf("expected root prompt, first answer, follow-up, and second answer; got %d messages", len(messages))
+	}
+	if messages[2].OfUser == nil || messages[2].OfUser.Content.OfString.Value != secondPrompt {
+		t.Fatalf("second turn did not retain the follow-up in shared history: %+v", messages[2])
+	}
+	steps, err := store.GetAllTurns(context.Background(), start.ConversationID)
+	if err != nil {
+		t.Fatalf("load persisted ReAct steps: %v", err)
+	}
+	if len(steps) != 2 || steps[0].ConversationTurnID != firstTurnID || steps[1].ConversationTurnID != secondTurnID {
+		t.Fatalf("expected persisted steps linked to both conversation turns: %+v", steps)
+	}
+	trackerJSON, err := json.Marshal(history.StateTrackerData{})
+	if err != nil {
+		t.Fatalf("encode snapshot tracker: %v", err)
+	}
+	if err := store.SaveSnapshot(context.Background(), &persistence.SnapshotRecord{
+		SessionID: start.ConversationID, StepNumber: 1, DistilledNarrative: "The project is a Go service.", StateTrackerJSON: string(trackerJSON),
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save snapshot before follow-up turn: %v", err)
+	}
+	restored, err := RestoreConversationRuntime(context.Background(), engine, store, start.ConversationID)
+	if err != nil {
+		t.Fatalf("restore conversation runtime: %v", err)
+	}
+	restoredMessages := restored.History().CompileMessages()
+	followupRestored := false
+	for _, message := range restoredMessages {
+		if message.OfUser != nil && message.OfUser.Content.OfString.Value == secondPrompt {
+			followupRestored = true
+		}
+	}
+	if !followupRestored {
+		t.Fatalf("restored history lost the follow-up prompt or turn order: %+v", restoredMessages)
+	}
+}
+
 func TestEngineErrorAndBudgetExhaustion(t *testing.T) {
 	tempDir := t.TempDir()
 	reg := tools.NewRegistry(1000)
@@ -222,7 +327,6 @@ func TestEngineErrorAndBudgetExhaustion(t *testing.T) {
 		t.Fatal("expected budget exhaustion error")
 	}
 }
-
 
 func TestEngineContextCompactionAndExhaustion(t *testing.T) {
 	tempDir := t.TempDir()
@@ -534,9 +638,9 @@ type mockSimpleTool struct {
 	exec func(ctx context.Context, args json.RawMessage) (string, error)
 }
 
-func (m *mockSimpleTool) Name() string { return m.name }
+func (m *mockSimpleTool) Name() string        { return m.name }
 func (m *mockSimpleTool) Description() string { return "mock tool" }
-func (m *mockSimpleTool) Parameters() any { return map[string]any{"type": "object"} }
+func (m *mockSimpleTool) Parameters() any     { return map[string]any{"type": "object"} }
 func (m *mockSimpleTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	return m.exec(ctx, args)
 }
@@ -1059,4 +1163,3 @@ func TestEngine_SessionIDOverride(t *testing.T) {
 		t.Errorf("expected session ID 'sess_override_1234', got %q", lastRes.SessionID)
 	}
 }
-

@@ -135,3 +135,67 @@ func (p *AutoProvider) Generate(ctx context.Context, req GenerateRequest) (*Gene
 	// Other operational error (401, 403, 429, 5xx, or network timeout) - fail fast immediately without latching
 	return nil, err
 }
+
+// GenerateStream preserves the unary negotiation policy. A capability error
+// can be retried through the existing negotiation path only before any text
+// has been exposed to the caller.
+func (p *AutoProvider) GenerateStream(ctx context.Context, req GenerateRequest, onTextDelta func(string) error) (*GenerateResponse, error) {
+	currentLatch := atomic.LoadInt32(&p.latch)
+	if currentLatch == latchResponses {
+		return p.responses.GenerateStream(ctx, req, onTextDelta)
+	}
+	mode := atomic.LoadInt32(&p.reasoningMode)
+	switch mode {
+	case reasoningModeNone:
+		req.ReasoningEffort = "none"
+	case reasoningModeOmit:
+		req.ReasoningEffort = ""
+	}
+	if currentLatch == latchChat {
+		visible := false
+		trackDelta := func(delta string) error {
+			if delta != "" {
+				visible = true
+			}
+			if onTextDelta != nil {
+				return onTextDelta(delta)
+			}
+			return nil
+		}
+		resp, err := p.chat.GenerateStream(ctx, req, trackDelta)
+		if err == nil {
+			return resp, nil
+		}
+		kind := ParseCapabilityError(err)
+		if !visible && (kind == CapabilityErrorReasoningConflict || kind == CapabilityErrorParamRejected) {
+			return p.Generate(ctx, req)
+		}
+		return nil, err
+	}
+
+	visible := false
+	trackDelta := func(delta string) error {
+		if delta != "" {
+			visible = true
+		}
+		if onTextDelta != nil {
+			return onTextDelta(delta)
+		}
+		return nil
+	}
+	resp, err := p.chat.GenerateStream(ctx, req, trackDelta)
+	if err == nil {
+		if len(req.Tools) > 0 {
+			atomic.CompareAndSwapInt32(&p.latch, latchUnset, latchChat)
+		}
+		return resp, nil
+	}
+	if visible {
+		return nil, err
+	}
+	kind := ParseCapabilityError(err)
+	if kind == CapabilityErrorReasoningConflict || kind == CapabilityErrorParamRejected {
+		return p.Generate(ctx, req)
+	}
+	return nil, err
+}

@@ -12,4 +12,4 @@ This directory contains approved technical design documents for `buddy-agent`, f
 | **06** | [`06_sqlite_state_persistence.md`](06_sqlite_state_persistence.md) | Approved | 2026-11-20 | Pure Go SQLite episodic trajectory store, atomic turn persistence, secret redaction, and crash recovery. |
 | **07** | [`07_subagent_orchestration.md`](07_subagent_orchestration.md) | Approved | 2026-11-20 | Bounded subagent delegation (depth=1), static role gating, reserve-step synthesis, and hierarchical SQLite sessions. |
 | **08** | [`08_unix_socket_daemon.md`](08_unix_socket_daemon.md) | Approved | 2026-11-21 | Background daemon with Unix domain socket IPC, line-delimited JSON-RPC 2.0, single-instance advisory locking, peer credential verification, and client re-attachment. |
-| **09** | `09_terminal_user_interface.md` | Staged | — | Bubbletea interactive TUI with streaming output rendering. |
+| **09** | [`09_terminal_user_interface.md`](09_terminal_user_interface.md) | Approved | 2026-11-21 | Bubble Tea conversation TUI with multi-turn history, daemon queue/steer, explicit resume, replay-safe events, and provider streaming. |

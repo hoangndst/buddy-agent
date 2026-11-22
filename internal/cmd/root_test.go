@@ -14,6 +14,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/config"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	core "github.com/hoangndst/buddy-agent/internal/mcp"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/openai/openai-go"
 )
 
@@ -62,17 +63,18 @@ func TestRootCmd_REPLExit(t *testing.T) {
 			MaxContextTokens: 4096,
 		}, nil
 	}
+	f.Store = func() (persistence.Store, func(), error) { return nil, nil, nil }
 
 	// Send "exit" to REPL input stream
 	inBuf.WriteString("exit\n")
 
 	rootCmd := NewRootCmd(f)
-	rootCmd.SetArgs([]string{})
+	rootCmd.SetArgs([]string{"--standalone"})
 	if err := rootCmd.Execute(); err != nil {
 		t.Fatalf("REPL execution failed: %v", err)
 	}
 
-	if !strings.Contains(outBuf.String(), "=== buddy-agent CLI ready ===") {
+	if !strings.Contains(outBuf.String(), "=== buddy-agent conversation ready ===") {
 		t.Errorf("expected ready message, got: %s", outBuf.String())
 	}
 }

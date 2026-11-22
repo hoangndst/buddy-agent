@@ -16,6 +16,7 @@ type BufferedEvent struct {
 	Timestamp time.Time   `json:"timestamp"`
 	Event     agent.Event `json:"event"`
 	Terminal  bool        `json:"terminal"`
+	TurnID    string      `json:"turn_id,omitempty"`
 }
 
 // EventRingBuffer provides thread-safe, memory-bounded circular storage for intra-session events.
@@ -48,6 +49,11 @@ func (rb *EventRingBuffer) Push(evt agent.Event) uint64 {
 
 // PushWithTerminal appends an event to the ring buffer with terminal flag.
 func (rb *EventRingBuffer) PushWithTerminal(evt agent.Event, terminal bool) uint64 {
+	return rb.PushWithIdentity(evt, terminal, "")
+}
+
+// PushWithIdentity appends an event and associates it with its durable turn identity.
+func (rb *EventRingBuffer) PushWithIdentity(evt agent.Event, terminal bool, turnID string) uint64 {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
@@ -59,6 +65,7 @@ func (rb *EventRingBuffer) PushWithTerminal(evt agent.Event, terminal bool) uint
 		Timestamp: time.Now(),
 		Event:     evt,
 		Terminal:  terminal,
+		TurnID:    turnID,
 	}
 
 	rb.buffer[rb.tail] = item
@@ -97,4 +104,21 @@ func (rb *EventRingBuffer) Len() int {
 // Capacity returns the maximum capacity of the buffer.
 func (rb *EventRingBuffer) Capacity() int {
 	return rb.capacity
+}
+
+// Watermark returns the newest event sequence assigned by the ring.
+func (rb *EventRingBuffer) Watermark() uint64 {
+	rb.mu.RLock()
+	defer rb.mu.RUnlock()
+	return rb.nextID - 1
+}
+
+// EarliestID returns the oldest event sequence still retained by the ring.
+func (rb *EventRingBuffer) EarliestID() uint64 {
+	rb.mu.RLock()
+	defer rb.mu.RUnlock()
+	if rb.size == 0 {
+		return rb.nextID
+	}
+	return rb.buffer[rb.head].EventID
 }

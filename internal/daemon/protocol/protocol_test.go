@@ -12,6 +12,54 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/mcp"
 )
 
+func TestConversationRPCShapesRoundTrip(t *testing.T) {
+	start := ConversationStartParams{
+		StartID: "start-1", SubmissionID: "submission-1", Prompt: "first prompt",
+		WorkspaceDir: "/work/project", Mode: "queue",
+	}
+	encoded, err := json.Marshal(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ConversationStartParams
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.StartID != start.StartID || decoded.SubmissionID != start.SubmissionID || decoded.Prompt != start.Prompt {
+		t.Fatalf("conversation.start round trip mismatch: %#v", decoded)
+	}
+
+	syncResult := ConversationSyncResult{
+		ConversationID: "conv-1", WorkerEpoch: "epoch-1", EventWatermark: 17,
+		HistoryRevision: 9, State: "running",
+		Transcript: []ConversationTranscriptEntry{{SubmissionID: "submission-1", TurnID: "turn-1", Role: "user", Content: "first prompt"}},
+	}
+	encoded, err = json.Marshal(syncResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decodedSync ConversationSyncResult
+	if err := json.Unmarshal(encoded, &decodedSync); err != nil {
+		t.Fatal(err)
+	}
+	if decodedSync.WorkerEpoch != syncResult.WorkerEpoch || decodedSync.EventWatermark != syncResult.EventWatermark || decodedSync.HistoryRevision != syncResult.HistoryRevision {
+		t.Fatalf("conversation.sync cursor/revision round trip mismatch: %#v", decodedSync)
+	}
+
+	// Existing one-shot task requests remain available alongside the additive chat RPCs.
+	legacy, err := json.Marshal(SessionStartParams{Task: "legacy task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decodedLegacy SessionStartParams
+	if err := json.Unmarshal(legacy, &decodedLegacy); err != nil {
+		t.Fatal(err)
+	}
+	if decodedLegacy.Task != "legacy task" {
+		t.Fatalf("legacy task field changed: %#v", decodedLegacy)
+	}
+}
+
 func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	// 1. Request roundtrip
 	effort := "medium"

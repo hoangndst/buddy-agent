@@ -16,6 +16,7 @@ import (
 
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	"github.com/hoangndst/buddy-agent/internal/daemon/security"
+	"github.com/hoangndst/buddy-agent/internal/persistence"
 )
 
 // Server coordinates the Unix Domain Socket listener, client connection pumps,
@@ -33,15 +34,16 @@ type Server struct {
 }
 
 type clientConnection struct {
-	id         string
-	conn       net.Conn
-	codec      *protocol.StreamCodec
-	outbound   chan *protocol.JSONRPCMessage
-	outboundMu sync.RWMutex
-	server     *Server
-	activeSess map[string]*SessionWorker
-	sessMu     sync.Mutex
-	closed     atomic.Bool
+	id                  string
+	conn                net.Conn
+	codec               *protocol.StreamCodec
+	outbound            chan *protocol.JSONRPCMessage
+	outboundMu          sync.RWMutex
+	server              *Server
+	activeSess          map[string]*SessionWorker
+	activeConversations map[string]*ConversationWorker
+	sessMu              sync.Mutex
+	closed              atomic.Bool
 }
 
 func (c *clientConnection) ID() string {
@@ -145,12 +147,13 @@ func generateClientID() string {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	client := &clientConnection{
-		id:         generateClientID(),
-		conn:       conn,
-		codec:      protocol.NewStreamCodec(conn, conn),
-		outbound:   make(chan *protocol.JSONRPCMessage, 1024),
-		server:     s,
-		activeSess: make(map[string]*SessionWorker),
+		id:                  generateClientID(),
+		conn:                conn,
+		codec:               protocol.NewStreamCodec(conn, conn),
+		outbound:            make(chan *protocol.JSONRPCMessage, 1024),
+		server:              s,
+		activeSess:          make(map[string]*SessionWorker),
+		activeConversations: make(map[string]*ConversationWorker),
 	}
 
 	s.clientsMu.Lock()
@@ -165,6 +168,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		// Detach from all active sessions
 		client.sessMu.Lock()
 		for _, worker := range client.activeSess {
+			worker.Detach(client)
+		}
+		for _, worker := range client.activeConversations {
 			worker.Detach(client)
 		}
 		client.sessMu.Unlock()
@@ -223,6 +229,18 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 			_ = client.Send(res)
 		}
 
+	case protocol.MethodDaemonCapabilities:
+		if msg.ID != nil {
+			res, _ := protocol.NewResponse(*msg.ID, protocol.DaemonCapabilitiesResult{ProtocolVersion: 1, Methods: []string{
+				protocol.MethodSessionStart, protocol.MethodSessionAttach, protocol.MethodSessionDetach,
+				protocol.MethodSessionCancel, protocol.MethodPermissionRespond, protocol.MethodDaemonPing,
+				protocol.MethodDaemonStatus, protocol.MethodConversationStart, protocol.MethodConversationResume,
+				protocol.MethodConversationSubmit, protocol.MethodConversationSync, protocol.MethodConversationWorkspaces,
+				protocol.MethodConversationList, protocol.MethodTurnInterrupt,
+			}})
+			_ = client.Send(res)
+		}
+
 	case protocol.MethodDaemonStop:
 		if msg.ID != nil {
 			res, _ := protocol.NewResponse(*msg.ID, map[string]string{"status": "shutting_down"})
@@ -258,6 +276,193 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 		res, _ := protocol.NewResponse(*msg.ID, protocol.SessionStartResult{
 			SessionID: worker.SessionID(),
 		})
+		_ = client.Send(res)
+
+	case protocol.MethodConversationStart:
+		if msg.ID == nil {
+			return
+		}
+		var params protocol.ConversationStartParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid conversation.start params", err.Error()))
+			return
+		}
+		worker, result, err := s.sessionMgr.StartConversation(s.ctx, params, client)
+		if err != nil {
+			code := protocol.ErrCodeInternalError
+			if errors.Is(err, persistence.ErrSubmissionConflict) {
+				code = protocol.ErrCodeConflict
+			}
+			if params.StartID == "" || params.SubmissionID == "" || params.Prompt == "" {
+				code = protocol.ErrCodeInvalidParams
+			}
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, code, "failed to start conversation", err.Error()))
+			return
+		}
+		client.sessMu.Lock()
+		client.activeConversations[worker.ConversationID()] = worker
+		client.sessMu.Unlock()
+		res, _ := protocol.NewResponse(*msg.ID, result)
+		_ = client.Send(res)
+
+	case protocol.MethodConversationResume:
+		if msg.ID == nil {
+			return
+		}
+		var params protocol.ConversationResumeParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil || params.WorkspaceDir == "" {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid conversation.resume params", nil))
+			return
+		}
+		worker, record, err := s.sessionMgr.ResumeConversation(s.ctx, params, client)
+		if err != nil {
+			code := protocol.ErrCodeInternalError
+			if errors.Is(err, persistence.ErrSessionNotFound) {
+				code = protocol.ErrCodeSessionNotFound
+			}
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, code, "failed to resume conversation", err.Error()))
+			return
+		}
+		client.sessMu.Lock()
+		client.activeConversations[worker.ConversationID()] = worker
+		client.sessMu.Unlock()
+		syncResult, _, syncErr := worker.Sync(s.ctx, protocol.ConversationSyncParams{ConversationID: worker.ConversationID()}, client)
+		if syncErr != nil {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInternalError, "failed to sync resumed conversation", syncErr.Error()))
+			return
+		}
+		result := protocol.ConversationResumeResult{
+			ConversationID: worker.ConversationID(), SessionID: worker.ConversationID(),
+			WorkspaceDir: record.WorkingDir, Task: record.Task, HistoryRevision: syncResult.HistoryRevision,
+			State: worker.State(), Role: syncResult.Role,
+		}
+		res, _ := protocol.NewResponse(*msg.ID, result)
+		_ = client.Send(res)
+
+	case protocol.MethodConversationSubmit:
+		if msg.ID == nil {
+			return
+		}
+		var params protocol.ConversationSubmitParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid conversation.submit params", err.Error()))
+			return
+		}
+		worker, ok := s.sessionMgr.GetConversation(params.ConversationID)
+		if !ok {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeSessionNotFound, fmt.Sprintf("conversation %s not found", params.ConversationID), nil))
+			return
+		}
+		if !worker.IsController(client) {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodePermissionDenied, "only the conversation controller may submit prompts", nil))
+			return
+		}
+		record, existing, err := worker.Submit(s.ctx, &persistence.SubmissionRecord{
+			ConversationID: params.ConversationID, SubmissionID: params.SubmissionID,
+			Prompt: params.Prompt, Mode: persistence.SubmissionMode(params.Mode),
+		})
+		if err != nil {
+			code := protocol.ErrCodeInvalidParams
+			if errors.Is(err, persistence.ErrSubmissionConflict) {
+				code = protocol.ErrCodeConflict
+			}
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, code, "failed to submit conversation prompt", err.Error()))
+			return
+		}
+		turnID := ""
+		if record.TurnID != nil {
+			turnID = *record.TurnID
+		}
+		res, _ := protocol.NewResponse(*msg.ID, protocol.ConversationSubmitResult{
+			ConversationID: params.ConversationID, SubmissionID: record.SubmissionID,
+			Sequence: record.Sequence, Status: string(record.Status), TurnID: turnID, Existing: existing,
+		})
+		_ = client.Send(res)
+
+	case protocol.MethodConversationSync:
+		if msg.ID == nil {
+			return
+		}
+		var params protocol.ConversationSyncParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil || params.ConversationID == "" {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid conversation.sync params", nil))
+			return
+		}
+		worker, ok := s.sessionMgr.GetConversation(params.ConversationID)
+		if !ok {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeSessionNotFound, "conversation worker is not resident; resume the conversation first", nil))
+			return
+		}
+		client.sessMu.Lock()
+		client.activeConversations[params.ConversationID] = worker
+		client.sessMu.Unlock()
+		result, _, err := worker.Sync(s.ctx, params, client)
+		if err != nil {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInternalError, "conversation sync failed", err.Error()))
+			return
+		}
+		res, _ := protocol.NewResponse(*msg.ID, result)
+		_ = client.Send(res)
+
+	case protocol.MethodConversationWorkspaces:
+		if msg.ID == nil {
+			return
+		}
+		var params protocol.ConversationListWorkspacesParams
+		if len(msg.Params) > 0 {
+			if err := json.Unmarshal(msg.Params, &params); err != nil {
+				_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid workspace list params", err.Error()))
+				return
+			}
+		}
+		workspaces, err := s.sessionMgr.ListConversationWorkspaces(s.ctx, params.Limit)
+		if err != nil {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInternalError, "failed to list conversation workspaces", err.Error()))
+			return
+		}
+		res, _ := protocol.NewResponse(*msg.ID, protocol.ConversationListWorkspacesResult{Workspaces: workspaces})
+		_ = client.Send(res)
+
+	case protocol.MethodConversationList:
+		if msg.ID == nil {
+			return
+		}
+		var params protocol.ConversationListParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil || params.WorkspaceDir == "" {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid conversation.list params", nil))
+			return
+		}
+		conversations, err := s.sessionMgr.ListConversations(s.ctx, params.WorkspaceDir, params.Limit)
+		if err != nil {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInternalError, "failed to list conversations", err.Error()))
+			return
+		}
+		res, _ := protocol.NewResponse(*msg.ID, protocol.ConversationListResult{Conversations: conversations})
+		_ = client.Send(res)
+
+	case protocol.MethodTurnInterrupt:
+		if msg.ID == nil {
+			return
+		}
+		var params protocol.TurnInterruptParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid turn.interrupt params", err.Error()))
+			return
+		}
+		worker, ok := s.sessionMgr.GetConversation(params.ConversationID)
+		if !ok {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeSessionNotFound, "conversation not found", nil))
+			return
+		}
+		if !worker.IsController(client) {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodePermissionDenied, "only the conversation controller may interrupt a turn", nil))
+			return
+		}
+		if err := worker.Interrupt(params.TurnID); err != nil {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "turn interrupt failed", err.Error()))
+			return
+		}
+		res, _ := protocol.NewResponse(*msg.ID, protocol.TurnInterruptResult{ConversationID: params.ConversationID, TurnID: params.TurnID, Status: "interrupting"})
 		_ = client.Send(res)
 
 	case protocol.MethodSessionAttach:
@@ -347,18 +552,44 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 			return
 		}
 
-		client.sessMu.Lock()
-		var foundWorker *SessionWorker
-		for _, w := range client.activeSess {
-			foundWorker = w
-			break
-		}
-		client.sessMu.Unlock()
-
-		if foundWorker != nil {
-			if err := foundWorker.RespondPermission(params.RequestID, params.Decision); err != nil {
-				errRes := protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInternalError, err.Error(), nil)
-				_ = client.Send(errRes)
+		if params.ConversationID != "" {
+			client.sessMu.Lock()
+			worker := client.activeConversations[params.ConversationID]
+			client.sessMu.Unlock()
+			if worker == nil {
+				_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeSessionNotFound, "conversation is not attached to this client", nil))
+				return
+			}
+			if !worker.IsController(client) {
+				_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodePermissionDenied, "only the conversation controller may respond to permission requests", nil))
+				return
+			}
+			if err := worker.RespondPermission(client, params.TurnID, params.RequestID, params.Decision); err != nil {
+				_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeConflict, err.Error(), nil))
+				return
+			}
+		} else {
+			client.sessMu.Lock()
+			workers := make([]*SessionWorker, 0, len(client.activeSess))
+			for _, worker := range client.activeSess {
+				workers = append(workers, worker)
+			}
+			client.sessMu.Unlock()
+			responded := false
+			for _, worker := range workers {
+				if params.SessionID != "" && worker.sessionID != params.SessionID {
+					continue
+				}
+				if !worker.IsController(client) {
+					continue
+				}
+				if err := worker.RespondPermission(params.RequestID, params.Decision); err == nil {
+					responded = true
+					break
+				}
+			}
+			if !responded {
+				_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeConflict, "no controller-owned session has that pending permission request", nil))
 				return
 			}
 		}
