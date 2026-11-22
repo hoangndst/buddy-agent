@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
 
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
@@ -170,7 +171,7 @@ func TestWaitConversationSubmissionTerminalIgnoresPriorTurn(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err := waitConversationSubmissionEvents(ctx, factory, "conversation-1", "queued-submission", "", events, nil, snapshot,
+	err := waitConversationSubmissionEvents(ctx, factory, "conversation-1", "queued-submission", "", persistence.SubmissionQueue, events, nil, snapshot,
 		func() (*protocol.ConversationSyncResult, error) { return &protocol.ConversationSyncResult{}, nil }, func() error { return nil })
 	if err != nil {
 		t.Fatalf("wait for queued target turn: %v", err)
@@ -191,7 +192,7 @@ func TestWaitConversationSubmissionTerminalReturnsWhenSyncShowsCompletion(t *tes
 	}}}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err := waitConversationSubmissionEvents(ctx, factory, "conversation-1", "target-submission", "", nil, nil,
+	err := waitConversationSubmissionEvents(ctx, factory, "conversation-1", "target-submission", "", persistence.SubmissionQueue, nil, nil,
 		func() (*protocol.ConversationSyncResult, error) { return completed, nil },
 		func() (*protocol.ConversationSyncResult, error) {
 			return &protocol.ConversationSyncResult{Transcript: []protocol.ConversationTranscriptEntry{{
@@ -203,6 +204,76 @@ func TestWaitConversationSubmissionTerminalReturnsWhenSyncShowsCompletion(t *tes
 	}
 	if !strings.Contains(out.String(), "restored answer") {
 		t.Fatalf("sync-completed target answer was not printed: %q", out.String())
+	}
+}
+
+func TestWaitConversationSteerResolvesAttachedTurnFromTranscript(t *testing.T) {
+	streams, _, out, _ := cmdutil.TestIOStreams()
+	factory := &cmdutil.Factory{IOStreams: streams}
+	snapshotCalls := 0
+	snapshot := func() (*protocol.ConversationSyncResult, error) {
+		snapshotCalls++
+		status := string(persistence.StatusRunning)
+		if snapshotCalls > 1 {
+			status = string(persistence.StatusCompleted)
+		}
+		return &protocol.ConversationSyncResult{Turns: []protocol.ConversationTurnState{{
+			SubmissionID: "original-submission", TurnID: "active-turn", Status: status,
+		}}}, nil
+	}
+	fullSnapshotCalls := 0
+	fullSnapshot := func() (*protocol.ConversationSyncResult, error) {
+		fullSnapshotCalls++
+		return &protocol.ConversationSyncResult{Transcript: []protocol.ConversationTranscriptEntry{
+			{SubmissionID: "steer-submission", TurnID: "active-turn", Mode: string(persistence.SubmissionSteer), Role: "user"},
+			{TurnID: "active-turn", Role: "assistant", Content: "answer"},
+		}}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := waitConversationSubmissionEvents(ctx, factory, "conversation-1", "steer-submission", "", persistence.SubmissionSteer,
+		nil, nil, snapshot, fullSnapshot, func() error { return nil })
+	if err != nil {
+		t.Fatalf("wait for completed turn receiving the steer: %v", err)
+	}
+	if fullSnapshotCalls < 2 {
+		t.Fatal("steer submission was not resolved from transcript attachment")
+	}
+	if !strings.Contains(out.String(), "answer") {
+		t.Fatalf("target turn output was not rendered: %q", out.String())
+	}
+}
+
+func TestWaitConversationSubmissionDoesNotDuplicateRenderedFinalText(t *testing.T) {
+	streams, _, out, _ := cmdutil.TestIOStreams()
+	factory := &cmdutil.Factory{IOStreams: streams}
+	events := make(chan protocol.SessionEventNotification, 1)
+	events <- protocol.SessionEventNotification{ConversationID: "conversation-1", TurnID: "target-turn", Type: string(agent.EventTextComplete), Content: "final answer"}
+	snapshotCalls := 0
+	snapshot := func() (*protocol.ConversationSyncResult, error) {
+		snapshotCalls++
+		status := string(persistence.StatusRunning)
+		if snapshotCalls > 1 {
+			status = string(persistence.StatusCompleted)
+		}
+		return &protocol.ConversationSyncResult{Turns: []protocol.ConversationTurnState{{
+			SubmissionID: "target-submission", TurnID: "target-turn", Status: status,
+		}}}, nil
+	}
+	fullSnapshot := func() (*protocol.ConversationSyncResult, error) {
+		return &protocol.ConversationSyncResult{Transcript: []protocol.ConversationTranscriptEntry{{
+			Role: "assistant", TurnID: "target-turn", Content: "final answer",
+		}}}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := waitConversationSubmissionEvents(ctx, factory, "conversation-1", "target-submission", "target-turn", persistence.SubmissionQueue,
+		events, nil, snapshot, fullSnapshot, func() error { return nil })
+	if err != nil {
+		t.Fatalf("wait for target completion after final text: %v", err)
+	}
+	if got := strings.Count(out.String(), "final answer"); got != 1 {
+		t.Fatalf("final answer was rendered %d times; output=%q", got, out.String())
 	}
 }
 

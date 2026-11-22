@@ -263,7 +263,7 @@ func runConversationLines(ctx context.Context, f *cmdutil.Factory, socketPath st
 				return fmt.Errorf("start conversation: %w", err)
 			}
 			conversationID = started.ConversationID
-			if err := waitConversationSubmissionTerminal(ctx, f, cl, conversationID, started.SubmissionID, started.TurnID); err != nil {
+			if err := waitConversationSubmissionTerminal(ctx, f, cl, conversationID, started.SubmissionID, started.TurnID, persistence.SubmissionQueue); err != nil {
 				return err
 			}
 		} else {
@@ -272,7 +272,7 @@ func runConversationLines(ctx context.Context, f *cmdutil.Factory, socketPath st
 			if err != nil {
 				return fmt.Errorf("submit conversation prompt: %w", err)
 			}
-			if err := waitConversationSubmissionTerminal(ctx, f, cl, conversationID, submitted.SubmissionID, submitted.TurnID); err != nil {
+			if err := waitConversationSubmissionTerminal(ctx, f, cl, conversationID, submitted.SubmissionID, submitted.TurnID, mode); err != nil {
 				return err
 			}
 		}
@@ -283,8 +283,8 @@ func runConversationLines(ctx context.Context, f *cmdutil.Factory, socketPath st
 	return nil
 }
 
-func waitConversationSubmissionTerminal(ctx context.Context, f *cmdutil.Factory, cl *client.Client, conversationID, submissionID, turnID string) error {
-	return waitConversationSubmissionEvents(ctx, f, conversationID, submissionID, turnID,
+func waitConversationSubmissionTerminal(ctx context.Context, f *cmdutil.Factory, cl *client.Client, conversationID, submissionID, turnID string, mode persistence.SubmissionMode) error {
+	return waitConversationSubmissionEvents(ctx, f, conversationID, submissionID, turnID, mode,
 		cl.ConversationEvents(), cl.ConversationEventGaps(),
 		func() (*protocol.ConversationSyncResult, error) {
 			return cl.SyncConversation(protocol.ConversationSyncParams{ConversationID: conversationID, PageSize: 1})
@@ -296,13 +296,14 @@ func waitConversationSubmissionTerminal(ctx context.Context, f *cmdutil.Factory,
 		})
 }
 
-func waitConversationSubmissionEvents(ctx context.Context, f *cmdutil.Factory, conversationID, submissionID, turnID string,
+func waitConversationSubmissionEvents(ctx context.Context, f *cmdutil.Factory, conversationID, submissionID, turnID string, mode persistence.SubmissionMode,
 	events <-chan protocol.SessionEventNotification, gaps <-chan struct{},
 	snapshot func() (*protocol.ConversationSyncResult, error), fullSnapshot func() (*protocol.ConversationSyncResult, error), resync func() error,
 ) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	terminalTurns := make(map[string]bool)
+	renderedFinalText := make(map[string]bool)
 	turnStatus, turnError := "", ""
 	resolveTurn := func() error {
 		if submissionID == "" && turnID == "" {
@@ -320,6 +321,18 @@ func waitConversationSubmissionEvents(ctx context.Context, f *cmdutil.Factory, c
 				break
 			}
 		}
+		if turnID == "" && mode == persistence.SubmissionSteer && submissionID != "" {
+			history, historyErr := fullSnapshot()
+			if historyErr != nil {
+				return fmt.Errorf("sync conversation while resolving steering submission: %w", historyErr)
+			}
+			for _, entry := range history.Transcript {
+				if entry.SubmissionID == submissionID && entry.TurnID != "" {
+					turnID = entry.TurnID
+					break
+				}
+			}
+		}
 		return nil
 	}
 	for {
@@ -327,7 +340,7 @@ func waitConversationSubmissionEvents(ctx context.Context, f *cmdutil.Factory, c
 			return err
 		}
 		if turnID != "" && turnStatus != "" && turnStatus != string(persistence.StatusRunning) {
-			if !terminalTurns[turnID] {
+			if !terminalTurns[turnID] && !renderedFinalText[turnID] {
 				if history, err := fullSnapshot(); err == nil {
 					for _, entry := range history.Transcript {
 						if entry.Role == "assistant" && entry.TurnID == turnID {
@@ -358,6 +371,9 @@ func waitConversationSubmissionEvents(ctx context.Context, f *cmdutil.Factory, c
 				continue
 			}
 			renderEvent(f, evt)
+			if evt.Type == string(agent.EventTextComplete) && evt.TurnID != "" && evt.Content != "" {
+				renderedFinalText[evt.TurnID] = true
+			}
 			terminal := evt.Type == string(agent.EventFinished) || evt.Type == string(agent.EventError) && evt.Data["terminal"] == true
 			if terminal {
 				terminalTurns[evt.TurnID] = true
