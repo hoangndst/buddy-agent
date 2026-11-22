@@ -22,36 +22,38 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/client"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
+	"github.com/hoangndst/buddy-agent/internal/mcp"
 	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"golang.org/x/term"
 )
 
 type conversationTUI struct {
-	ctx               context.Context
-	client            conversationAPI
-	workspace         string
-	startParams       protocol.ConversationStartParams
-	conversation      string
-	databasePath      string
-	standalone        bool
-	state             string
-	lastSequence      uint64
-	scrollOffset      int
-	transcript        []string
-	streamingText     string
-	pendingApproval   *protocol.PermissionRequestNotification
-	queued            []string
-	steers            []string
-	textarea          textarea.Model
-	width             int
-	height            int
-	errorText         string
-	choosing          string
-	choices           []string
-	cursor            int
-	workspaces        []protocol.ConversationWorkspace
-	conversations     []protocol.ConversationSummary
-	selectedWorkspace string
+	ctx                    context.Context
+	client                 conversationAPI
+	workspace              string
+	startParams            protocol.ConversationStartParams
+	conversation           string
+	databasePath           string
+	standalone             bool
+	state                  string
+	lastSequence           uint64
+	scrollOffset           int
+	transcript             []string
+	streamingText          string
+	pendingApproval        *protocol.PermissionRequestNotification
+	queued                 []string
+	steers                 []string
+	textarea               textarea.Model
+	width                  int
+	height                 int
+	errorText              string
+	choosing               string
+	choices                []string
+	cursor                 int
+	workspaces             []protocol.ConversationWorkspace
+	conversations          []protocol.ConversationSummary
+	selectedWorkspace      string
+	loadWorkspaceMCPConfig func(string) (*mcp.Config, error)
 }
 
 type conversationAPI interface {
@@ -97,9 +99,11 @@ type conversationListMsg struct {
 	err           error
 }
 type conversationResumedMsg struct {
-	result    *protocol.ConversationSyncResult
-	workspace string
-	err       error
+	result          *protocol.ConversationSyncResult
+	workspace       string
+	mcpConfig       *mcp.Config
+	updateMCPConfig bool
+	err             error
 }
 type conversationSyncMsg struct {
 	result *protocol.ConversationSyncResult
@@ -147,6 +151,17 @@ func runConversationTUI(ctx context.Context, f *cmdutil.Factory, socketPath stri
 	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"), key.WithHelp("shift+enter", "new line"))
 	input.Focus()
 	m := &conversationTUI{ctx: ctx, client: api, workspace: workspace, startParams: params, databasePath: params.DBPath, standalone: standalone, state: "ready", textarea: input, width: 80, height: 24}
+	if f.MCPConfigLoader != nil {
+		home := ""
+		if f.UserHome != nil {
+			home, _ = f.UserHome()
+		} else {
+			home, _ = os.UserHomeDir()
+		}
+		m.loadWorkspaceMCPConfig = func(project string) (*mcp.Config, error) {
+			return f.MCPConfigLoader(project, home)
+		}
+	}
 	if continueLatest {
 		result, resumeErr := api.ResumeConversation(conversationResumeParams(workspace, "", params))
 		if resumeErr != nil {
@@ -470,6 +485,10 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.choosing = ""
 		if msg.workspace != "" {
 			m.workspace = msg.workspace
+			m.startParams.WorkspaceDir = msg.workspace
+		}
+		if msg.updateMCPConfig {
+			m.startParams.MCPConfig = msg.mcpConfig
 		}
 		m.loadSync(msg.result)
 		return m, tea.Batch(m.watchEvent(), m.watchPermission())
@@ -776,30 +795,60 @@ func (m *conversationTUI) listConversations(workspace string) tea.Cmd {
 
 func (m *conversationTUI) resumeSelected(selected protocol.ConversationSummary) tea.Cmd {
 	workspace := m.selectedWorkspace
+	startParams := m.startParams
+	loadMCPConfig := m.loadWorkspaceMCPConfig
+	api := m.client
 	return func() tea.Msg {
-		resumeParams := conversationResumeParams(workspace, selected.ConversationID, m.startParams)
-		resumeParams.DBPath = selected.DBPath
-		_, err := m.client.ResumeConversation(resumeParams)
+		resumeParams, mcpConfig, err := conversationResumeParamsForWorkspace(workspace, selected.ConversationID, selected.DBPath, startParams, loadMCPConfig)
 		if err != nil {
 			return conversationResumedMsg{err: err}
 		}
-		result, err := readConversationSnapshot(m.client, selected.ConversationID)
-		return conversationResumedMsg{result: result, workspace: workspace, err: err}
+		_, err = api.ResumeConversation(resumeParams)
+		if err != nil {
+			return conversationResumedMsg{err: err}
+		}
+		result, err := readConversationSnapshot(api, selected.ConversationID)
+		return conversationResumedMsg{result: result, workspace: workspace, mcpConfig: mcpConfig, updateMCPConfig: true, err: err}
 	}
 }
 
 func (m *conversationTUI) resumeEvictedConversation() tea.Cmd {
 	workspace, conversationID, databasePath := m.workspace, m.conversation, m.databasePath
+	startParams := m.startParams
+	api := m.client
 	return func() tea.Msg {
-		resumeParams := conversationResumeParams(workspace, conversationID, m.startParams)
+		resumeParams := conversationResumeParams(workspace, conversationID, startParams)
 		resumeParams.DBPath = databasePath
-		_, err := m.client.ResumeConversation(resumeParams)
+		_, err := api.ResumeConversation(resumeParams)
 		if err != nil {
 			return conversationResumedMsg{err: err}
 		}
-		result, err := readConversationSnapshot(m.client, conversationID)
-		return conversationResumedMsg{result: result, err: err}
+		result, err := readConversationSnapshot(api, conversationID)
+		return conversationResumedMsg{result: result, workspace: workspace, mcpConfig: startParams.MCPConfig, updateMCPConfig: true, err: err}
 	}
+}
+
+func (m *conversationTUI) resumeParamsForWorkspace(workspace, conversationID, dbPath string) (protocol.ConversationResumeParams, *mcp.Config, error) {
+	return conversationResumeParamsForWorkspace(workspace, conversationID, dbPath, m.startParams, m.loadWorkspaceMCPConfig)
+}
+
+func conversationResumeParamsForWorkspace(workspace, conversationID, dbPath string, start protocol.ConversationStartParams, loadMCPConfig func(string) (*mcp.Config, error)) (protocol.ConversationResumeParams, *mcp.Config, error) {
+	params := conversationResumeParams(workspace, conversationID, start)
+	params.DBPath = dbPath
+	mcpConfig := start.MCPConfig
+	if loadMCPConfig != nil {
+		loaded, err := loadMCPConfig(workspace)
+		if err != nil {
+			return params, nil, fmt.Errorf("load MCP configuration for workspace %q: %w", workspace, err)
+		}
+		mcpConfig = loaded
+	} else if workspace != start.WorkspaceDir {
+		// The current config was resolved for another project. Never send it to
+		// the selected workspace if no workspace loader is available.
+		mcpConfig = nil
+	}
+	params.MCPConfig = mcpConfig
+	return params, mcpConfig, nil
 }
 
 func conversationResumeParams(workspace, conversationID string, start protocol.ConversationStartParams) protocol.ConversationResumeParams {

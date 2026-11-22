@@ -59,6 +59,9 @@ func (p *ChatCompletionsProvider) GenerateStream(ctx context.Context, req Genera
 	if err := stream.Err(); err != nil {
 		return nil, err
 	}
+	if len(accumulated.Choices) == 0 || accumulated.Choices[0].FinishReason == "" {
+		return nil, fmt.Errorf("chat completion stream ended without a finish reason for the selected choice")
+	}
 	return normalizeChatCompletion(&accumulated.ChatCompletion)
 }
 

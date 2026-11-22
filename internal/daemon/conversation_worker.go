@@ -39,6 +39,7 @@ type ConversationWorker struct {
 	queueWake           chan struct{}
 	done                chan struct{}
 	runStarted          bool
+	idleNotifyPending   bool
 	active              bool
 	currentTurn         string
 	currentTurnCtx      context.Context
@@ -57,6 +58,7 @@ type ConversationWorker struct {
 	cleanup             func()
 	onIdle              func()
 	closed              bool
+	evictionStarted     bool
 	executionBlocked    string
 	cleanupOnce         sync.Once
 	doneOnce            sync.Once
@@ -146,6 +148,7 @@ func (w *ConversationWorker) StartIdle() error {
 		return errors.New("conversation worker is closed")
 	}
 	w.runStarted = true
+	w.idleNotifyPending = true
 	w.mu.Unlock()
 	go w.run()
 	return nil
@@ -180,6 +183,7 @@ func (w *ConversationWorker) StartRestored(submissions []*persistence.Submission
 		return w.queue[i].Sequence < w.queue[j].Sequence
 	})
 	w.runStarted = true
+	w.idleNotifyPending = len(w.queue) == 0
 	w.mu.Unlock()
 	go w.run()
 	w.signalQueue()
@@ -215,8 +219,16 @@ func (w *ConversationWorker) run() {
 			return
 		}
 		if w.executionBlocked != "" {
+			var idle func()
+			if len(w.queue) == 0 && w.idleNotifyPending {
+				idle = w.onIdle
+				w.idleNotifyPending = false
+			}
 			w.active = false
 			w.mu.Unlock()
+			if idle != nil {
+				go idle()
+			}
 			select {
 			case <-w.queueWake:
 				continue
@@ -225,11 +237,13 @@ func (w *ConversationWorker) run() {
 			}
 		}
 		if len(w.queue) == 0 {
-			wasActive, idle := w.active, w.onIdle
+			notifyIdle := w.active || w.idleNotifyPending
+			idle := w.onIdle
+			w.idleNotifyPending = false
 			w.active = false
 			w.mu.Unlock()
-			if wasActive && idle != nil {
-				idle()
+			if notifyIdle && idle != nil {
+				go idle()
 			}
 			select {
 			case <-w.queueWake:
@@ -1025,11 +1039,12 @@ func (w *ConversationWorker) finishTurn(turnID, answer string, _ persistence.Ses
 // Evict releases an idle worker and notifies its connected clients.
 func (w *ConversationWorker) Evict() {
 	w.mu.Lock()
-	if w.closed || w.active {
+	if w.evictionStarted || w.active {
 		w.mu.Unlock()
 		return
 	}
 	w.closed = true
+	w.evictionStarted = true
 	connections := make([]ClientConn, 0, len(w.subscribers))
 	for c := range w.subscribers {
 		connections = append(connections, c)
@@ -1041,6 +1056,22 @@ func (w *ConversationWorker) Evict() {
 		_ = c.Send(msg)
 	}
 	w.Stop()
+}
+
+func (w *ConversationWorker) reserveEviction() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.active || len(w.queue) > 0 || len(w.pendingSteers) > 0 {
+		return false
+	}
+	w.closed = true
+	return true
+}
+
+func (w *ConversationWorker) idleForRetention() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return !w.closed && !w.active && len(w.queue) == 0 && len(w.pendingSteers) == 0
 }
 
 // Stop requests shutdown and waits for worker cleanup to finish.

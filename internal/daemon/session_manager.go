@@ -860,6 +860,11 @@ func (sm *SessionManager) GetConversation(conversationID string) (*ConversationW
 func (sm *SessionManager) onConversationIdle(conversationID string) {
 	var evict []*ConversationWorker
 	sm.mu.Lock()
+	worker, ok := sm.conversations[conversationID]
+	if !ok || !worker.idleForRetention() {
+		sm.mu.Unlock()
+		return
+	}
 	filtered := sm.idleConversationOrder[:0]
 	for _, id := range sm.idleConversationOrder {
 		if id != conversationID {
@@ -870,7 +875,7 @@ func (sm *SessionManager) onConversationIdle(conversationID string) {
 	for len(sm.idleConversationOrder) > sm.maxCompletedSessions {
 		id := sm.idleConversationOrder[0]
 		sm.idleConversationOrder = sm.idleConversationOrder[1:]
-		if w, ok := sm.conversations[id]; ok && !w.IsActive() {
+		if w, ok := sm.conversations[id]; ok && w.reserveEviction() {
 			delete(sm.conversations, id)
 			evict = append(evict, w)
 		}

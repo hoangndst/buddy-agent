@@ -54,6 +54,39 @@ func TestChatCompletionsProvider_StreamAssemblesTextAndToolArguments(t *testing.
 	}
 }
 
+func TestChatCompletionsProvider_StreamRejectsPartialChoiceWithoutFinishReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunk := map[string]any{
+			"id": "chatcmpl-partial", "object": "chat.completion.chunk", "created": 1, "model": "test-model",
+			"choices": []any{map[string]any{
+				"index": 0,
+				"delta": map[string]any{"role": "assistant", "content": "incomplete", "tool_calls": []any{map[string]any{
+					"index": 0, "id": "call_partial", "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{"query":`},
+				}}},
+				"finish_reason": nil,
+			}},
+		}
+		data, _ := json.Marshal(chunk)
+		_, _ = w.Write(append(append([]byte("data: "), data...), []byte("\n\n")...))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+	client := openai.NewClient(option.WithBaseURL(server.URL), option.WithAPIKey("test"))
+	provider := NewChatCompletionsProvider(&client)
+	var visible strings.Builder
+	response, err := provider.GenerateStream(context.Background(), GenerateRequest{Model: "test-model"}, func(delta string) error {
+		visible.WriteString(delta)
+		return nil
+	})
+	if err == nil || response != nil {
+		t.Fatalf("partial stream was accepted as a completed response: response=%+v err=%v", response, err)
+	}
+	if visible.String() != "incomplete" {
+		t.Fatalf("expected deltas to remain visible while rejecting completion, got %q", visible.String())
+	}
+}
+
 func TestResponsesProvider_StreamReturnsCompletedResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

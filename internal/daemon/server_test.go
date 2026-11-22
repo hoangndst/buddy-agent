@@ -486,6 +486,108 @@ capturedParams:
 	}
 }
 
+func TestRestoredIdleConversationsParticipateInEvictionCap(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := persistence.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	calls := make(chan struct{}, 4)
+	factory := func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+		eng := agent.NewEngine(resumeTestProvider{calls: calls}, params.Model, 3, tools.NewRegistry(1000), nil, emitHandler,
+			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID),
+			agent.WithProviderMetadata(params.BaseURL, params.APIType, 1000))
+		return eng, nil, nil
+	}
+	initialManager := NewSessionManager(factory)
+	var conversationIDs []string
+	for i := 0; i < 2; i++ {
+		prompt := fmt.Sprintf("prompt-%d", i)
+		_, started, err := initialManager.StartConversation(t.Context(), protocol.ConversationStartParams{
+			StartID: fmt.Sprintf("start-%d", i), SubmissionID: fmt.Sprintf("submission-%d", i), Prompt: prompt, WorkspaceDir: workspace,
+			Model: "test-model",
+		}, nil)
+		if err != nil {
+			t.Fatalf("create conversation %d: %v", i, err)
+		}
+		conversationIDs = append(conversationIDs, started.ConversationID)
+		select {
+		case <-calls:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("provider request for conversation %d did not run", i)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			submission, getErr := store.GetSubmission(t.Context(), started.ConversationID, started.SubmissionID)
+			if getErr == nil && submission.Status == persistence.SubmissionConsumed {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	initialManager.Drain(time.Second)
+
+	restoredManager := NewSessionManager(factory)
+	restoredManager.SetMaxCompletedSessions(1)
+	first, _, err := restoredManager.ResumeConversation(t.Context(), protocol.ConversationResumeParams{
+		WorkspaceDir: workspace, ConversationID: conversationIDs[0],
+	}, nil)
+	if err != nil {
+		t.Fatalf("restore first idle conversation: %v", err)
+	}
+	waitForIdleConversationCount(t, restoredManager, 1)
+	second, _, err := restoredManager.ResumeConversation(t.Context(), protocol.ConversationResumeParams{
+		WorkspaceDir: workspace, ConversationID: conversationIDs[1],
+	}, nil)
+	if err != nil {
+		t.Fatalf("restore second idle conversation: %v", err)
+	}
+	waitForConversationEvicted(t, restoredManager, conversationIDs[0])
+	if got, ok := restoredManager.GetConversation(conversationIDs[1]); !ok || got != second {
+		t.Fatalf("most recently restored idle worker should remain resident: worker=%p ok=%v", got, ok)
+	}
+	if _, ok := restoredManager.GetConversation(conversationIDs[0]); ok {
+		t.Fatal("oldest idle worker remained resident")
+	}
+	select {
+	case <-first.done:
+	default:
+		t.Fatal("evicted idle worker did not finish cleanup")
+	}
+	restoredManager.Drain(time.Second)
+}
+
+func waitForIdleConversationCount(t *testing.T, manager *SessionManager, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.RLock()
+		got := len(manager.idleConversationOrder)
+		manager.mu.RUnlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("idle conversation count did not reach %d", want)
+}
+
+func waitForConversationEvicted(t *testing.T, manager *SessionManager, conversationID string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := manager.GetConversation(conversationID); !ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("conversation %s was not evicted", conversationID)
+}
+
 func waitForConversationTurns(t *testing.T, store persistence.Store, conversationID string, count int) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
