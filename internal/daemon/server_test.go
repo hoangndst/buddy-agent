@@ -369,8 +369,9 @@ func TestResumeConversationRequiresEphemeralCredentialAndReconfigures(t *testing
 		t.Fatalf("blocked restore did not expose history and reason: snapshot=%+v err=%v", snapshot, err)
 	}
 	resume.APIKey = &secret
+	resume.ConversationID = ""
 	if _, _, err := restoredManager.ResumeConversation(t.Context(), resume, nil); err != nil {
-		t.Fatalf("resume with re-supplied ephemeral key: %v", err)
+		t.Fatalf("resume latest with re-supplied ephemeral key: %v", err)
 	}
 	if reason := restored.ExecutionBlocked(); reason != "" {
 		t.Fatalf("execution remained blocked after credentials were supplied: %q", reason)
@@ -386,6 +387,103 @@ func TestResumeConversationRequiresEphemeralCredentialAndReconfigures(t *testing
 		t.Fatal("provider request did not run after credentials were re-supplied")
 	}
 	restoredManager.Drain(time.Second)
+}
+
+func TestStartConversationRetryRestoresSavedProviderProfile(t *testing.T) {
+	workspace := t.TempDir()
+	dbPath := filepath.Join(workspace, "retry-profile.db")
+	store, err := persistence.NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	calls := make(chan struct{}, 4)
+	makeFactory := func(captured chan<- protocol.SessionStartParams) EngineFactory {
+		return func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+			if captured != nil {
+				captured <- params
+			}
+			eng := agent.NewEngine(resumeTestProvider{calls: calls}, params.Model, 3, tools.NewRegistry(1000), nil, emitHandler,
+				agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID),
+				agent.WithProviderMetadata(params.BaseURL, params.APIType, 1000))
+			return eng, nil, nil
+		}
+	}
+	secret := "retry-ephemeral-key"
+	initial := protocol.ConversationStartParams{
+		StartID: "retry-profile-start", SubmissionID: "retry-profile-submission", Prompt: "retain this conversation", WorkspaceDir: workspace,
+		Model: "original-model", BaseURL: "https://original.example/v1", APIType: "chat", APIKey: &secret,
+	}
+	firstManager := NewSessionManager(makeFactory(nil))
+	_, started, err := firstManager.StartConversation(t.Context(), initial, nil)
+	if err != nil {
+		t.Fatalf("start original conversation: %v", err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("original provider request did not run")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		submission, getErr := store.GetSubmission(t.Context(), started.ConversationID, initial.SubmissionID)
+		if getErr == nil && submission.Status == persistence.SubmissionConsumed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	firstManager.Drain(time.Second)
+
+	captured := make(chan protocol.SessionStartParams, 4)
+	retryManager := NewSessionManager(makeFactory(captured))
+	retry := initial
+	retry.APIKey = nil
+	retry.Model = "incoming-wrong-model"
+	retry.BaseURL = "https://incoming-wrong.example/v1"
+	retry.APIType = "responses"
+	worker, result, err := retryManager.StartConversation(t.Context(), retry, nil)
+	if err != nil {
+		t.Fatalf("retry existing conversation without its ephemeral key: %v", err)
+	}
+	if !result.Existing || worker.ConversationID() != started.ConversationID {
+		t.Fatalf("retry did not reuse the persisted conversation: result=%+v worker=%q", result, worker.ConversationID())
+	}
+	if reason := worker.ExecutionBlocked(); !strings.Contains(reason, "credentials") || reason == "" {
+		t.Fatalf("retry did not block execution pending original credentials: %q", reason)
+	}
+	var lastFactoryParams protocol.SessionStartParams
+	for {
+		select {
+		case lastFactoryParams = <-captured:
+		default:
+			goto capturedParams
+		}
+	}
+capturedParams:
+	if lastFactoryParams.Model != "original-model" || lastFactoryParams.BaseURL != "https://original.example/v1" || lastFactoryParams.APIType != "chat" || lastFactoryParams.APIKey != nil {
+		t.Fatalf("retry restored using incoming settings instead of persisted profile: %+v", lastFactoryParams)
+	}
+	snapshot, _, err := worker.Sync(t.Context(), protocol.ConversationSyncParams{ConversationID: started.ConversationID}, nil)
+	if err != nil || snapshot.ExecutionBlocked == "" || len(snapshot.Transcript) == 0 {
+		t.Fatalf("blocked retry did not preserve history: snapshot=%+v err=%v", snapshot, err)
+	}
+
+	retry.APIKey = &secret
+	retry.Model = "original-model"
+	retry.BaseURL = "https://original.example/v1"
+	retry.APIType = "chat"
+	if _, result, err = retryManager.StartConversation(t.Context(), retry, nil); err != nil || !result.Existing {
+		t.Fatalf("retry with original ephemeral credentials: result=%+v err=%v", result, err)
+	}
+	if reason := worker.ExecutionBlocked(); reason != "" {
+		t.Fatalf("retry with credentials left execution blocked: %q", reason)
+	}
+	retryManager.Drain(time.Second)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func waitForConversationTurns(t *testing.T, store persistence.Store, conversationID string, count int) {

@@ -129,6 +129,85 @@ func derefStringValue(value *string) string {
 	return *value
 }
 
+func resumeParamsFromStart(workspace string, params protocol.ConversationStartParams) protocol.ConversationResumeParams {
+	return protocol.ConversationResumeParams{
+		WorkspaceDir: workspace, DBPath: params.DBPath, Model: params.Model, BaseURL: params.BaseURL, APIType: params.APIType,
+		APIKey: params.APIKey, ReasoningEffort: params.ReasoningEffort, MaxSteps: params.MaxSteps,
+		MaxContextTokens: params.MaxContextTokens, MaxOutputChars: params.MaxOutputChars,
+		WorkingTailSize: params.WorkingTailSize, MCPConfig: params.MCPConfig, Env: params.Env,
+	}
+}
+
+func (sm *SessionManager) createConversationRestoreEngine(conversationID string, params protocol.SessionStartParams, emit agent.EventHandler) (*agent.Engine, func(), string, error) {
+	engine, cleanup, err := sm.engineFactory(conversationID, params, emit)
+	if err == nil {
+		return engine, cleanup, "", nil
+	}
+	if params.CredentialSource != persistence.ConversationCredentialDaemonDefault {
+		return nil, nil, "", err
+	}
+	// The saved endpoint no longer matches daemon-default credentials. Rebuild
+	// with no credentials so transcript restore remains available but cannot
+	// accidentally send requests to another endpoint.
+	params.CredentialSource = persistence.ConversationCredentialEphemeral
+	params.APIKey = nil
+	engine, cleanup, fallbackErr := sm.engineFactory(conversationID, params, emit)
+	if fallbackErr != nil {
+		return nil, nil, "", fmt.Errorf("restore history without provider credentials: %w", fallbackErr)
+	}
+	blocked := "saved endpoint does not match the daemon-default provider endpoint; restore the daemon's saved provider configuration before execution"
+	return engine, cleanup, blocked, nil
+}
+
+func (sm *SessionManager) reconfigureBlockedConversation(ctx context.Context, worker *ConversationWorker, record *persistence.SessionRecord, profile *persistence.ConversationProviderProfile, supplied protocol.ConversationResumeParams) error {
+	if worker.ExecutionBlocked() == "" {
+		return nil
+	}
+	params, profile, blocked := conversationRestoreParams(record.WorkingDir, supplied.DBPath, record, profile, supplied)
+	if blocked != "" {
+		return nil
+	}
+	engine, cleanup, fallbackBlock, err := sm.createConversationRestoreEngine(record.ID, params, func(evt agent.Event) { worker.EmitEvent(evt) })
+	if err != nil {
+		return fmt.Errorf("reconfigure conversation execution: %w", err)
+	}
+	if fallbackBlock != "" {
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil
+	}
+	store := engine.PersistenceStore()
+	if store == nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		return errors.New("conversation persistence is unavailable")
+	}
+	runtime, err := agent.RestoreConversationRuntime(ctx, engine, store, record.ID)
+	if err != nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		return err
+	}
+	if profile != nil {
+		if err := worker.store.SaveConversationProviderProfile(ctx, record.ID, profile); err != nil {
+			if cleanup != nil {
+				cleanup()
+			}
+			return err
+		}
+	}
+	if err := worker.ReplaceBlockedExecution(engine, runtime, cleanup); err != nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		return err
+	}
+	return nil
+}
+
 // SessionManager tracks all active daemon sessions and manages headless execution lifecycles.
 type SessionManager struct {
 	mu                    sync.RWMutex
@@ -236,6 +315,17 @@ func (sm *SessionManager) StartConversation(ctx context.Context, params protocol
 			if first.SubmissionID != params.SubmissionID || first.PayloadFingerprint != persistence.SubmissionFingerprint(params.Prompt, persistence.SubmissionQueue) {
 				return nil, nil, persistence.ErrSubmissionConflict
 			}
+			record, err := worker.SessionRecord(ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			profile, err := worker.store.GetConversationProviderProfile(ctx, id)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := sm.reconfigureBlockedConversation(ctx, worker, record, profile, resumeParamsFromStart(requestedWorkspace, params)); err != nil {
+				return nil, nil, err
+			}
 			turnID := ""
 			if first.TurnID != nil {
 				turnID = *first.TurnID
@@ -325,20 +415,50 @@ func (sm *SessionManager) StartConversation(ctx context.Context, params protocol
 		if startResult.SubmissionID != params.SubmissionID || first.PayloadFingerprint != persistence.SubmissionFingerprint(params.Prompt, persistence.SubmissionQueue) {
 			return nil, nil, persistence.ErrSubmissionConflict
 		}
+		record, recordErr := existing.SessionRecord(ctx)
+		if recordErr != nil {
+			return nil, nil, recordErr
+		}
+		profile, profileErr := existing.store.GetConversationProviderProfile(ctx, startResult.ConversationID)
+		if profileErr != nil {
+			return nil, nil, profileErr
+		}
+		if err := sm.reconfigureBlockedConversation(ctx, existing, record, profile, resumeParamsFromStart(workspace, params)); err != nil {
+			return nil, nil, err
+		}
 		return existing, &protocol.ConversationStartResult{ConversationID: startResult.ConversationID, SessionID: startResult.ConversationID, SubmissionID: startResult.SubmissionID, TurnID: startResult.TurnID, Existing: true}, nil
 	}
 
 	var firstSubmission *persistence.SubmissionRecord
 	if startResult.Existing {
+		if startResult.SubmissionID != params.SubmissionID {
+			cleanupEngine()
+			return nil, nil, persistence.ErrSubmissionConflict
+		}
+		record, recordErr := store.GetSession(ctx, startResult.ConversationID)
+		if recordErr != nil {
+			cleanupEngine()
+			return nil, nil, recordErr
+		}
+		profile, profileErr := store.GetConversationProviderProfile(ctx, startResult.ConversationID)
+		if profileErr != nil {
+			cleanupEngine()
+			return nil, nil, profileErr
+		}
+		hadProviderProfile := profile != nil
+		restoreParams, profile, executionBlocked := conversationRestoreParams(workspace, params.DBPath, record, profile, resumeParamsFromStart(workspace, params))
 		cleanupEngine()
 		conversationID = startResult.ConversationID
-		engine, cleanup, err = sm.engineFactory(conversationID, startParams, func(evt agent.Event) {
+		engine, cleanup, fallbackBlocked, err := sm.createConversationRestoreEngine(conversationID, restoreParams, func(evt agent.Event) {
 			if worker != nil {
 				worker.EmitEvent(evt)
 			}
 		})
 		if err != nil {
 			return nil, nil, fmt.Errorf("restore conversation engine: %w", err)
+		}
+		if fallbackBlocked != "" {
+			executionBlocked = fallbackBlocked
 		}
 		cleanupEngine = func() {
 			if cleanup != nil {
@@ -350,6 +470,12 @@ func (sm *SessionManager) StartConversation(ctx context.Context, params protocol
 			cleanupEngine()
 			return nil, nil, fmt.Errorf("conversation persistence is unavailable")
 		}
+		if !hadProviderProfile && executionBlocked == "" {
+			if err := store.SaveConversationProviderProfile(ctx, conversationID, profile); err != nil {
+				cleanupEngine()
+				return nil, nil, err
+			}
+		}
 		runtime, restoreErr := agent.RestoreConversationRuntime(ctx, engine, store, conversationID)
 		if restoreErr != nil {
 			cleanupEngine()
@@ -359,6 +485,9 @@ func (sm *SessionManager) StartConversation(ctx context.Context, params protocol
 		if err != nil {
 			cleanupEngine()
 			return nil, nil, err
+		}
+		if executionBlocked != "" {
+			worker.SetExecutionBlocked(executionBlocked)
 		}
 	} else {
 		historySession, historyErr := engine.NewHistorySession(params.Prompt)
@@ -427,40 +556,8 @@ func (sm *SessionManager) ResumeConversation(ctx context.Context, params protoco
 			if err != nil {
 				return nil, nil, err
 			}
-			restoreParams, profile, blocked := conversationRestoreParams(workspace, params.DBPath, record, profile, params)
-			if worker.ExecutionBlocked() != "" && blocked == "" {
-				engine, cleanup, err := sm.engineFactory(record.ID, restoreParams, func(evt agent.Event) { worker.EmitEvent(evt) })
-				if err != nil {
-					return nil, nil, fmt.Errorf("reconfigure conversation execution: %w", err)
-				}
-				store := engine.PersistenceStore()
-				if store == nil {
-					if cleanup != nil {
-						cleanup()
-					}
-					return nil, nil, errors.New("conversation persistence is unavailable")
-				}
-				runtime, err := agent.RestoreConversationRuntime(ctx, engine, store, record.ID)
-				if err != nil {
-					if cleanup != nil {
-						cleanup()
-					}
-					return nil, nil, err
-				}
-				if profile != nil {
-					if err := worker.store.SaveConversationProviderProfile(ctx, record.ID, profile); err != nil {
-						if cleanup != nil {
-							cleanup()
-						}
-						return nil, nil, err
-					}
-				}
-				if err := worker.ReplaceBlockedExecution(engine, runtime, cleanup); err != nil {
-					if cleanup != nil {
-						cleanup()
-					}
-					return nil, nil, err
-				}
+			if err := sm.reconfigureBlockedConversation(ctx, worker, record, profile, params); err != nil {
+				return nil, nil, err
 			}
 			return worker, record, nil
 		}
@@ -512,6 +609,13 @@ func (sm *SessionManager) ResumeConversation(ctx context.Context, params protoco
 	}
 	if existing, ok := sm.GetConversation(record.ID); ok {
 		closeEngine()
+		profile, err := existing.store.GetConversationProviderProfile(ctx, record.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := sm.reconfigureBlockedConversation(ctx, existing, record, profile, params); err != nil {
+			return nil, nil, err
+		}
 		return existing, record, nil
 	}
 	profile, err := store.GetConversationProviderProfile(ctx, record.ID)
@@ -522,28 +626,16 @@ func (sm *SessionManager) ResumeConversation(ctx context.Context, params protoco
 	hadProviderProfile := profile != nil
 	startParams, profile, executionBlocked := conversationRestoreParams(workspace, params.DBPath, record, profile, params)
 	closeEngine()
-	engine, cleanup, err = sm.engineFactory(record.ID, startParams, func(evt agent.Event) {
+	engine, cleanup, fallbackBlocked, err := sm.createConversationRestoreEngine(record.ID, startParams, func(evt agent.Event) {
 		if worker != nil {
 			worker.EmitEvent(evt)
 		}
 	})
 	if err != nil {
-		if startParams.CredentialSource != persistence.ConversationCredentialDaemonDefault {
-			return nil, nil, fmt.Errorf("recreate conversation engine: %w", err)
-		}
-		// The saved endpoint no longer matches daemon-default credentials. Build
-		// a no-credential engine for transcript recovery and block execution.
-		startParams.CredentialSource = persistence.ConversationCredentialEphemeral
-		startParams.APIKey = nil
-		executionBlocked = "saved endpoint does not match the daemon-default provider endpoint; restore the daemon's saved provider configuration before execution"
-		engine, cleanup, err = sm.engineFactory(record.ID, startParams, func(evt agent.Event) {
-			if worker != nil {
-				worker.EmitEvent(evt)
-			}
-		})
-		if err != nil {
-			return nil, nil, fmt.Errorf("recreate conversation engine for history: %w", err)
-		}
+		return nil, nil, fmt.Errorf("recreate conversation engine: %w", err)
+	}
+	if fallbackBlocked != "" {
+		executionBlocked = fallbackBlocked
 	}
 	closeEngine = func() {
 		if cleanup != nil {
