@@ -33,6 +33,9 @@ type conversationTUI struct {
 	workspace              string
 	startParams            protocol.ConversationStartParams
 	conversation           string
+	startPending           bool
+	pendingStart           []pendingStartSubmission
+	pendingStartInFlight   bool
 	databasePath           string
 	standalone             bool
 	state                  string
@@ -79,10 +82,15 @@ type conversationStartedMsg struct {
 	err    error
 }
 type conversationSubmittedMsg struct {
-	result *protocol.ConversationSubmitResult
+	result       *protocol.ConversationSubmitResult
+	prompt       string
+	mode         persistence.SubmissionMode
+	pendingStart bool
+	err          error
+}
+type pendingStartSubmission struct {
 	prompt string
 	mode   persistence.SubmissionMode
-	err    error
 }
 type conversationEventMsg protocol.SessionEventNotification
 type permissionRequestMsg protocol.PermissionRequestNotification
@@ -255,14 +263,18 @@ func runConversationLines(ctx context.Context, f *cmdutil.Factory, socketPath st
 				return fmt.Errorf("start conversation: %w", err)
 			}
 			conversationID = started.ConversationID
+			if err := waitConversationSubmissionTerminal(ctx, f, cl, conversationID, started.SubmissionID, started.TurnID); err != nil {
+				return err
+			}
 		} else {
-			_, err := cl.SubmitConversation(protocol.ConversationSubmitParams{ConversationID: conversationID, SubmissionID: newConversationID("submission"), Prompt: prompt, Mode: string(mode)})
+			submissionID := newConversationID("submission")
+			submitted, err := cl.SubmitConversation(protocol.ConversationSubmitParams{ConversationID: conversationID, SubmissionID: submissionID, Prompt: prompt, Mode: string(mode)})
 			if err != nil {
 				return fmt.Errorf("submit conversation prompt: %w", err)
 			}
-		}
-		if err := waitConversationTerminal(ctx, f, cl, conversationID); err != nil {
-			return err
+			if err := waitConversationSubmissionTerminal(ctx, f, cl, conversationID, submitted.SubmissionID, submitted.TurnID); err != nil {
+				return err
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil && err != io.EOF {
@@ -271,12 +283,74 @@ func runConversationLines(ctx context.Context, f *cmdutil.Factory, socketPath st
 	return nil
 }
 
-func waitConversationTerminal(ctx context.Context, f *cmdutil.Factory, cl *client.Client, conversationID string) error {
+func waitConversationSubmissionTerminal(ctx context.Context, f *cmdutil.Factory, cl *client.Client, conversationID, submissionID, turnID string) error {
+	return waitConversationSubmissionEvents(ctx, f, conversationID, submissionID, turnID,
+		cl.ConversationEvents(), cl.ConversationEventGaps(),
+		func() (*protocol.ConversationSyncResult, error) {
+			return cl.SyncConversation(protocol.ConversationSyncParams{ConversationID: conversationID, PageSize: 1})
+		},
+		func() (*protocol.ConversationSyncResult, error) { return readConversationSnapshot(cl, conversationID) },
+		func() error {
+			_, err := cl.SyncConversation(protocol.ConversationSyncParams{ConversationID: conversationID})
+			return err
+		})
+}
+
+func waitConversationSubmissionEvents(ctx context.Context, f *cmdutil.Factory, conversationID, submissionID, turnID string,
+	events <-chan protocol.SessionEventNotification, gaps <-chan struct{},
+	snapshot func() (*protocol.ConversationSyncResult, error), fullSnapshot func() (*protocol.ConversationSyncResult, error), resync func() error,
+) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	terminalTurns := make(map[string]bool)
+	turnStatus, turnError := "", ""
+	resolveTurn := func() error {
+		if submissionID == "" && turnID == "" {
+			return nil
+		}
+		synced, err := snapshot()
+		if err != nil {
+			return fmt.Errorf("sync conversation while waiting for submitted turn: %w", err)
+		}
+		for _, turn := range synced.Turns {
+			matchesSubmission := submissionID != "" && turn.SubmissionID == submissionID
+			matchesTurn := turnID != "" && turn.TurnID == turnID
+			if (matchesSubmission || matchesTurn) && turn.TurnID != "" {
+				turnID, turnStatus, turnError = turn.TurnID, turn.Status, turn.Error
+				break
+			}
+		}
+		return nil
+	}
 	for {
+		if err := resolveTurn(); err != nil {
+			return err
+		}
+		if turnID != "" && turnStatus != "" && turnStatus != string(persistence.StatusRunning) {
+			if !terminalTurns[turnID] {
+				if history, err := fullSnapshot(); err == nil {
+					for _, entry := range history.Transcript {
+						if entry.Role == "assistant" && entry.TurnID == turnID {
+							_, _ = fmt.Fprintln(f.IOStreams.Out, entry.Content)
+						}
+					}
+				}
+			}
+			if turnStatus != string(persistence.StatusCompleted) {
+				if turnError == "" {
+					turnError = turnStatus
+				}
+				return fmt.Errorf("conversation turn failed: %s", turnError)
+			}
+			return nil
+		}
+		if turnID != "" && terminalTurns[turnID] {
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case evt, ok := <-cl.ConversationEvents():
+		case evt, ok := <-events:
 			if !ok {
 				return fmt.Errorf("conversation daemon connection closed")
 			}
@@ -284,16 +358,21 @@ func waitConversationTerminal(ctx context.Context, f *cmdutil.Factory, cl *clien
 				continue
 			}
 			renderEvent(f, evt)
-			if evt.Type == string(agent.EventFinished) {
-				return nil
+			terminal := evt.Type == string(agent.EventFinished) || evt.Type == string(agent.EventError) && evt.Data["terminal"] == true
+			if terminal {
+				terminalTurns[evt.TurnID] = true
+				if turnID != "" && evt.TurnID == turnID {
+					if evt.Type == string(agent.EventError) {
+						return fmt.Errorf("conversation turn failed: %s", evt.Content)
+					}
+					return nil
+				}
 			}
-			if evt.Type == string(agent.EventError) && evt.Data["terminal"] == true {
-				return fmt.Errorf("conversation turn failed: %s", evt.Content)
-			}
-		case <-cl.ConversationEventGaps():
-			if _, err := cl.SyncConversation(protocol.ConversationSyncParams{ConversationID: conversationID}); err != nil {
+		case <-gaps:
+			if err := resync(); err != nil {
 				return fmt.Errorf("resync conversation after event gap: %w", err)
 			}
+		case <-ticker.C:
 		}
 	}
 }
@@ -341,17 +420,39 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textarea.SetHeight(min(5, max(3, msg.Height/5)))
 	case conversationStartedMsg:
 		if msg.err != nil {
+			m.startPending = false
 			m.errorText = msg.err.Error()
+			if len(m.pendingStart) > 0 {
+				m.pendingStart = nil
+				m.errorText += "; prompts queued while starting were discarded; resubmit them"
+			}
+			return m, nil
+		}
+		m.startPending = false
+		if msg.result == nil || msg.result.ConversationID == "" {
+			m.errorText = "start conversation returned no conversation ID"
+			m.pendingStart = nil
 			return m, nil
 		}
 		m.conversation = msg.result.ConversationID
 		m.state = "running"
-		return m, tea.Batch(m.syncConversation(), m.watchPermission())
+		cmds := []tea.Cmd{m.syncConversation(), m.watchPermission()}
+		cmds = append(cmds, m.submitNextPendingStart())
+		return m, tea.Batch(cmds...)
 	case conversationSubmittedMsg:
+		if msg.pendingStart {
+			m.pendingStartInFlight = false
+		}
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
 			m.state = "idle"
+			if msg.pendingStart {
+				return m, nil
+			}
 			return m, nil
+		}
+		if msg.pendingStart && len(m.pendingStart) > 0 {
+			m.pendingStart = m.pendingStart[1:]
 		}
 		if msg.mode == persistence.SubmissionSteer {
 			m.steers = append(m.steers, msg.prompt)
@@ -359,6 +460,9 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.queued = append(m.queued, msg.prompt)
 		}
 		m.state = "running"
+		if len(m.pendingStart) > 0 {
+			return m, tea.Batch(m.syncConversation(), m.submitNextPendingStart())
+		}
 		return m, m.syncConversation()
 	case conversationEventMsg:
 		if msg.ConversationID != m.conversation {
@@ -583,9 +687,6 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if strings.HasPrefix(text, "/queue ") {
 				return m, m.submit(strings.TrimSpace(strings.TrimPrefix(text, "/queue ")), persistence.SubmissionQueue)
 			}
-			if m.conversation == "" {
-				return m, m.start(text)
-			}
 			return m, m.submit(text, persistence.SubmissionQueue)
 		}
 	}
@@ -630,7 +731,14 @@ func (m *conversationTUI) View() tea.View {
 		for _, prompt := range m.steers {
 			b.WriteString(uiTitleStyle.Render("Steering · "+prompt) + "\n")
 		}
-		if len(m.queued)+len(m.steers) > 0 {
+		for _, submission := range m.pendingStart {
+			label := "Queued · "
+			if submission.mode == persistence.SubmissionSteer {
+				label = "Steering · "
+			}
+			b.WriteString(uiMutedStyle.Render(label+submission.prompt) + "\n")
+		}
+		if len(m.queued)+len(m.steers)+len(m.pendingStart) > 0 {
 			b.WriteByte('\n')
 		}
 		if m.pendingApproval != nil {
@@ -675,12 +783,34 @@ func (m *conversationTUI) submit(prompt string, mode persistence.SubmissionMode)
 		return nil
 	}
 	if m.conversation == "" {
+		if m.startPending {
+			m.pendingStart = append(m.pendingStart, pendingStartSubmission{prompt: prompt, mode: mode})
+			return nil
+		}
+		m.startPending = true
 		return m.start(prompt)
+	}
+	if len(m.pendingStart) > 0 || m.pendingStartInFlight {
+		m.pendingStart = append(m.pendingStart, pendingStartSubmission{prompt: prompt, mode: mode})
+		return m.submitNextPendingStart()
 	}
 	params := protocol.ConversationSubmitParams{ConversationID: m.conversation, SubmissionID: newConversationID("submission"), Prompt: prompt, Mode: string(mode)}
 	return func() tea.Msg {
 		result, err := m.client.SubmitConversation(params)
 		return conversationSubmittedMsg{result: result, prompt: prompt, mode: mode, err: err}
+	}
+}
+
+func (m *conversationTUI) submitNextPendingStart() tea.Cmd {
+	if m.conversation == "" || m.pendingStartInFlight || len(m.pendingStart) == 0 {
+		return nil
+	}
+	submission := m.pendingStart[0]
+	params := protocol.ConversationSubmitParams{ConversationID: m.conversation, SubmissionID: newConversationID("submission"), Prompt: submission.prompt, Mode: string(submission.mode)}
+	m.pendingStartInFlight = true
+	return func() tea.Msg {
+		result, err := m.client.SubmitConversation(params)
+		return conversationSubmittedMsg{result: result, prompt: submission.prompt, mode: submission.mode, pendingStart: true, err: err}
 	}
 }
 
