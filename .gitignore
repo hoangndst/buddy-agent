@@ -40,4 +40,5 @@ scratch/
 # EGM local drafts, briefs, and reviews
 .dev/
 concepts_brief.md
+AGENTS.md
 

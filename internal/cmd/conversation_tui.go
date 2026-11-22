@@ -42,6 +42,12 @@ type conversationTUI struct {
 	lastSequence           uint64
 	scrollOffset           int
 	transcript             []string
+	blocks                 []TranscriptBlock
+	lineCountCache         map[string]int
+	wrapCache              map[string][]string
+	deltaBuffer            strings.Builder
+	tickerActive           bool
+	activeBlockID          string
 	streamingText          string
 	pendingApproval        *protocol.PermissionRequestNotification
 	queued                 []string
@@ -58,6 +64,32 @@ type conversationTUI struct {
 	selectedWorkspace      string
 	loadWorkspaceMCPConfig func(string) (*mcp.Config, error)
 }
+
+type BlockKind int
+
+const (
+	BlockUserMessage BlockKind = iota
+	BlockAssistantMessage
+	BlockToolActivity
+	BlockSubagentActivity
+	BlockSystemStatus
+)
+
+type TranscriptBlock struct {
+	ID        string
+	TurnID    string
+	Kind      BlockKind
+	Role      string
+	Header    string
+	Body      string
+	Streaming bool
+	Collapsed bool
+	Depth     int
+	CreatedAt time.Time
+	Data      map[string]any
+}
+
+type renderTickMsg time.Time
 
 type conversationAPI interface {
 	Capabilities() (*protocol.DaemonCapabilitiesResult, error)
@@ -158,7 +190,20 @@ func runConversationTUI(ctx context.Context, f *cmdutil.Factory, socketPath stri
 	input.SetStyles(textarea.DefaultStyles(true))
 	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"), key.WithHelp("shift+enter", "new line"))
 	input.Focus()
-	m := &conversationTUI{ctx: ctx, client: api, workspace: workspace, startParams: params, databasePath: params.DBPath, standalone: standalone, state: "ready", textarea: input, width: 80, height: 24}
+	m := &conversationTUI{
+		ctx:            ctx,
+		client:         api,
+		workspace:      workspace,
+		startParams:    params,
+		databasePath:   params.DBPath,
+		standalone:     standalone,
+		state:          "ready",
+		textarea:       input,
+		width:          80,
+		height:         24,
+		lineCountCache: make(map[string]int),
+		wrapCache:      make(map[string][]string),
+	}
 	if f.MCPConfigLoader != nil {
 		home := ""
 		if f.UserHome != nil {
@@ -450,6 +495,12 @@ func isConversationNotFound(err error) bool {
 }
 
 func (m *conversationTUI) Init() tea.Cmd {
+	if m.lineCountCache == nil {
+		m.lineCountCache = make(map[string]int)
+	}
+	if m.wrapCache == nil {
+		m.wrapCache = make(map[string][]string)
+	}
 	if m.conversation != "" {
 		return tea.Batch(textarea.Blink, m.watchEvent(), m.watchPermission())
 	}
@@ -460,8 +511,46 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.textarea.SetWidth(max(20, msg.Width-6))
-		m.textarea.SetHeight(min(5, max(3, msg.Height/5)))
+		func() {
+			defer func() { _ = recover() }()
+			m.textarea.SetWidth(max(20, msg.Width-6))
+			m.textarea.SetHeight(min(5, max(3, msg.Height/5)))
+		}()
+		m.clearCache()
+		if m.activeBlockID != "" {
+			for _, b := range m.blocks {
+				if b.ID == m.activeBlockID {
+					_ = m.getWrappedLines(b, m.width)
+					break
+				}
+			}
+		}
+		visible := m.computeVisibleBlocks()
+		for _, b := range visible {
+			_ = m.getWrappedLines(b, m.width)
+		}
+	case renderTickMsg:
+		if m.deltaBuffer.Len() > 0 {
+			flushed := m.deltaBuffer.String()
+			m.deltaBuffer.Reset()
+			m.streamingText += flushed
+			if m.activeBlockID != "" {
+				for i := range m.blocks {
+					if m.blocks[i].ID == m.activeBlockID {
+						m.blocks[i].Body += flushed
+						m.invalidateBlockCache(m.blocks[i].ID)
+						break
+					}
+				}
+			}
+		}
+		if m.tickerActive && (m.state == "running" || m.activeBlockID != "" || m.deltaBuffer.Len() > 0) {
+			return m, tea.Tick(33*time.Millisecond, func(t time.Time) tea.Msg {
+				return renderTickMsg(t)
+			})
+		}
+		m.tickerActive = false
+		return m, nil
 	case conversationStartedMsg:
 		if msg.err != nil {
 			m.startPending = false
@@ -524,21 +613,76 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case string(agent.EventFinished):
 			m.state = "idle"
+			m.tickerActive = false
+			m.deltaBuffer.Reset()
+			m.activeBlockID = ""
 			return m, m.syncConversation()
 		case string(agent.EventError):
 			m.state = "idle"
 			m.streamingText = ""
+			m.tickerActive = false
+			m.deltaBuffer.Reset()
+			m.activeBlockID = ""
 			m.errorText = msg.Content
 			return m, m.syncConversation()
 		case string(agent.EventTextDelta):
-			m.streamingText += msg.Content
+			m.deltaBuffer.WriteString(msg.Content)
+			if m.activeBlockID == "" {
+				block := TranscriptBlock{
+					ID:        newConversationID("block"),
+					TurnID:    msg.TurnID,
+					Kind:      BlockAssistantMessage,
+					Role:      "assistant",
+					Header:    "Buddy",
+					Body:      "",
+					Streaming: true,
+					CreatedAt: time.Now(),
+					Data:      msg.Data,
+				}
+				m.appendBlock(block)
+				m.activeBlockID = block.ID
+			}
+			if !m.tickerActive {
+				m.tickerActive = true
+				return m, tea.Batch(
+					m.watchEvent(),
+					tea.Tick(33*time.Millisecond, func(t time.Time) tea.Msg {
+						return renderTickMsg(t)
+					}),
+				)
+			}
+			return m, m.watchEvent()
 		case string(agent.EventToolCall):
 			tool := "tool"
 			if msg.Data != nil {
 				if name, ok := msg.Data["tool_name"].(string); ok && name != "" {
 					tool = name
 				}
+				if path, ok := msg.Data["path"].(string); ok && path != "" {
+					line := 0
+					if l, ok := msg.Data["line"].(float64); ok {
+						line = int(l)
+					}
+					tool += " " + FormatFileHyperlink(path, line)
+				} else if path, ok := msg.Data["file_path"].(string); ok && path != "" {
+					line := 0
+					if l, ok := msg.Data["line"].(float64); ok {
+						line = int(l)
+					}
+					tool += " " + FormatFileHyperlink(path, line)
+				}
 			}
+			block := TranscriptBlock{
+				ID:        newConversationID("block"),
+				TurnID:    msg.TurnID,
+				Kind:      BlockToolActivity,
+				Role:      "tool",
+				Header:    "Running " + tool,
+				Body:      "",
+				CreatedAt: time.Now(),
+				Data:      msg.Data,
+			}
+			m.appendBlock(block)
 			m.transcript = append(m.transcript, toolStyle.Render("Running "+tool))
 		case string(agent.EventToolResult):
 			result := msg.Content
@@ -548,21 +692,89 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			if result != "" {
-				if len(result) > 300 {
-					result = result[:300] + "…"
+				preview := result
+				if len(preview) > 300 {
+					preview = preview[:300] + "…"
 				}
-				m.transcript = append(m.transcript, uiMutedStyle.Render(result))
+				block := TranscriptBlock{
+					ID:        newConversationID("block"),
+					TurnID:    msg.TurnID,
+					Kind:      BlockToolActivity,
+					Role:      "tool",
+					Header:    "Result",
+					Body:      result,
+					CreatedAt: time.Now(),
+					Data:      msg.Data,
+				}
+				m.appendBlock(block)
+				m.transcript = append(m.transcript, uiMutedStyle.Render(preview))
 			}
 		case string(agent.EventReasoning):
 			if msg.Content != "" {
+				block := TranscriptBlock{
+					ID:        newConversationID("block"),
+					TurnID:    msg.TurnID,
+					Kind:      BlockAssistantMessage,
+					Role:      "reasoning",
+					Header:    "Reasoning",
+					Body:      msg.Content,
+					CreatedAt: time.Now(),
+					Data:      msg.Data,
+				}
+				m.appendBlock(block)
 				m.transcript = append(m.transcript, thoughtStyle.Render(msg.Content))
 			}
 		case string(agent.EventTextComplete):
+			if m.deltaBuffer.Len() > 0 {
+				flushed := m.deltaBuffer.String()
+				m.deltaBuffer.Reset()
+				m.streamingText += flushed
+			}
+			m.tickerActive = false
+			content := msg.Content
+			if content == "" {
+				content = m.streamingText
+			}
 			m.streamingText = ""
-			if msg.Content != "" {
-				m.transcript = append(m.transcript, uiBuddyStyle.Render("Buddy")+"\n"+msg.Content)
+			if m.activeBlockID != "" {
+				for i := range m.blocks {
+					if m.blocks[i].ID == m.activeBlockID {
+						m.blocks[i].Streaming = false
+						if content != "" {
+							m.blocks[i].Body = content
+						}
+						m.invalidateBlockCache(m.blocks[i].ID)
+						break
+					}
+				}
+				m.activeBlockID = ""
+			} else if content != "" {
+				block := TranscriptBlock{
+					ID:        newConversationID("block"),
+					TurnID:    msg.TurnID,
+					Kind:      BlockAssistantMessage,
+					Role:      "assistant",
+					Header:    "Buddy",
+					Body:      content,
+					CreatedAt: time.Now(),
+					Data:      msg.Data,
+				}
+				m.appendBlock(block)
+			}
+			if content != "" {
+				m.transcript = append(m.transcript, uiBuddyStyle.Render("Buddy")+"\n"+content)
 			}
 		case string(agent.EventCompactionStart):
+			block := TranscriptBlock{
+				ID:        newConversationID("block"),
+				TurnID:    msg.TurnID,
+				Kind:      BlockSystemStatus,
+				Role:      "system",
+				Header:    "System",
+				Body:      "Compacting conversation context…",
+				CreatedAt: time.Now(),
+			}
+			m.appendBlock(block)
 			m.transcript = append(m.transcript, uiMutedStyle.Render("Compacting conversation context…"))
 		}
 		return m, m.watchEvent()
@@ -760,14 +972,21 @@ func (m *conversationTUI) View() tea.View {
 			b.WriteString(marker + choice + "\n")
 		}
 	} else {
-		visible := max(4, m.height-12)
-		end := max(0, len(m.transcript)-m.scrollOffset)
-		start := max(0, end-visible)
-		for _, line := range m.transcript[start:end] {
-			b.WriteString(line + "\n\n")
+		if len(m.blocks) > 0 {
+			visible := m.computeVisibleBlocks()
+			for _, block := range visible {
+				b.WriteString(m.renderBlock(block, m.width) + "\n\n")
+			}
+		} else {
+			visible := max(4, m.height-12)
+			end := max(0, len(m.transcript)-m.scrollOffset)
+			start := max(0, end-visible)
+			for _, line := range m.transcript[start:end] {
+				b.WriteString(line + "\n\n")
+			}
 		}
-		if m.streamingText != "" {
-			b.WriteString(uiBuddyStyle.Render("Buddy") + "\n" + m.streamingText + "\n\n")
+		if m.streamingText != "" && m.activeBlockID == "" {
+			b.WriteString(uiBuddyStyle.Render("Buddy") + "\n" + ProcessMarkdownTables(m.streamingText, m.width, 0) + "\n\n")
 		}
 		for _, prompt := range m.queued {
 			b.WriteString(uiMutedStyle.Render("Queued · "+prompt) + "\n")
@@ -796,7 +1015,7 @@ func (m *conversationTUI) View() tea.View {
 				b.WriteString(uiMutedStyle.Render(preview) + "\n")
 			}
 		}
-		b.WriteString(m.textarea.View())
+		b.WriteString(m.renderTextarea())
 		footer := "Enter send  ·  Shift+Enter newline  ·  /steer <prompt>  ·  /resume  ·  Ctrl+C detach"
 		if m.standalone {
 			footer = "Enter send  ·  Shift+Enter newline  ·  /steer <prompt>  ·  /resume  ·  Ctrl+C stop local run"
@@ -911,6 +1130,9 @@ func (m *conversationTUI) syncConversation() tea.Cmd {
 
 func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	m.streamingText = ""
+	m.deltaBuffer.Reset()
+	m.tickerActive = false
+	m.activeBlockID = ""
 	m.pendingApproval = nil
 	if result == nil {
 		return
@@ -927,12 +1149,23 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	}
 	m.lastSequence = result.EventWatermark
 	m.transcript = m.transcript[:0]
+	m.blocks = m.blocks[:0]
+	m.clearCache()
 	m.queued, m.steers = nil, nil
 	if result.OutputIncomplete {
 		m.errorText = "Some transient output is unavailable; restored from durable conversation history."
 	}
 	for _, entry := range result.Transcript {
 		if entry.Role == "user" {
+			m.appendBlock(TranscriptBlock{
+				ID:        newConversationID("block"),
+				TurnID:    entry.TurnID,
+				Kind:      BlockUserMessage,
+				Role:      "user",
+				Header:    "You",
+				Body:      entry.Content,
+				CreatedAt: time.Now(),
+			})
 			m.transcript = append(m.transcript, uiUserStyle.Render("You")+"\n"+entry.Content)
 			if entry.Status == string(persistence.SubmissionQueued) {
 				m.queued = append(m.queued, entry.Content)
@@ -942,9 +1175,245 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			}
 		}
 		if entry.Role == "assistant" {
+			m.appendBlock(TranscriptBlock{
+				ID:        newConversationID("block"),
+				TurnID:    entry.TurnID,
+				Kind:      BlockAssistantMessage,
+				Role:      "assistant",
+				Header:    "Buddy",
+				Body:      entry.Content,
+				CreatedAt: time.Now(),
+			})
 			m.transcript = append(m.transcript, uiBuddyStyle.Render("Buddy")+"\n"+entry.Content)
 		}
 	}
+}
+
+func (m *conversationTUI) renderTextarea() string {
+	defer func() {
+		_ = recover()
+	}()
+	return m.textarea.View()
+}
+
+func (m *conversationTUI) viewportHeight() int {
+	headerHeight := 3
+	if m.conversation != "" {
+		headerHeight = 4
+	}
+	composerHeight := m.textarea.Height() + 2
+	overhead := headerHeight + composerHeight + len(m.queued) + len(m.steers) + len(m.pendingStart)
+	if m.pendingApproval != nil {
+		overhead += 3
+	}
+	if m.errorText != "" {
+		overhead += 2
+	}
+	h := m.height - overhead
+	if h < 4 {
+		return 4
+	}
+	return h
+}
+
+func (m *conversationTUI) clearCache() {
+	m.lineCountCache = make(map[string]int)
+	m.wrapCache = make(map[string][]string)
+}
+
+func (m *conversationTUI) invalidateBlockCache(blockID string) {
+	if m.lineCountCache != nil {
+		for k := range m.lineCountCache {
+			if strings.HasPrefix(k, blockID+":") {
+				delete(m.lineCountCache, k)
+			}
+		}
+	}
+	if m.wrapCache != nil {
+		for k := range m.wrapCache {
+			if strings.HasPrefix(k, blockID+":") {
+				delete(m.wrapCache, k)
+			}
+		}
+	}
+}
+
+func (m *conversationTUI) appendBlock(block TranscriptBlock) {
+	if block.ID == "" {
+		block.ID = newConversationID("block")
+	}
+	if block.CreatedAt.IsZero() {
+		block.CreatedAt = time.Now()
+	}
+	m.blocks = append(m.blocks, block)
+}
+
+func (m *conversationTUI) getBlockLineCount(b TranscriptBlock, width int) int {
+	if width <= 0 {
+		width = 80
+	}
+	key := fmt.Sprintf("%s:%d", b.ID, width)
+	if m.lineCountCache != nil {
+		if count, ok := m.lineCountCache[key]; ok {
+			return count
+		}
+	}
+	if m.wrapCache != nil {
+		if lines, ok := m.wrapCache[key]; ok {
+			count := len(lines) + 1
+			if m.lineCountCache == nil {
+				m.lineCountCache = make(map[string]int)
+			}
+			m.lineCountCache[key] = count
+			return count
+		}
+	}
+	// Fast line count estimation for off-screen blocks without executing full markdown formatting passes.
+	lines := strings.Split(b.Body, "\n")
+	count := 1 // header line
+	for _, l := range lines {
+		w := len(l)
+		if w == 0 {
+			count++
+		} else {
+			count += (w + width - 1) / width
+		}
+	}
+	count++ // separator newline
+	if m.lineCountCache == nil {
+		m.lineCountCache = make(map[string]int)
+	}
+	m.lineCountCache[key] = count
+	return count
+}
+
+func (m *conversationTUI) getWrappedLines(b TranscriptBlock, width int) []string {
+	if width <= 0 {
+		width = 80
+	}
+	if m.wrapCache == nil {
+		m.wrapCache = make(map[string][]string)
+	}
+	key := fmt.Sprintf("%s:%d", b.ID, width)
+	if lines, ok := m.wrapCache[key]; ok {
+		return lines
+	}
+	rendered := m.renderBlock(b, width)
+	lines := strings.Split(rendered, "\n")
+	var wrapped []string
+	for _, l := range lines {
+		if lipgloss.Width(l) <= width {
+			wrapped = append(wrapped, l)
+		} else {
+			renderedLine := lipgloss.NewStyle().Width(width).Render(l)
+			wrapped = append(wrapped, strings.Split(renderedLine, "\n")...)
+		}
+	}
+	m.wrapCache[key] = wrapped
+	if m.lineCountCache == nil {
+		m.lineCountCache = make(map[string]int)
+	}
+	m.lineCountCache[key] = len(wrapped) + 1
+	return wrapped
+}
+
+func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+	var content string
+	switch b.Kind {
+	case BlockUserMessage:
+		header := b.Header
+		if header == "" {
+			header = "You"
+		}
+		content = uiUserStyle.Render(header) + "\n" + b.Body
+	case BlockAssistantMessage:
+		header := b.Header
+		if header == "" {
+			header = "Buddy"
+		}
+		body := b.Body
+		if b.Streaming && m.streamingText != "" && len(m.streamingText) > len(body) {
+			body = m.streamingText
+		}
+		if b.Role == "reasoning" {
+			content = thoughtStyle.Render(body)
+		} else {
+			body = ProcessMarkdownTables(body, width, 0)
+			content = uiBuddyStyle.Render(header) + "\n" + body
+		}
+	case BlockToolActivity:
+		if b.Body == "" {
+			content = toolStyle.Render(b.Header)
+		} else {
+			preview := b.Body
+			if len(preview) > 300 {
+				preview = preview[:300] + "…"
+			}
+			content = uiMutedStyle.Render(preview)
+		}
+	case BlockSubagentActivity:
+		header := b.Header
+		if header == "" {
+			header = "Subagent"
+		}
+		content = uiTitleStyle.Render(header) + "\n" + b.Body
+	case BlockSystemStatus:
+		content = uiMutedStyle.Render(b.Body)
+	default:
+		content = b.Body
+	}
+	return content
+}
+
+func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {
+	if len(m.blocks) == 0 {
+		return nil
+	}
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	vpHeight := m.viewportHeight()
+
+	totalLines := 0
+	lineCounts := make([]int, len(m.blocks))
+	for i, block := range m.blocks {
+		lc := m.getBlockLineCount(block, width)
+		lineCounts[i] = lc
+		totalLines += lc
+	}
+
+	if totalLines <= vpHeight {
+		m.scrollOffset = 0
+		return m.blocks
+	}
+
+	maxScroll := max(0, totalLines-vpHeight)
+	if m.scrollOffset > maxScroll {
+		m.scrollOffset = maxScroll
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
+
+	windowBottom := totalLines - m.scrollOffset
+	windowTop := max(0, windowBottom-vpHeight)
+
+	var visible []TranscriptBlock
+	curLine := 0
+	for i, block := range m.blocks {
+		blockStart := curLine
+		blockEnd := curLine + lineCounts[i]
+		curLine = blockEnd
+
+		if blockEnd > windowTop && blockStart < windowBottom {
+			visible = append(visible, block)
+		}
+	}
+	return visible
 }
 
 func (m *conversationTUI) listWorkspaces() tea.Cmd {
