@@ -42,7 +42,7 @@ func (p *ChatCompletionsProvider) GenerateStream(ctx context.Context, req Genera
 	params, opts := chatCompletionParams(req)
 	params.StreamOptions = openai.ChatCompletionStreamOptionsParam{IncludeUsage: openai.Bool(true)}
 	stream := p.client.Chat.Completions.NewStreaming(ctx, params, opts...)
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	var accumulated openai.ChatCompletionAccumulator
 	for stream.Next() {

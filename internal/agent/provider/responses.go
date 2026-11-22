@@ -43,7 +43,7 @@ func (p *ResponsesProvider) Generate(ctx context.Context, req GenerateRequest) (
 func (p *ResponsesProvider) GenerateStream(ctx context.Context, req GenerateRequest, onTextDelta func(string) error) (*GenerateResponse, error) {
 	params, opts := responseParams(req)
 	stream := p.client.Responses.NewStreaming(ctx, params, opts...)
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	var completed *responses.Response
 	for stream.Next() {

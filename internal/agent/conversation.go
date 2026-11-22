@@ -29,26 +29,31 @@ type ConversationRuntime struct {
 	turnOutcomeHook     func(string, string, persistence.SessionStatus, error, func() error) error
 }
 
+// SetApplySubmissionHook installs the daemon's ordered persistence/event hook for applying inputs.
 func (c *ConversationRuntime) SetApplySubmissionHook(hook func(func() (*persistence.SubmissionRecord, error)) (*persistence.SubmissionRecord, error)) {
 	c.applySubmissionHook = hook
 }
 
+// SetTurnOutcomeHook installs the daemon's atomic turn-outcome persistence hook.
 func (c *ConversationRuntime) SetTurnOutcomeHook(hook func(string, string, persistence.SessionStatus, error, func() error) error) {
 	c.turnOutcomeHook = hook
 }
 
+// SetPromptOverride keeps the unredacted accepted prompt available for the active process.
 func (c *ConversationRuntime) SetPromptOverride(submissionID, prompt string) {
 	c.overridesMu.Lock()
 	c.promptOverrides[submissionID] = prompt
 	c.overridesMu.Unlock()
 }
 
+// DeletePromptOverride removes the in-memory prompt override after it is no longer needed.
 func (c *ConversationRuntime) DeletePromptOverride(submissionID string) {
 	c.overridesMu.Lock()
 	delete(c.promptOverrides, submissionID)
 	c.overridesMu.Unlock()
 }
 
+// PromptOverride returns the in-memory prompt associated with a submission, if present.
 func (c *ConversationRuntime) PromptOverride(submissionID string) (string, bool) {
 	c.overridesMu.Lock()
 	defer c.overridesMu.Unlock()
@@ -253,12 +258,10 @@ func RestoreConversationRuntime(ctx context.Context, engine *Engine, store persi
 		return nil, fmt.Errorf("load conversation snapshot: %w", err)
 	}
 	compactedStep := 0
-	snapshotRevision := int64(0)
 	narrative := ""
 	var tracker *history.StateTracker
 	if snapshot != nil {
 		compactedStep = snapshot.StepNumber
-		snapshotRevision = snapshot.HistoryRevision
 		narrative = snapshot.DistilledNarrative
 		var state history.StateTrackerData
 		if err := json.Unmarshal([]byte(snapshot.StateTrackerJSON), &state); err != nil {
@@ -280,7 +283,10 @@ func RestoreConversationRuntime(ctx context.Context, engine *Engine, store persi
 	firstSubmissionID := submissions[0].SubmissionID
 	appliedSubmissions := make([]*persistence.SubmissionRecord, 0, len(submissions))
 	for _, submission := range submissions {
-		if submission.Sequence == 1 || submission.TurnID == nil || submission.AppliedAfterStep == nil || submission.AppliedHistoryRevision <= snapshotRevision || (submission.Status != persistence.SubmissionAttached && submission.Status != persistence.SubmissionConsumed) {
+		// Snapshot revisions also advance when turns after the compaction
+		// boundary are persisted. Use the compacted step boundary to decide
+		// whether an applied prompt is already represented by the snapshot.
+		if submission.Sequence == 1 || submission.TurnID == nil || submission.AppliedAfterStep == nil || *submission.AppliedAfterStep < compactedStep || (submission.Status != persistence.SubmissionAttached && submission.Status != persistence.SubmissionConsumed) {
 			continue
 		}
 		appliedSubmissions = append(appliedSubmissions, submission)

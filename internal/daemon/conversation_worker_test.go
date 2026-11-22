@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,18 @@ type steeringBoundaryProvider struct {
 	toolAfterFirst bool
 	mu             sync.Mutex
 	calls          int
+}
+
+type uncooperativeProvider struct {
+	entered chan struct{}
+	release <-chan struct{}
+}
+
+func (p *uncooperativeProvider) Protocol() string { return "test" }
+func (p *uncooperativeProvider) Generate(context.Context, provider.GenerateRequest) (*provider.GenerateResponse, error) {
+	close(p.entered)
+	<-p.release // Deliberately ignores cancellation to exercise the drain deadline.
+	return &provider.GenerateResponse{Protocol: "test", Content: "completed after release"}, nil
 }
 
 func (p *steeringBoundaryProvider) Protocol() string { return "test" }
@@ -148,6 +161,47 @@ func TestConversationWorkerAppliesSteerAtNextModelBoundary(t *testing.T) {
 	}
 	steer, err = store.GetSubmission(ctx, started.ConversationID, steer.SubmissionID)
 	t.Fatalf("steer was not consumed with the active turn: %+v err=%v", steer, err)
+}
+
+func TestConversationWorkerSyncTranscriptPaginationAdvances(t *testing.T) {
+	ctx := context.Background()
+	store, err := persistence.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	fingerprint := persistence.SubmissionFingerprint("prompt-0", persistence.SubmissionQueue)
+	started, err := store.CreateConversation(ctx, &persistence.ConversationStartRequest{
+		Session: persistence.SessionRecord{ID: "pagination-test", WorkingDir: t.TempDir(), Model: "test-model"},
+		StartID: "pagination-start", PayloadFingerprint: fingerprint,
+		FirstSubmission: persistence.SubmissionRecord{SubmissionID: "submission-0", Prompt: "prompt-0", Mode: persistence.SubmissionQueue, PayloadFingerprint: fingerprint, TurnID: ptrString("turn-0")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < 105; i++ {
+		prompt := fmt.Sprintf("prompt-%d", i)
+		if _, err := store.AdmitSubmission(ctx, &persistence.SubmissionRecord{
+			ConversationID: started.ConversationID, SubmissionID: fmt.Sprintf("submission-%d", i), Prompt: prompt, Mode: persistence.SubmissionQueue,
+		}); err != nil {
+			t.Fatalf("admit submission %d: %v", i, err)
+		}
+	}
+	worker := &ConversationWorker{conversationID: started.ConversationID, store: store, ring: NewEventRingBuffer(DefaultRingBufferCapacity), workerEpoch: "pagination-epoch"}
+	first, _, err := worker.Sync(ctx, protocol.ConversationSyncParams{ConversationID: started.ConversationID, PageSize: 100}, nil)
+	if err != nil {
+		t.Fatalf("read first transcript page: %v", err)
+	}
+	if len(first.Transcript) != 100 || first.NextPageToken == "" {
+		t.Fatalf("unexpected first page size/token: entries=%d token=%q", len(first.Transcript), first.NextPageToken)
+	}
+	second, _, err := worker.Sync(ctx, protocol.ConversationSyncParams{ConversationID: started.ConversationID, PageSize: 100, HistoryRevision: first.HistoryRevision, PageToken: first.NextPageToken}, nil)
+	if err != nil {
+		t.Fatalf("read second transcript page: %v", err)
+	}
+	if len(second.Transcript) != 5 || second.NextPageToken != "" || second.Transcript[0].Content == first.Transcript[0].Content {
+		t.Fatalf("pagination did not advance to the final five entries: %+v", second)
+	}
 }
 
 func TestConversationWorkerPromotesLateSteerAheadOfQueuedPrompts(t *testing.T) {
@@ -338,3 +392,169 @@ func TestConversationPermissionSyncReconnectAndStaleRequest(t *testing.T) {
 }
 
 func ptrString(s string) *string { return &s }
+
+func TestConversationWorkerQueuesSteerAcceptedAfterTerminalSequence(t *testing.T) {
+	ctx := context.Background()
+	store, err := persistence.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	workspace := t.TempDir()
+	fingerprint := persistence.SubmissionFingerprint("first prompt", persistence.SubmissionQueue)
+	started, err := store.CreateConversation(ctx, &persistence.ConversationStartRequest{
+		Session: persistence.SessionRecord{ID: "terminal-steer-test", WorkingDir: workspace, Model: "test-model"},
+		StartID: "terminal-steer-start", PayloadFingerprint: fingerprint,
+		FirstSubmission: persistence.SubmissionRecord{
+			SubmissionID: "first-submission", Prompt: "first prompt", Mode: persistence.SubmissionQueue,
+			PayloadFingerprint: fingerprint, TurnID: ptrString("terminal-turn"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &steeringBoundaryProvider{firstCall: make(chan struct{}), continueCh: make(chan struct{}), second: make(chan provider.GenerateRequest, 1)}
+	engine := agent.NewEngine(provider, "test-model", 5, tools.NewRegistry(1000), nil, nil,
+		agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(started.ConversationID), agent.WithSystemPromptOverride("system"))
+	historySession, err := engine.NewHistorySession("first prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := agent.NewConversationRuntime(ctx, engine, store, started.ConversationID, started.SubmissionID, historySession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewConversationWorker(ctx, started.ConversationID, engine, runtime, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(worker.Stop)
+	worker.mu.Lock()
+	worker.active = true
+	worker.currentTurn = "terminal-turn"
+	worker.currentTerminalSent = true
+	worker.mu.Unlock()
+
+	steer, _, err := worker.Submit(ctx, &persistence.SubmissionRecord{
+		ConversationID: started.ConversationID, SubmissionID: "late-steer", Prompt: "next turn steer", Mode: persistence.SubmissionSteer,
+	})
+	if err != nil {
+		t.Fatalf("submit steer after terminal event: %v", err)
+	}
+	worker.mu.Lock()
+	queued := len(worker.queue) == 1 && worker.queue[0].SubmissionID == steer.SubmissionID
+	stranded := len(worker.pendingSteers) != 0
+	_, pending := worker.pending[steer.SubmissionID]
+	wakeQueued := len(worker.queueWake) > 0
+	worker.mu.Unlock()
+	if !queued || stranded || !pending || !wakeQueued {
+		t.Fatalf("late steer was not made runnable: queued=%v stranded=%v pending=%v wake=%v", queued, stranded, pending, wakeQueued)
+	}
+}
+
+func TestSessionManagerDrainReturnsAtDeadlineForUncooperativeProvider(t *testing.T) {
+	ctx := context.Background()
+	store, err := persistence.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeClosed := make(chan struct{})
+	pool := NewStorePool()
+	pooled, _, err := pool.Get("drain-test", func() (persistence.Store, func(), error) {
+		return store, func() {
+			close(storeClosed)
+			_ = store.Close()
+		}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewSessionManager(nil)
+	manager.SetStorePool(pool)
+	workspace := t.TempDir()
+	fingerprint := persistence.SubmissionFingerprint("run", persistence.SubmissionQueue)
+	started, err := store.CreateConversation(ctx, &persistence.ConversationStartRequest{
+		Session: persistence.SessionRecord{ID: "drain-uncooperative-test", WorkingDir: workspace, Model: "test-model"},
+		StartID: "drain-start", PayloadFingerprint: fingerprint,
+		FirstSubmission: persistence.SubmissionRecord{
+			SubmissionID: "drain-submission", Prompt: "run", Mode: persistence.SubmissionQueue,
+			PayloadFingerprint: fingerprint, TurnID: ptrString("drain-turn"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	provider := &uncooperativeProvider{entered: make(chan struct{}), release: release}
+	engine := agent.NewEngine(provider, "test-model", 5, tools.NewRegistry(1000), nil, nil,
+		agent.WithStore(pooled), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(started.ConversationID), agent.WithSystemPromptOverride("system"))
+	historySession, err := engine.NewHistorySession("run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := agent.NewConversationRuntime(ctx, engine, pooled, started.ConversationID, started.SubmissionID, historySession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupDone := make(chan struct{})
+	worker, err := NewConversationWorker(ctx, started.ConversationID, engine, runtime, nil, func() { close(cleanupDone) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Start(&persistence.SubmissionRecord{ConversationID: started.ConversationID, SubmissionID: started.SubmissionID, TurnID: ptrString("drain-turn")}); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	manager.conversations[started.ConversationID] = worker
+	manager.mu.Unlock()
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		worker.Stop()
+		_ = pool.Close()
+	})
+	select {
+	case <-provider.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider call did not start")
+	}
+
+	startedAt := time.Now()
+	manager.Drain(30 * time.Millisecond)
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("Drain exceeded its deadline by too much: %s", elapsed)
+	}
+	select {
+	case <-worker.done:
+		t.Fatal("Drain waited for a provider that ignored cancellation")
+	default:
+	}
+	select {
+	case <-storeClosed:
+		t.Fatal("Drain closed shared stores while a conversation was still running")
+	default:
+	}
+	if _, err := store.GetSession(ctx, started.ConversationID); err != nil {
+		t.Fatalf("shared store became unavailable before the worker exited: %v", err)
+	}
+
+	close(release)
+	select {
+	case <-worker.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not exit after releasing the provider")
+	}
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("worker cleanup did not run after exit")
+	}
+	select {
+	case <-storeClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shared store was not closed after workers exited")
+	}
+}

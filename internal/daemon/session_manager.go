@@ -28,6 +28,7 @@ type EngineFactory func(sessionID string, params protocol.SessionStartParams, em
 // SessionManager tracks all active daemon sessions and manages headless execution lifecycles.
 type SessionManager struct {
 	mu                    sync.RWMutex
+	storesCloseOnce       sync.Once
 	sessions              map[string]*SessionWorker
 	conversations         map[string]*ConversationWorker
 	completedOrder        []string
@@ -40,12 +41,14 @@ type SessionManager struct {
 	workspaceCatalog      *persistence.WorkspaceCatalog
 }
 
+// SetStorePool configures the manager's shared workspace store pool.
 func (sm *SessionManager) SetStorePool(pool *StorePool) {
 	sm.mu.Lock()
 	sm.storePool = pool
 	sm.mu.Unlock()
 }
 
+// SetWorkspaceCatalog configures workspace discovery for stored conversations.
 func (sm *SessionManager) SetWorkspaceCatalog(catalog *persistence.WorkspaceCatalog) {
 	sm.mu.Lock()
 	sm.workspaceCatalog = catalog
@@ -53,18 +56,18 @@ func (sm *SessionManager) SetWorkspaceCatalog(catalog *persistence.WorkspaceCata
 }
 
 func (sm *SessionManager) closeStores() {
-	sm.mu.RLock()
-	pool := sm.storePool
-	sm.mu.RUnlock()
-	if pool != nil {
-		_ = pool.Close()
-	}
-	sm.mu.RLock()
-	catalog := sm.workspaceCatalog
-	sm.mu.RUnlock()
-	if catalog != nil {
-		_ = catalog.Close()
-	}
+	sm.storesCloseOnce.Do(func() {
+		sm.mu.RLock()
+		pool := sm.storePool
+		catalog := sm.workspaceCatalog
+		sm.mu.RUnlock()
+		if pool != nil {
+			_ = pool.Close()
+		}
+		if catalog != nil {
+			_ = catalog.Close()
+		}
+	})
 }
 
 func (sm *SessionManager) registerWorkspace(ctx context.Context, workspace string, store persistence.Store) error {
@@ -452,6 +455,7 @@ func (sm *SessionManager) ResumeConversation(ctx context.Context, params protoco
 	return worker, record, nil
 }
 
+// ListConversationWorkspaces returns workspaces with persisted conversations.
 func (sm *SessionManager) ListConversationWorkspaces(ctx context.Context, limit int) ([]protocol.ConversationWorkspace, error) {
 	sm.mu.RLock()
 	catalog := sm.workspaceCatalog
@@ -500,6 +504,7 @@ func (sm *SessionManager) ListConversationWorkspaces(ctx context.Context, limit 
 	return workspaces, nil
 }
 
+// ListConversations returns persisted conversations for the requested workspace.
 func (sm *SessionManager) ListConversations(ctx context.Context, workspace string, limit int) ([]protocol.ConversationSummary, error) {
 	workspace, err := canonicalWorkspace(workspace)
 	if err != nil {
@@ -575,6 +580,7 @@ func canonicalWorkspace(workspace string) (string, error) {
 	return abs, nil
 }
 
+// GetConversation returns the resident worker for a conversation when available.
 func (sm *SessionManager) GetConversation(conversationID string) (*ConversationWorker, bool) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -729,8 +735,9 @@ func (sm *SessionManager) Drain(timeout time.Duration) {
 	}
 
 	deadline := time.Now().Add(timeout)
+	stillActive := false
 	for time.Now().Before(deadline) {
-		stillActive := false
+		stillActive = false
 		for _, w := range workers {
 			if w.IsActive() {
 				stillActive = true
@@ -747,6 +754,40 @@ func (sm *SessionManager) Drain(timeout time.Duration) {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	stillActive = false
+	for _, w := range workers {
+		stillActive = stillActive || w.IsActive()
+	}
+	for _, w := range conversationWorkers {
+		stillActive = stillActive || w.IsActive()
+	}
+	if stillActive {
+		for _, w := range conversationWorkers {
+			w.StopAsync()
+		}
+		// Keep shared stores open while canceled executions may still be unwinding.
+		// Drain returns at its deadline; resource closure follows once all workers exit.
+		go func() {
+			for {
+				active := false
+				for _, w := range workers {
+					active = active || w.IsActive()
+				}
+				for _, w := range conversationWorkers {
+					active = active || w.IsActive()
+				}
+				if !active {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			for _, w := range conversationWorkers {
+				<-w.done
+			}
+			sm.closeStores()
+		}()
+		return
 	}
 	for _, w := range conversationWorkers {
 		w.Stop()

@@ -52,6 +52,7 @@ func (rb *EventRingBuffer) PushWithTerminal(evt agent.Event, terminal bool) uint
 	return rb.PushWithIdentity(evt, terminal, "")
 }
 
+// PushWithIdentity appends an event and associates it with its durable turn identity.
 func (rb *EventRingBuffer) PushWithIdentity(evt agent.Event, terminal bool, turnID string) uint64 {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -105,12 +106,14 @@ func (rb *EventRingBuffer) Capacity() int {
 	return rb.capacity
 }
 
+// Watermark returns the newest event sequence assigned by the ring.
 func (rb *EventRingBuffer) Watermark() uint64 {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
 	return rb.nextID - 1
 }
 
+// EarliestID returns the oldest event sequence still retained by the ring.
 func (rb *EventRingBuffer) EarliestID() uint64 {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()

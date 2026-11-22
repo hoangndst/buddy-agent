@@ -43,7 +43,9 @@ const (
 type InteractionKind string
 
 const (
-	InteractionTask         InteractionKind = "task"
+	// InteractionTask identifies a legacy one-shot task execution.
+	InteractionTask InteractionKind = "task"
+	// InteractionConversation identifies a persistent multi-turn conversation.
 	InteractionConversation InteractionKind = "conversation"
 )
 
@@ -51,7 +53,9 @@ const (
 type SubmissionMode string
 
 const (
+	// SubmissionQueue schedules a prompt for a later turn.
 	SubmissionQueue SubmissionMode = "queue"
+	// SubmissionSteer applies a prompt at the next model boundary when possible.
 	SubmissionSteer SubmissionMode = "steer"
 )
 
@@ -59,12 +63,17 @@ const (
 type SubmissionStatus string
 
 const (
-	SubmissionQueued       SubmissionStatus = "queued"
+	// SubmissionQueued indicates a prompt is waiting for turn execution.
+	SubmissionQueued SubmissionStatus = "queued"
+	// SubmissionSteerPending indicates a steer is waiting for a model boundary.
 	SubmissionSteerPending SubmissionStatus = "steer_pending"
-	SubmissionAttached     SubmissionStatus = "attached"
-	SubmissionConsumed     SubmissionStatus = "consumed"
+	// SubmissionAttached indicates a prompt has been attached to an active turn.
+	SubmissionAttached SubmissionStatus = "attached"
+	// SubmissionConsumed indicates a prompt was applied and its turn completed.
+	SubmissionConsumed SubmissionStatus = "consumed"
 )
 
+// ErrSubmissionConflict indicates a submission ID was reused with a different payload.
 var ErrSubmissionConflict = errors.New("submission ID already exists with a different payload")
 
 // SubmissionFingerprint returns a stable SHA-256 fingerprint of a prompt and delivery mode.

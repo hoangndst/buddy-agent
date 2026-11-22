@@ -29,7 +29,7 @@ func TestClient_ConversationStartAndSubmit(t *testing.T) {
 	if err := store.Migrate(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	catalog, err := persistence.NewWorkspaceCatalog(filepath.Join(workspace, "catalog.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +51,7 @@ func TestClient_ConversationStartAndSubmit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	started, err := client.StartConversation(protocol.ConversationStartParams{
 		StartID: "stable-start", SubmissionID: "first-submission", Prompt: "first prompt", WorkspaceDir: workspace,

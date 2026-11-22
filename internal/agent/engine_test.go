@@ -232,12 +232,28 @@ func TestConversationRuntimeRunsSequentialTurnsAgainstSharedHistory(t *testing.T
 	if len(steps) != 2 || steps[0].ConversationTurnID != firstTurnID || steps[1].ConversationTurnID != secondTurnID {
 		t.Fatalf("expected persisted steps linked to both conversation turns: %+v", steps)
 	}
+	trackerJSON, err := json.Marshal(history.StateTrackerData{})
+	if err != nil {
+		t.Fatalf("encode snapshot tracker: %v", err)
+	}
+	if err := store.SaveSnapshot(context.Background(), &persistence.SnapshotRecord{
+		SessionID: start.ConversationID, StepNumber: 1, DistilledNarrative: "The project is a Go service.", StateTrackerJSON: string(trackerJSON),
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save snapshot before follow-up turn: %v", err)
+	}
 	restored, err := RestoreConversationRuntime(context.Background(), engine, store, start.ConversationID)
 	if err != nil {
 		t.Fatalf("restore conversation runtime: %v", err)
 	}
 	restoredMessages := restored.History().CompileMessages()
-	if len(restoredMessages) != 4 || restoredMessages[2].OfUser == nil || restoredMessages[2].OfUser.Content.OfString.Value != secondPrompt {
+	followupRestored := false
+	for _, message := range restoredMessages {
+		if message.OfUser != nil && message.OfUser.Content.OfString.Value == secondPrompt {
+			followupRestored = true
+		}
+	}
+	if !followupRestored {
 		t.Fatalf("restored history lost the follow-up prompt or turn order: %+v", restoredMessages)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 )
 
+// WorkspaceCatalogEntry identifies a workspace database in the user-level catalog.
 type WorkspaceCatalogEntry struct {
 	WorkspacePath string    `json:"workspace_path"`
 	DatabasePath  string    `json:"database_path"`
@@ -19,6 +20,7 @@ type WorkspaceCatalogEntry struct {
 // Conversation transcripts remain in their workspace-specific SQLite databases.
 type WorkspaceCatalog struct{ db *sql.DB }
 
+// NewWorkspaceCatalog opens or creates the workspace database catalog at path.
 func NewWorkspaceCatalog(path string) (*WorkspaceCatalog, error) {
 	if path == "" {
 		return nil, fmt.Errorf("workspace catalog path is required")
@@ -43,6 +45,7 @@ func NewWorkspaceCatalog(path string) (*WorkspaceCatalog, error) {
 	return &WorkspaceCatalog{db: db}, nil
 }
 
+// Register adds or updates a workspace database entry.
 func (c *WorkspaceCatalog) Register(ctx context.Context, workspacePath, databasePath string) error {
 	if workspacePath == "" || databasePath == "" {
 		return fmt.Errorf("workspace and database paths are required")
@@ -55,13 +58,17 @@ func (c *WorkspaceCatalog) Register(ctx context.Context, workspacePath, database
 	return nil
 }
 
-func (c *WorkspaceCatalog) List(ctx context.Context) ([]WorkspaceCatalogEntry, error) {
+// List returns workspace database entries ordered by most recent update.
+func (c *WorkspaceCatalog) List(ctx context.Context) (entries []WorkspaceCatalogEntry, retErr error) {
 	rows, err := c.db.QueryContext(ctx, `SELECT workspace_path, database_path, updated_at FROM workspace_catalog ORDER BY updated_at DESC, workspace_path, database_path`)
 	if err != nil {
 		return nil, fmt.Errorf("list workspace catalog: %w", err)
 	}
-	defer rows.Close()
-	var entries []WorkspaceCatalogEntry
+	defer func() {
+		if err := rows.Close(); retErr == nil && err != nil {
+			retErr = err
+		}
+	}()
 	for rows.Next() {
 		var entry WorkspaceCatalogEntry
 		if err := rows.Scan(&entry.WorkspacePath, &entry.DatabasePath, &entry.UpdatedAt); err != nil {
@@ -72,4 +79,5 @@ func (c *WorkspaceCatalog) List(ctx context.Context) ([]WorkspaceCatalogEntry, e
 	return entries, rows.Err()
 }
 
+// Close releases the catalog database connection.
 func (c *WorkspaceCatalog) Close() error { return c.db.Close() }

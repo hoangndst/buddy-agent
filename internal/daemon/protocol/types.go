@@ -129,6 +129,7 @@ type ConversationResumeParams struct {
 	DBPath         string `json:"db_path,omitempty"`
 }
 
+// ConversationResumeResult reports the attached conversation and current state.
 type ConversationResumeResult struct {
 	ConversationID  string `json:"conversation_id"`
 	SessionID       string `json:"session_id"` // compatibility alias
@@ -147,6 +148,7 @@ type ConversationSubmitParams struct {
 	Mode           string `json:"mode"` // queue or steer
 }
 
+// ConversationSubmitResult confirms durable acceptance of a conversation prompt.
 type ConversationSubmitResult struct {
 	ConversationID string `json:"conversation_id"`
 	SubmissionID   string `json:"submission_id"`
@@ -166,6 +168,7 @@ type ConversationSyncParams struct {
 	PageSize        int    `json:"page_size,omitempty"`
 }
 
+// ConversationTranscriptEntry is one durable user or assistant transcript item.
 type ConversationTranscriptEntry struct {
 	SubmissionID string `json:"submission_id,omitempty"`
 	TurnID       string `json:"turn_id,omitempty"`
@@ -176,6 +179,7 @@ type ConversationTranscriptEntry struct {
 	CreatedAt    string `json:"created_at,omitempty"`
 }
 
+// ConversationTurnState reports the persisted lifecycle of one conversation turn.
 type ConversationTurnState struct {
 	TurnID       string `json:"turn_id"`
 	SubmissionID string `json:"submission_id"`
@@ -185,6 +189,7 @@ type ConversationTurnState struct {
 	Error        string `json:"error,omitempty"`
 }
 
+// ConversationSyncResult contains a transcript page and event synchronization state.
 type ConversationSyncResult struct {
 	ConversationID   string                          `json:"conversation_id"`
 	Role             string                          `json:"role"`
@@ -200,22 +205,30 @@ type ConversationSyncResult struct {
 	OutputIncomplete bool                            `json:"output_incomplete,omitempty"`
 }
 
+// ConversationListWorkspacesParams limits workspace discovery results.
 type ConversationListWorkspacesParams struct {
 	Limit int `json:"limit,omitempty"`
 }
+
+// ConversationWorkspace summarizes a workspace containing conversations.
 type ConversationWorkspace struct {
 	WorkspaceDir      string `json:"workspace_dir"`
 	ConversationCount int    `json:"conversation_count"`
 	UpdatedAt         string `json:"updated_at,omitempty"`
 }
+
+// ConversationListWorkspacesResult contains discovered workspaces.
 type ConversationListWorkspacesResult struct {
 	Workspaces []ConversationWorkspace `json:"workspaces"`
 }
 
+// ConversationListParams selects conversations in a workspace.
 type ConversationListParams struct {
 	WorkspaceDir string `json:"workspace_dir"`
 	Limit        int    `json:"limit,omitempty"`
 }
+
+// ConversationSummary is a conversation entry in a workspace list.
 type ConversationSummary struct {
 	ConversationID  string `json:"conversation_id"`
 	DBPath          string `json:"db_path,omitempty"`
@@ -225,19 +238,26 @@ type ConversationSummary struct {
 	UpdatedAt       string `json:"updated_at"`
 	HistoryRevision int64  `json:"history_revision"`
 }
+
+// ConversationListResult contains conversation summaries.
 type ConversationListResult struct {
 	Conversations []ConversationSummary `json:"conversations"`
 }
 
+// TurnInterruptParams identifies the conversation turn to interrupt.
 type TurnInterruptParams struct {
 	ConversationID string `json:"conversation_id"`
 	TurnID         string `json:"turn_id"`
 }
+
+// TurnInterruptResult reports the result of a turn interruption request.
 type TurnInterruptResult struct {
 	ConversationID string `json:"conversation_id"`
 	TurnID         string `json:"turn_id"`
 	Status         string `json:"status"`
 }
+
+// DaemonCapabilitiesResult lists the daemon protocol version and supported methods.
 type DaemonCapabilitiesResult struct {
 	ProtocolVersion int      `json:"protocol_version"`
 	Methods         []string `json:"methods"`

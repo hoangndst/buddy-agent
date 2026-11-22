@@ -16,21 +16,27 @@ type pooledStore struct {
 // StorePool shares SQLite handles among engines that use the same resolved DB path.
 // It is closed by SessionManager after workers have drained.
 type StorePool struct {
-	mu     sync.Mutex
-	stores map[string]pooledStore
+	mu      sync.Mutex
+	stores  map[string]pooledStore
 	aliases map[string]string
-	closed bool
+	closed  bool
 }
 
-func NewStorePool() *StorePool { return &StorePool{stores: make(map[string]pooledStore), aliases: make(map[string]string)} }
+// NewStorePool creates a pool for sharing workspace database handles.
+func NewStorePool() *StorePool {
+	return &StorePool{stores: make(map[string]pooledStore), aliases: make(map[string]string)}
+}
 
+// Get returns the pooled store for key, opening and registering it when absent.
 func (p *StorePool) Get(key string, open func() (persistence.Store, func(), error)) (persistence.Store, func(), error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
 		return nil, nil, errors.New("daemon persistence store pool is closed")
 	}
-	if actual, ok := p.aliases[key]; ok { key = actual }
+	if actual, ok := p.aliases[key]; ok {
+		key = actual
+	}
 	if entry, ok := p.stores[key]; ok {
 		return entry.store, func() {}, nil
 	}
@@ -43,10 +49,18 @@ func (p *StorePool) Get(key string, open func() (persistence.Store, func(), erro
 	}
 	if pathProvider, ok := store.(interface{ DatabasePath() string }); ok && pathProvider.DatabasePath() != "" {
 		actualKey := pathProvider.DatabasePath()
-		if abs, err := filepath.Abs(filepath.Clean(actualKey)); err == nil { actualKey = abs }
-		if resolved, err := filepath.EvalSymlinks(actualKey); err == nil { actualKey = resolved }
+		if abs, err := filepath.Abs(filepath.Clean(actualKey)); err == nil {
+			actualKey = abs
+		}
+		if resolved, err := filepath.EvalSymlinks(actualKey); err == nil {
+			actualKey = resolved
+		}
 		if existing, ok := p.stores[actualKey]; ok {
-			if closeStore != nil { closeStore() } else { _ = store.Close() }
+			if closeStore != nil {
+				closeStore()
+			} else {
+				_ = store.Close()
+			}
 			p.aliases[key] = actualKey
 			return existing.store, func() {}, nil
 		}
@@ -57,6 +71,7 @@ func (p *StorePool) Get(key string, open func() (persistence.Store, func(), erro
 	return store, func() {}, nil
 }
 
+// Close releases every store owned by the pool.
 func (p *StorePool) Close() error {
 	p.mu.Lock()
 	if p.closed {

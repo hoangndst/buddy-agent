@@ -58,6 +58,7 @@ type ConversationWorker struct {
 	onIdle              func()
 	closed              bool
 	cleanupOnce         sync.Once
+	doneOnce            sync.Once
 }
 
 type sequencedEvent struct {
@@ -66,6 +67,7 @@ type sequencedEvent struct {
 	subscribers []ClientConn
 }
 
+// NewConversationWorker creates a resident worker for one persisted conversation.
 func NewConversationWorker(parent context.Context, id string, engine *agent.Engine, runtime *agent.ConversationRuntime, controller ClientConn, cleanup func()) (*ConversationWorker, error) {
 	if id == "" || engine == nil || runtime == nil || engine.PersistenceStore() == nil {
 		return nil, errors.New("conversation worker requires an ID, engine, runtime, and persistence store")
@@ -87,26 +89,36 @@ func NewConversationWorker(parent context.Context, id string, engine *agent.Engi
 	return w, nil
 }
 
+// ConversationID returns the persisted conversation identifier owned by the worker.
 func (w *ConversationWorker) ConversationID() string { return w.conversationID }
+
+// Submission loads one accepted submission for this conversation.
 func (w *ConversationWorker) Submission(ctx context.Context, id string) (*persistence.SubmissionRecord, error) {
 	return w.store.GetSubmission(ctx, w.conversationID, id)
 }
+
+// SessionRecord loads the persistent session row that backs this conversation.
 func (w *ConversationWorker) SessionRecord(ctx context.Context) (*persistence.SessionRecord, error) {
 	return w.store.GetSession(ctx, w.conversationID)
 }
+
+// State reports the conversation's externally visible runtime state.
 func (w *ConversationWorker) State() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.pendingApproval != nil {
 		return "awaiting_approval"
 	}
-	if w.active {
+	if w.active && !w.currentTerminalSent {
 		return "running"
 	}
 	return "idle"
 }
+
+// SetOnIdle registers a callback invoked when the worker becomes idle.
 func (w *ConversationWorker) SetOnIdle(fn func()) { w.mu.Lock(); w.onIdle = fn; w.mu.Unlock() }
 
+// Start starts processing the persisted initial submission.
 func (w *ConversationWorker) Start(first *persistence.SubmissionRecord) error {
 	if first == nil || first.SubmissionID == "" || first.TurnID == nil || *first.TurnID == "" {
 		return errors.New("conversation worker requires its persisted first submission and turn ID")
@@ -125,6 +137,7 @@ func (w *ConversationWorker) Start(first *persistence.SubmissionRecord) error {
 	return nil
 }
 
+// StartIdle restores a resident conversation with no queued submissions.
 func (w *ConversationWorker) StartIdle() error {
 	w.mu.Lock()
 	if w.closed {
@@ -137,6 +150,7 @@ func (w *ConversationWorker) StartIdle() error {
 	return nil
 }
 
+// StartRestored starts the worker with its durable queued submissions restored.
 func (w *ConversationWorker) StartRestored(submissions []*persistence.SubmissionRecord) error {
 	w.mu.Lock()
 	if w.closed {
@@ -186,7 +200,12 @@ func (w *ConversationWorker) run() {
 		w.currentTurnCtx = nil
 		w.currentCancel = nil
 		w.mu.Unlock()
-		close(w.done)
+		w.cleanupOnce.Do(func() {
+			if w.cleanup != nil {
+				w.cleanup()
+			}
+		})
+		w.doneOnce.Do(func() { close(w.done) })
 	}()
 	for {
 		w.mu.Lock()
@@ -283,14 +302,14 @@ func (w *ConversationWorker) Submit(ctx context.Context, submission *persistence
 	if !pending && (accepted.Status == persistence.SubmissionQueued || accepted.Status == persistence.SubmissionSteerPending) {
 		w.pending[accepted.SubmissionID] = struct{}{}
 		w.runtime.SetPromptOverride(accepted.SubmissionID, rawPrompt)
-		if accepted.Mode == persistence.SubmissionSteer && w.active && w.currentTurn != "" {
+		if accepted.Mode == persistence.SubmissionSteer && w.active && w.currentTurn != "" && !w.currentTerminalSent {
 			w.pendingSteers = append(w.pendingSteers, accepted)
 		} else if accepted.Mode == persistence.SubmissionSteer {
 			w.queue = append([]*persistence.SubmissionRecord{accepted}, w.queue...)
 		} else {
 			w.queue = append(w.queue, accepted)
 		}
-		if !w.active || accepted.Mode == persistence.SubmissionQueue {
+		if !w.active || w.currentTerminalSent || accepted.Mode == persistence.SubmissionQueue {
 			sort.SliceStable(w.queue, func(i, j int) bool {
 				if w.queue[i].Mode != w.queue[j].Mode {
 					return w.queue[i].Mode == persistence.SubmissionSteer
@@ -367,13 +386,17 @@ func (w *ConversationWorker) beforeModelRequest(ctx context.Context, conversatio
 	return boundaryErr
 }
 
+// IsActive reports whether the worker is executing a conversation turn.
 func (w *ConversationWorker) IsActive() bool { w.mu.Lock(); defer w.mu.Unlock(); return w.active }
+
+// IsController reports whether c currently controls this conversation.
 func (w *ConversationWorker) IsController(c ClientConn) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.controller == c
 }
 
+// Attach registers a client, optionally transfers control, and replays retained events.
 func (w *ConversationWorker) Attach(c ClientConn, epoch string, after uint64, takeControl bool) (string, bool, error) {
 	w.eventMu.Lock()
 	w.mu.Lock()
@@ -428,6 +451,7 @@ func (w *ConversationWorker) Attach(c ClientConn, epoch string, after uint64, ta
 	return role, gap, nil
 }
 
+// Sync captures the durable transcript revision and event watermark for a client.
 func (w *ConversationWorker) Sync(ctx context.Context, params protocol.ConversationSyncParams, conn ClientConn) (*protocol.ConversationSyncResult, string, error) {
 	w.eventMu.Lock()
 	w.mu.Lock()
@@ -441,9 +465,12 @@ func (w *ConversationWorker) Sync(ctx context.Context, params protocol.Conversat
 		}
 		w.subscribers[conn] = struct{}{}
 	}
-	active := w.active
+	active := w.active && !w.currentTerminalSent
 	epoch := w.workerEpoch
 	turnID := w.currentTurn
+	if !active {
+		turnID = ""
+	}
 	lastDurableSequence := w.lastDurableSequence
 	var pendingApprovals []protocol.PermissionRequestNotification
 	if conn != nil && w.controller == conn && w.pendingApproval != nil {
@@ -534,10 +561,11 @@ func (w *ConversationWorker) Sync(ctx context.Context, params protocol.Conversat
 			return nil, "", errors.New("invalid transcript page token")
 		}
 		tokenRevision, e1 := strconv.ParseInt(parts[0], 10, 64)
-		offset, e2 := strconv.Atoi(parts[1])
-		if e1 != nil || e2 != nil || tokenRevision != revision || offset < 0 || offset > len(entries) {
+		parsedOffset, e2 := strconv.Atoi(parts[1])
+		if e1 != nil || e2 != nil || tokenRevision != revision || parsedOffset < 0 || parsedOffset > len(entries) {
 			return nil, "", errors.New("transcript page token does not match pinned revision")
 		}
+		offset = parsedOffset
 	}
 	pageSize := params.PageSize
 	if pageSize <= 0 {
@@ -580,6 +608,7 @@ func (w *ConversationWorker) Sync(ctx context.Context, params protocol.Conversat
 	}, role, nil
 }
 
+// Detach removes a client connection and releases its controller role if held.
 func (w *ConversationWorker) Detach(c ClientConn) {
 	w.eventMu.Lock()
 	delete(w.replaying, c)
@@ -592,6 +621,7 @@ func (w *ConversationWorker) Detach(c ClientConn) {
 	w.eventMu.Unlock()
 }
 
+// Interrupt cancels the active turn only when turnID matches it.
 func (w *ConversationWorker) Interrupt(turnID string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -650,6 +680,7 @@ func (w *ConversationWorker) RequestPermission(tool string, args map[string]any)
 	}
 }
 
+// RespondPermission applies a controller's decision to the exact active request.
 func (w *ConversationWorker) RespondPermission(conn ClientConn, turnID, requestID, decision string) error {
 	if decision != "allow" && decision != "deny" {
 		return errors.New("permission decision must be allow or deny")
@@ -703,7 +734,10 @@ func boundedPermissionRequest(req protocol.PermissionRequestNotification) protoc
 	return req
 }
 
-func (w *ConversationWorker) Cancel()                   { w.cancel() }
+// Cancel requests cancellation of the worker and its active turn.
+func (w *ConversationWorker) Cancel() { w.cancel() }
+
+// EmitEvent adds a nonterminal engine event to the conversation stream.
 func (w *ConversationWorker) EmitEvent(evt agent.Event) { w.emit(evt, false) }
 
 func (w *ConversationWorker) sequenceLocked(evt agent.Event, terminal bool) (sequencedEvent, error) {
@@ -825,7 +859,7 @@ func (w *ConversationWorker) applySubmission(apply func() (*persistence.Submissi
 	return record, err
 }
 
-func (w *ConversationWorker) finishTurn(turnID, answer string, status persistence.SessionStatus, runErr error, commit func() error) error {
+func (w *ConversationWorker) finishTurn(turnID, answer string, _ persistence.SessionStatus, runErr error, commit func() error) error {
 	w.eventMu.Lock()
 	commitErr := commit()
 	for _, submissionID := range w.attachedSteers[turnID] {
@@ -838,9 +872,7 @@ func (w *ConversationWorker) finishTurn(turnID, answer string, status persistenc
 	// steers ahead of ordinary queued submissions for the next turn.
 	if len(w.pendingSteers) > 0 {
 		w.mu.Lock()
-		for _, submission := range w.pendingSteers {
-			w.queue = append(w.queue, submission)
-		}
+		w.queue = append(w.queue, w.pendingSteers...)
 		w.pendingSteers = nil
 		sort.SliceStable(w.queue, func(i, j int) bool {
 			if w.queue[i].Mode != w.queue[j].Mode {
@@ -876,6 +908,7 @@ func (w *ConversationWorker) finishTurn(turnID, answer string, status persistenc
 	return sequenceErr
 }
 
+// Evict releases an idle worker and notifies its connected clients.
 func (w *ConversationWorker) Evict() {
 	w.mu.Lock()
 	if w.closed || w.active {
@@ -888,37 +921,37 @@ func (w *ConversationWorker) Evict() {
 		connections = append(connections, c)
 	}
 	w.subscribers = make(map[ClientConn]struct{})
-	started := w.runStarted
 	w.mu.Unlock()
 	msg, _ := protocol.NewNotification(protocol.NotifyConversationEvicted, map[string]string{"conversation_id": w.conversationID})
 	for _, c := range connections {
 		_ = c.Send(msg)
 	}
-	w.cancel()
-	if started {
-		<-w.done
-	}
-	w.cleanupOnce.Do(func() {
-		if w.cleanup != nil {
-			w.cleanup()
-		}
-	})
+	w.Stop()
 }
 
+// Stop requests shutdown and waits for worker cleanup to finish.
 func (w *ConversationWorker) Stop() {
+	w.StopAsync()
+	<-w.done
+}
+
+// StopAsync requests shutdown without waiting for an in-flight provider or tool
+// to return. The run goroutine owns cleanup once it exits.
+func (w *ConversationWorker) StopAsync() {
 	w.mu.Lock()
 	w.closed = true
 	started := w.runStarted
 	w.mu.Unlock()
 	w.cancel()
 	if started {
-		<-w.done
+		return
 	}
 	w.cleanupOnce.Do(func() {
 		if w.cleanup != nil {
 			w.cleanup()
 		}
 	})
+	w.doneOnce.Do(func() { close(w.done) })
 }
 
 func generateWorkerID(prefix string) string {

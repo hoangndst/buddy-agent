@@ -302,6 +302,7 @@ func (c *Client) StartConversation(params protocol.ConversationStartParams) (*pr
 	return &result, nil
 }
 
+// ResumeConversation attaches to a conversation and returns its current state.
 func (c *Client) ResumeConversation(params protocol.ConversationResumeParams) (*protocol.ConversationResumeResult, error) {
 	resp, err := c.call(protocol.MethodConversationResume, params)
 	if err != nil {
@@ -314,6 +315,7 @@ func (c *Client) ResumeConversation(params protocol.ConversationResumeParams) (*
 	return &result, nil
 }
 
+// SyncConversation reads a durable transcript page and synchronization watermark.
 func (c *Client) SyncConversation(params protocol.ConversationSyncParams) (*protocol.ConversationSyncResult, error) {
 	resp, err := c.call(protocol.MethodConversationSync, params)
 	if err != nil {
@@ -326,6 +328,7 @@ func (c *Client) SyncConversation(params protocol.ConversationSyncParams) (*prot
 	return &result, nil
 }
 
+// Capabilities returns the daemon protocol version and supported methods.
 func (c *Client) Capabilities() (*protocol.DaemonCapabilitiesResult, error) {
 	resp, err := c.call(protocol.MethodDaemonCapabilities, nil)
 	if err != nil {
@@ -338,6 +341,7 @@ func (c *Client) Capabilities() (*protocol.DaemonCapabilitiesResult, error) {
 	return &result, nil
 }
 
+// ListConversationWorkspaces returns workspaces with stored conversations.
 func (c *Client) ListConversationWorkspaces(limit int) (*protocol.ConversationListWorkspacesResult, error) {
 	resp, err := c.call(protocol.MethodConversationWorkspaces, protocol.ConversationListWorkspacesParams{Limit: limit})
 	if err != nil {
@@ -350,6 +354,7 @@ func (c *Client) ListConversationWorkspaces(limit int) (*protocol.ConversationLi
 	return &result, nil
 }
 
+// ListConversations returns conversations stored for a workspace.
 func (c *Client) ListConversations(params protocol.ConversationListParams) (*protocol.ConversationListResult, error) {
 	resp, err := c.call(protocol.MethodConversationList, params)
 	if err != nil {
@@ -440,10 +445,16 @@ func (c *Client) ConversationEvents() <-chan protocol.SessionEventNotification {
 	return c.conversationEventsCh
 }
 
+// ConversationEventGaps signals when streamed conversation events have a gap.
 func (c *Client) ConversationEventGaps() <-chan struct{} { return c.conversationEventGaps }
-func (c *Client) HasConversationEventGap() bool          { return c.conversationEventGap.Load() }
-func (c *Client) ClearConversationEventGap()             { c.conversationEventGap.Store(false) }
 
+// HasConversationEventGap reports whether a streamed event gap is pending.
+func (c *Client) HasConversationEventGap() bool { return c.conversationEventGap.Load() }
+
+// ClearConversationEventGap clears the pending event gap marker.
+func (c *Client) ClearConversationEventGap() { c.conversationEventGap.Store(false) }
+
+// ConversationEvictions signals that a resident conversation worker was evicted.
 func (c *Client) ConversationEvictions() <-chan string { return c.conversationEvictions }
 
 // Permissions returns the channel receiving interactive tool permission requests.

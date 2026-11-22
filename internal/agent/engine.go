@@ -188,6 +188,7 @@ func (e *Engine) SetConversationCommitHook(hook func(func() error, []Event) erro
 	e.conversationCommitHook = hook
 }
 
+// SetConversationBoundaryHook installs a callback run before each model request.
 func (e *Engine) SetConversationBoundaryHook(hook func(context.Context, string, string, *history.Session, int) error) {
 	e.conversationBoundaryHook = hook
 }

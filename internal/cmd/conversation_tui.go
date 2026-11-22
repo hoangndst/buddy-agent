@@ -345,7 +345,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = "running"
 		return m, m.syncConversation()
 	case conversationEventMsg:
-		if string(msg.ConversationID) != m.conversation {
+		if msg.ConversationID != m.conversation {
 			return m, m.watchEvent()
 		}
 		if msg.Sequence > 0 && msg.Sequence <= m.lastSequence {

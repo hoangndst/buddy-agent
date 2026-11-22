@@ -185,8 +185,8 @@ func TestSessionManager_StartConversationAndQueueSubmissions(t *testing.T) {
 	if err := store.Migrate(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-	factory := func(sessionID string, params protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
+	defer func() { _ = store.Close() }()
+	factory := func(sessionID string, _ protocol.SessionStartParams, emitHandler agent.EventHandler) (*agent.Engine, func(), error) {
 		eng := agent.NewEngine(&mockProvider{}, "test-model", 3, tools.NewRegistry(1000), nil, emitHandler,
 			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID))
 		return eng, nil, nil
