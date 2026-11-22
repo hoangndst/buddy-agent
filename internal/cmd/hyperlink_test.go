@@ -1,15 +1,11 @@
 package cmd
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
 
 func TestFormatFileHyperlink(t *testing.T) {
-	origTerm := os.Getenv("TERM")
-	defer os.Setenv("TERM", origTerm)
-
 	t.Run("empty path returns empty string", func(t *testing.T) {
 		if got := FormatFileHyperlink("", 0); got != "" {
 			t.Fatalf("expected empty string, got %q", got)
@@ -17,7 +13,7 @@ func TestFormatFileHyperlink(t *testing.T) {
 	})
 
 	t.Run("dumb terminal returns plain text", func(t *testing.T) {
-		os.Setenv("TERM", "dumb")
+		t.Setenv("TERM", "dumb")
 		got := FormatFileHyperlink("internal/cmd/main.go", 42)
 		expected := "internal/cmd/main.go:42"
 		if got != expected {
@@ -26,7 +22,7 @@ func TestFormatFileHyperlink(t *testing.T) {
 	})
 
 	t.Run("compatible terminal returns OSC 8 escape sequence", func(t *testing.T) {
-		os.Setenv("TERM", "xterm-256color")
+		t.Setenv("TERM", "xterm-256color")
 		got := FormatFileHyperlink("internal/cmd/main.go", 42)
 		if !strings.HasPrefix(got, "\x1b]8;;file://") {
 			t.Fatalf("expected OSC 8 escape prefix, got %q", got)
@@ -37,7 +33,7 @@ func TestFormatFileHyperlink(t *testing.T) {
 	})
 
 	t.Run("without line number", func(t *testing.T) {
-		os.Setenv("TERM", "xterm-256color")
+		t.Setenv("TERM", "xterm-256color")
 		got := FormatFileHyperlink("README.md", 0)
 		if strings.Contains(got, "#L") {
 			t.Fatalf("hyperlink should not contain line fragment, got %q", got)

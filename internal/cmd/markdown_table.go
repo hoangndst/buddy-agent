@@ -87,12 +87,8 @@ func isDelimiterRow(cells []string) bool {
 
 func splitRowCells(line string) []string {
 	trimmed := strings.TrimSpace(line)
-	if strings.HasPrefix(trimmed, "|") {
-		trimmed = trimmed[1:]
-	}
-	if strings.HasSuffix(trimmed, "|") {
-		trimmed = trimmed[:len(trimmed)-1]
-	}
+	trimmed = strings.TrimPrefix(trimmed, "|")
+	trimmed = strings.TrimSuffix(trimmed, "|")
 	parts := strings.Split(trimmed, "|")
 	cells := make([]string, len(parts))
 	for i, p := range parts {
