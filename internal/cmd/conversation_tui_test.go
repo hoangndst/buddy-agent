@@ -711,3 +711,58 @@ func TestConversationTUILongBlockClipping(t *testing.T) {
 		t.Fatalf("top view should not contain last response line: %s", topText)
 	}
 }
+
+func TestConversationTUIQuitCommand(t *testing.T) {
+	for _, cmdStr := range []string{"/quit", "/exit"} {
+		model := &conversationTUI{
+			textarea:       textarea.New(),
+			width:          80,
+			height:         24,
+			lineCountCache: make(map[string]int),
+			wrapCache:      make(map[string][]string),
+		}
+		model.textarea.SetValue(cmdStr)
+		_, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+		if cmd == nil {
+			t.Fatalf("expected tea.Quit command on %s, got nil", cmdStr)
+		}
+		msg := cmd()
+		if _, ok := msg.(tea.QuitMsg); !ok {
+			t.Fatalf("expected QuitMsg on %s, got %T", cmdStr, msg)
+		}
+	}
+}
+
+func TestConversationTUIClearCommand(t *testing.T) {
+	model := &conversationTUI{
+		textarea:       textarea.New(),
+		width:          80,
+		height:         24,
+		scrollOffset:   5,
+		lineCountCache: make(map[string]int),
+		wrapCache:      make(map[string][]string),
+	}
+	model.appendBlock(TranscriptBlock{
+		ID:        "block-1",
+		Kind:      BlockAssistantMessage,
+		Role:      "assistant",
+		Header:    "Buddy",
+		Body:      "Some text",
+		CreatedAt: time.Now(),
+	})
+	model.textarea.SetValue("/clear")
+	updated, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatalf("expected nil cmd on /clear, got %v", cmd)
+	}
+	cleared := updated.(*conversationTUI)
+	if len(cleared.blocks) != 0 {
+		t.Fatalf("expected 0 blocks after /clear, got %d", len(cleared.blocks))
+	}
+	if len(cleared.transcript) != 0 {
+		t.Fatalf("expected 0 transcript entries after /clear, got %d", len(cleared.transcript))
+	}
+	if cleared.scrollOffset != 0 {
+		t.Fatalf("expected scrollOffset 0 after /clear, got %d", cleared.scrollOffset)
+	}
+}

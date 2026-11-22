@@ -966,6 +966,16 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 				return m, tea.Printf("%s", osc52)
 			}
+			if text == "/quit" || text == "/exit" {
+				return m, tea.Quit
+			}
+			if text == "/clear" {
+				m.blocks = nil
+				m.transcript = nil
+				m.scrollOffset = 0
+				m.clearCache()
+				return m, nil
+			}
 			if strings.HasPrefix(text, "/steer ") {
 				return m, m.submit(strings.TrimSpace(strings.TrimPrefix(text, "/steer ")), persistence.SubmissionSteer)
 			}

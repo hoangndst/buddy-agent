@@ -1,6 +1,6 @@
 # Terminal User Interface (TUI)
 
-Buddy Agent includes an interactive, full-screen terminal interface built with Charm's Bubble Tea and Lip Gloss. It manages multi-turn conversations, live text streaming, multiline prompt composition, tool approvals, and Git working-tree reviews.
+Buddy Agent includes an interactive, full-screen terminal interface built with Charm's Bubble Tea and Lip Gloss. It manages multi-turn conversations, live text streaming, multiline prompt composition, and tool approvals.
 
 ## User Interface Layout
 
@@ -37,13 +37,14 @@ Buddy Agent includes an interactive, full-screen terminal interface built with C
 * **History Storage**: Prompts are stored in `~/.buddy/history.jsonl` (capped at 500 entries with consecutive duplicate deduplication).
 
 ### 2. Slash Commands
-Type `/` in the composer to open an interactive command popup:
-* `/help`: Display keyboard shortcuts and command reference.
+Type `/` commands in the composer:
 * `/steer <instruction>`: Inject guidance into the actively running agent turn at the next model-request boundary.
-* `/resume`: Open the project and conversation picker.
-* `/diff`: Open the Git working-tree diff viewer.
+* `/queue <prompt>`: Queue a follow-up prompt behind the active turn.
+* `/interrupt`: Cancel the currently executing turn immediately.
+* `/resume`: Open the project and conversation picker to switch sessions.
+* `/copy`: Copy the full un-truncated conversation markdown transcript to the system clipboard via OSC 52 escape sequences.
 * `/clear`: Clear the visible transcript viewport.
-* `/quit`: Detach from the session and leave daemon tasks running.
+* `/quit` or `/exit`: Detach from the session and leave background daemon tasks running.
 
 ### 3. File Path Autocompletion (`@`)
 * Type `@` in the composer to open a fuzzy-filtered list of files in the active workspace.
@@ -56,14 +57,7 @@ When a tool call requires user confirmation (e.g. destructive shell commands), a
 * `[3] Deny`: Cancel the tool call and provide optional feedback text.
 * `[4] Edit Arguments`: Open an inline JSON sub-composer to modify the tool arguments before execution.
 
-### 5. Attributed Working-Tree Diff (`/diff`)
-The `/diff` command opens a colorized diff viewer:
-* Inspects `git status` and `git diff HEAD` (including untracked files).
-* Cross-references file modifications against the active turn:
-  * Files modified by Buddy receive an attributed green badge: `[Buddy Edit]`.
-  * Pre-existing dirty files receive a neutral badge: `[Workspace Dirty]`.
-
-### 6. Keyboard Shortcuts
+### 5. Keyboard Shortcuts
 
 | Shortcut | Context | Action |
 | :--- | :--- | :--- |

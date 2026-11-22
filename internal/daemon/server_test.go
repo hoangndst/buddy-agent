@@ -790,3 +790,47 @@ func TestCreateEventNotification_OversizedToolResultBounded(t *testing.T) {
 		t.Errorf("expected truncation marker in tool_result")
 	}
 }
+
+func TestCreateEventNotificationToolArgsExtraction(t *testing.T) {
+	evt := agent.Event{
+		Type:     agent.EventToolCall,
+		ToolName: "read_file",
+		ToolArgs: `{"path":"internal/cmd/root.go","line":42}`,
+	}
+	msg, err := createEventNotification("sess_test", 1, evt, false)
+	if err != nil {
+		t.Fatalf("createEventNotification failed: %v", err)
+	}
+	var notify protocol.SessionEventNotification
+	if err := json.Unmarshal(msg.Params, &notify); err != nil {
+		t.Fatalf("unmarshal params failed: %v", err)
+	}
+	if notify.Data["path"] != "internal/cmd/root.go" {
+		t.Fatalf("expected path internal/cmd/root.go, got %v", notify.Data["path"])
+	}
+	if notify.Data["line"] != float64(42) {
+		t.Fatalf("expected line 42, got %v", notify.Data["line"])
+	}
+}
+
+func TestCreateEventNotificationToolArgsExtractionAliases(t *testing.T) {
+	evt := agent.Event{
+		Type:     agent.EventToolCall,
+		ToolName: "edit_file",
+		ToolArgs: `{"file_path":"pkg/util.go","line_number":99}`,
+	}
+	msg, err := createEventNotification("sess_test", 1, evt, false)
+	if err != nil {
+		t.Fatalf("createEventNotification failed: %v", err)
+	}
+	var notify protocol.SessionEventNotification
+	if err := json.Unmarshal(msg.Params, &notify); err != nil {
+		t.Fatalf("unmarshal params failed: %v", err)
+	}
+	if notify.Data["path"] != "pkg/util.go" {
+		t.Fatalf("expected path pkg/util.go, got %v", notify.Data["path"])
+	}
+	if notify.Data["line"] != float64(99) {
+		t.Fatalf("expected line 99, got %v", notify.Data["line"])
+	}
+}

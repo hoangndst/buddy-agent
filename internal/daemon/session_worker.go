@@ -201,6 +201,21 @@ func createEventNotification(sessionID string, eventID uint64, evt agent.Event, 
 			"tool_result":  toolResult,
 			"terminal":     terminal,
 		}
+		if evt.ToolArgs != "" {
+			var argsMap map[string]any
+			if err := json.Unmarshal([]byte(evt.ToolArgs), &argsMap); err == nil {
+				if p, ok := argsMap["path"].(string); ok && p != "" {
+					data["path"] = p
+				} else if p, ok := argsMap["file_path"].(string); ok && p != "" {
+					data["path"] = p
+				}
+				if l, ok := argsMap["line"].(float64); ok && l > 0 {
+					data["line"] = l
+				} else if l, ok := argsMap["line_number"].(float64); ok && l > 0 {
+					data["line"] = l
+				}
+			}
+		}
 		if evt.Error != nil {
 			data["error"] = errorText
 		}
