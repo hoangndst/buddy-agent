@@ -46,7 +46,7 @@ func (m *approvalModalState) handleKey(msg tea.KeyPressMsg, request protocol.Per
 				return nil, false
 			}
 			return &protocol.PermissionRespondParams{
-				Decision: protocol.DecisionAllowOnce, ModifiedArguments: args,
+				Decision: protocol.DecisionAllowOnce, ModifiedArguments: &args,
 			}, true
 		default:
 			var cmd tea.Cmd
@@ -71,6 +71,7 @@ func (m *approvalModalState) handleKey(msg tea.KeyPressMsg, request protocol.Per
 		return &protocol.PermissionRespondParams{Decision: protocol.DecisionDeny, DenialReason: "denied by user"}, true
 	case "4":
 		m.editing = true
+		_ = m.editor.Focus()
 		m.err = ""
 	}
 	return nil, false

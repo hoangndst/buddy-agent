@@ -30,9 +30,18 @@ func TestApprovalModalEditsJSONArguments(t *testing.T) {
 	request := protocol.PermissionRequestNotification{Tool: "write_file", Arguments: map[string]any{"path": "old.go"}}
 	modal := newApprovalModalState(request.Arguments, 80, 24)
 	modal.handleKey(tea.KeyPressMsg{Text: "4", Code: '4'}, request)
-	modal.editor.SetValue(`{"path":"new.go"}`)
+	if !modal.editor.Focused() {
+		t.Fatal("argument editor is not focused")
+	}
+	modal.editor.CursorEnd()
+	for range len(modal.editor.Value()) {
+		modal.handleKey(tea.KeyPressMsg{Code: tea.KeyBackspace}, request)
+	}
+	for _, ch := range `{"path":"new.go"}` {
+		modal.handleKey(tea.KeyPressMsg{Text: string(ch), Code: ch}, request)
+	}
 	response, done := modal.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter}, request)
-	if !done || response.Decision != protocol.DecisionAllowOnce || response.ModifiedArguments["path"] != "new.go" {
+	if !done || response.Decision != protocol.DecisionAllowOnce || response.ModifiedArguments == nil || (*response.ModifiedArguments)["path"] != "new.go" {
 		t.Fatalf("edited approval = %+v, done=%t", response, done)
 	}
 	modal.editor.SetValue("[")

@@ -332,7 +332,7 @@ type PermissionRespondParams struct {
 	TurnID            string             `json:"turn_id,omitempty"`
 	SessionWhitelist  bool               `json:"session_whitelist,omitempty"`
 	CommandPattern    string             `json:"command_pattern,omitempty"`
-	ModifiedArguments map[string]any     `json:"modified_arguments,omitempty"`
+	ModifiedArguments *map[string]any    `json:"modified_arguments,omitempty"`
 	DenialReason      string             `json:"denial_reason,omitempty"`
 }
 

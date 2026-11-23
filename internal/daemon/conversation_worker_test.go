@@ -632,6 +632,53 @@ func TestConversationWorkerCancellationWinsAgainstApproval(t *testing.T) {
 	}
 }
 
+func TestConversationWorkerInterceptPreservesEmptyModifiedArguments(t *testing.T) {
+	controller := &permissionTestConn{id: "controller", messages: make(chan *protocol.JSONRPCMessage, 2)}
+	worker, cancel := newApprovalLifecycleWorker(controller, time.Second, time.Second)
+	defer cancel()
+	type result struct {
+		allowed bool
+		args    json.RawMessage
+		err     error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		allowed, args, err := worker.interceptTool(worker.currentTurnCtx, "write_file", json.RawMessage(`{"path":"old.go"}`))
+		resultCh <- result{allowed: allowed, args: args, err: err}
+	}()
+	var request protocol.PermissionRequestNotification
+	select {
+	case message := <-controller.messages:
+		if err := json.Unmarshal(message.Params, &request); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval request was not sent")
+	}
+	empty := map[string]any{}
+	payload, err := json.Marshal(protocol.PermissionRespondParams{
+		RequestID: request.RequestID, TurnID: request.TurnID, Decision: protocol.DecisionAllowOnce, ModifiedArguments: &empty,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response protocol.PermissionRespondParams
+	if err := json.Unmarshal(payload, &response); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.RespondPermission(controller, response); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-resultCh:
+		if got.err != nil || !got.allowed || string(got.args) != "{}" {
+			t.Fatalf("intercepted empty replacement = allowed:%t args:%s err:%v", got.allowed, got.args, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval interceptor did not return")
+	}
+}
+
 func ptrString(s string) *string { return &s }
 
 func TestConversationWorkerQueuesSteerAcceptedAfterTerminalSequence(t *testing.T) {
