@@ -911,3 +911,37 @@ func TestConversationTUIFileCompletionKeepsSelectionVisible(t *testing.T) {
 		t.Fatalf("selected completion %q is not visible", selected)
 	}
 }
+
+func TestConversationTUICompletionReservesViewportRows(t *testing.T) {
+	workspace := t.TempDir()
+	for i := 0; i < 12; i++ {
+		if err := os.WriteFile(filepath.Join(workspace, fmt.Sprintf("file-%02d", i)), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	model := &conversationTUI{textarea: textarea.New(), workspace: workspace, width: 80, height: 19}
+	model.textarea.SetValue("@")
+	model.updateCompletion()
+	for i := 0; i < 10; i++ {
+		updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		model = updated.(*conversationTUI)
+	}
+	if got := model.completionRows(); got != 4 {
+		t.Fatalf("completion rows = %d, want 4", got)
+	}
+	if got := model.viewportHeight(); got != 4 {
+		t.Fatalf("transcript viewport height = %d, want 4 after reserving completion rows", got)
+	}
+	visible := 0
+	for _, line := range strings.Split(model.View().Content, "\n") {
+		if strings.HasPrefix(line, "  file-") || strings.HasPrefix(line, "› file-") {
+			visible++
+		}
+	}
+	if visible != 4 {
+		t.Fatalf("rendered %d completion rows, want 4", visible)
+	}
+	if !strings.Contains(model.View().Content, "› "+model.fileMatches[model.completionCursor]) {
+		t.Fatal("selected completion is not visible in the constrained popup")
+	}
+}

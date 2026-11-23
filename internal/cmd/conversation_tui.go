@@ -1268,20 +1268,20 @@ func (m *conversationTUI) View() tea.View {
 				b.WriteString(uiMutedStyle.Render(preview) + "\n")
 			}
 		}
-		if m.completionKind == "command" {
-			for i, command := range m.commandMatches {
-				if i >= 8 {
-					break
-				}
+		switch m.completionKind {
+		case "command":
+			start := m.completionWindowStart()
+			for i := start; i < min(start+m.completionRows(), len(m.commandMatches)); i++ {
+				command := m.commandMatches[i]
 				marker := "  "
 				if i == m.completionCursor {
 					marker = "› "
 				}
 				b.WriteString(marker + command.Name + "  " + uiMutedStyle.Render(command.Description+" "+command.ArgsHint) + "\n")
 			}
-		} else if m.completionKind == "file" {
-			start := min(max(0, m.completionCursor-7), max(0, len(m.fileMatches)-8))
-			for i := start; i < min(start+8, len(m.fileMatches)); i++ {
+		case "file":
+			start := m.completionWindowStart()
+			for i := start; i < min(start+m.completionRows(), len(m.fileMatches)); i++ {
 				path := m.fileMatches[i]
 				marker := "  "
 				if i == m.completionCursor {
@@ -1472,6 +1472,14 @@ func (m *conversationTUI) renderTextarea() string {
 }
 
 func (m *conversationTUI) viewportHeight() int {
+	h := m.height - m.viewportOverhead() - m.completionRows()
+	if h < 4 {
+		return 4
+	}
+	return h
+}
+
+func (m *conversationTUI) viewportOverhead() int {
 	headerHeight := 3
 	if m.conversation != "" {
 		headerHeight = 4
@@ -1484,11 +1492,16 @@ func (m *conversationTUI) viewportHeight() int {
 	if m.errorText != "" {
 		overhead += 2
 	}
-	h := m.height - overhead
-	if h < 4 {
-		return 4
-	}
-	return h
+	return overhead
+}
+
+func (m *conversationTUI) completionRows() int {
+	return min(8, min(m.completionCount(), max(0, m.height-m.viewportOverhead()-4)))
+}
+
+func (m *conversationTUI) completionWindowStart() int {
+	rows := m.completionRows()
+	return min(max(0, m.completionCursor-rows+1), max(0, m.completionCount()-rows))
 }
 
 func (m *conversationTUI) clearCache() {
