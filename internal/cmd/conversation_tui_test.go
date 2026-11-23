@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -787,5 +789,71 @@ func TestConversationTUIClearKeepsStreamingBlock(t *testing.T) {
 	cleared := updated.(*conversationTUI)
 	if len(cleared.blocks) != 1 || cleared.blocks[0].ID != "active" || cleared.activeBlockID != "active" {
 		t.Fatalf("clear lost active streaming block: blocks=%+v active=%q", cleared.blocks, cleared.activeBlockID)
+	}
+}
+
+func TestConversationTUIComposerCompletions(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "notes.md"), []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	model := &conversationTUI{textarea: textarea.New(), workspace: workspace}
+	model.slashCommands.Register(SlashCommand{Name: "/clear", Description: "Clear transcript"})
+	model.slashCommands.Register(SlashCommand{Name: "/copy", Description: "Copy transcript"})
+	model.textarea.SetValue("/cl")
+	model.updateCompletion()
+	if model.completionKind != "command" || len(model.commandMatches) != 1 {
+		t.Fatalf("slash completion = %q, %+v", model.completionKind, model.commandMatches)
+	}
+	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	model = updated.(*conversationTUI)
+	if got := model.textarea.Value(); got != "/clear" {
+		t.Fatalf("slash completion inserted %q", got)
+	}
+	model.textarea.SetValue("/co")
+	model.updateCompletion()
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	model = updated.(*conversationTUI)
+	if model.completionKind != "" || model.textarea.Value() != "/co" {
+		t.Fatalf("escape changed composer draft: popup=%q draft=%q", model.completionKind, model.textarea.Value())
+	}
+	model.textarea.SetValue("@not")
+	model.updateCompletion()
+	if model.completionKind != "file" || len(model.fileMatches) != 1 || model.fileMatches[0] != "notes.md" {
+		t.Fatalf("file completion = %q, %+v", model.completionKind, model.fileMatches)
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	model = updated.(*conversationTUI)
+	if got := model.textarea.Value(); got != "notes.md" {
+		t.Fatalf("file completion inserted %q", got)
+	}
+}
+
+func TestConversationTUIHistoryNavigationRestoresDraft(t *testing.T) {
+	history, err := NewInputHistoryRing(filepath.Join(t.TempDir(), "history.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Add("older"); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Add("newer"); err != nil {
+		t.Fatal(err)
+	}
+	model := &conversationTUI{textarea: textarea.New(), history: history, lineCountCache: make(map[string]int), wrapCache: make(map[string][]string)}
+	model.textarea.SetValue("draft")
+	for _, key := range []tea.KeyPressMsg{{Code: tea.KeyUp}, {Code: tea.KeyUp}} {
+		updated, _ := model.Update(key)
+		model = updated.(*conversationTUI)
+	}
+	if got := model.textarea.Value(); got != "older" {
+		t.Fatalf("history up selected %q, want older", got)
+	}
+	for _, key := range []tea.KeyPressMsg{{Code: tea.KeyDown}, {Code: tea.KeyDown}} {
+		updated, _ := model.Update(key)
+		model = updated.(*conversationTUI)
+	}
+	if got := model.textarea.Value(); got != "draft" {
+		t.Fatalf("history down restored %q, want draft", got)
 	}
 }
