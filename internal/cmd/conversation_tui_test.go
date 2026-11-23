@@ -771,3 +771,21 @@ func TestConversationTUIClearCommand(t *testing.T) {
 		t.Fatalf("expected scrollOffset 0 after /clear, got %d", cleared.scrollOffset)
 	}
 }
+
+func TestConversationTUIClearKeepsStreamingBlock(t *testing.T) {
+	model := &conversationTUI{
+		textarea:       textarea.New(),
+		activeBlockID:  "active",
+		state:          "running",
+		lineCountCache: make(map[string]int),
+		wrapCache:      make(map[string][]string),
+	}
+	model.appendBlock(TranscriptBlock{ID: "old", Body: "old"})
+	model.appendBlock(TranscriptBlock{ID: "active", Body: "partial", Streaming: true})
+	model.textarea.SetValue("/clear")
+	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	cleared := updated.(*conversationTUI)
+	if len(cleared.blocks) != 1 || cleared.blocks[0].ID != "active" || cleared.activeBlockID != "active" {
+		t.Fatalf("clear lost active streaming block: blocks=%+v active=%q", cleared.blocks, cleared.activeBlockID)
+	}
+}

@@ -29,7 +29,7 @@ Buddy Agent includes an interactive, full-screen terminal interface built with C
 ## Core Interaction Patterns
 
 ### 1. Multiline Composer & Line-Zero History Ring
-* **Multiline Editing**: Type multiline prompts naturally. Pressing `Enter` inserts newlines in multiline mode.
+* **Multiline Editing**: Press `Shift+Enter` to insert a newline. Press `Enter` to submit the prompt.
 * **Line-Zero History Traversal**:
   * Pressing `Up Arrow` when the cursor is at line 0 traverses previous prompt history.
   * Pressing `Down Arrow` at the bottom row traverses forward; reaching the end restores the unsubmitted dirty draft.

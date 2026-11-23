@@ -970,7 +970,23 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			if text == "/clear" {
-				m.blocks = nil
+				if m.activeBlockID != "" {
+					var activeBlock *TranscriptBlock
+					for _, block := range m.blocks {
+						if block.ID == m.activeBlockID {
+							activeBlock = &block
+							break
+						}
+					}
+					m.blocks = nil
+					if activeBlock != nil {
+						m.blocks = append(m.blocks, *activeBlock)
+					} else {
+						m.activeBlockID = ""
+					}
+				} else {
+					m.blocks = nil
+				}
 				m.transcript = nil
 				m.scrollOffset = 0
 				m.clearCache()

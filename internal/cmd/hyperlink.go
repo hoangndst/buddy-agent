@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -47,7 +48,7 @@ func FormatWorkspaceFileHyperlink(workspace, path string, line int) string {
 	}
 	absPath = filepath.Clean(absPath)
 
-	targetURI := fmt.Sprintf("file://%s", absPath)
+	targetURI := (&url.URL{Scheme: "file", Path: absPath}).String()
 	if line > 0 {
 		targetURI = fmt.Sprintf("%s#L%d", targetURI, line)
 	}
