@@ -905,13 +905,14 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.approvalModal == nil {
 				m.approvalModal = newApprovalModalState(m.pendingApproval.Arguments, m.width, m.height)
 			}
-			if response, done := m.approvalModal.handleKey(msg, *m.pendingApproval); done {
+			response, done, cmd := m.approvalModal.handleKey(msg, *m.pendingApproval)
+			if done {
 				response.RequestID = m.pendingApproval.RequestID
 				response.ConversationID = m.pendingApproval.ConversationID
 				response.TurnID = m.pendingApproval.TurnID
 				return m, m.respondPermission(*response)
 			}
-			return m, nil
+			return m, cmd
 		}
 		if m.completionKind != "" {
 			switch msg.String() {
@@ -1121,6 +1122,12 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.submit(strings.TrimSpace(strings.TrimPrefix(text, "/queue ")), persistence.SubmissionQueue)
 			}
 			return m, m.submit(text, persistence.SubmissionQueue)
+		}
+	case tea.PasteMsg:
+		if m.pendingApproval != nil && m.approvalModal != nil && m.approvalModal.editing {
+			var cmd tea.Cmd
+			m.approvalModal.editor, cmd = m.approvalModal.editor.Update(msg)
+			return m, cmd
 		}
 	}
 	var cmd tea.Cmd

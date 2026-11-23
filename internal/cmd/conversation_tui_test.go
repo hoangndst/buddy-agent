@@ -872,6 +872,39 @@ func TestConversationTUIKeepsStreamingWhileApprovalCardIsOpen(t *testing.T) {
 	}
 }
 
+func TestConversationTUIRoutesPasteToApprovalEditor(t *testing.T) {
+	request := &protocol.PermissionRequestNotification{RequestID: "request-1", Tool: "write_file", Arguments: map[string]any{"path": "old.go"}}
+	model := &conversationTUI{
+		textarea:        textarea.New(),
+		pendingApproval: request,
+		approvalModal:   newApprovalModalState(request.Arguments, 80, 24),
+		conversation:    "conversation-1",
+	}
+	model.textarea.SetValue("draft")
+	updated, _ := model.Update(tea.KeyPressMsg{Text: "4", Code: '4'})
+	model = updated.(*conversationTUI)
+	model.approvalModal.editor.CursorEnd()
+	for range len(model.approvalModal.editor.Value()) {
+		updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+		model = updated.(*conversationTUI)
+	}
+	updated, _ = model.Update(tea.PasteMsg{Content: `{"path":"pasted.go"}`})
+	model = updated.(*conversationTUI)
+	if model.textarea.Value() != "draft" {
+		t.Fatalf("paste changed main composer: %q", model.textarea.Value())
+	}
+	if model.approvalModal.editor.Value() != `{"path":"pasted.go"}` {
+		t.Fatalf("paste did not update approval editor: %q", model.approvalModal.editor.Value())
+	}
+	updated, _ = model.Update(conversationEventMsg{
+		ConversationID: "conversation-1", TurnID: "turn-1", Type: string(agent.EventTextDelta), Content: "stream continues",
+	})
+	model = updated.(*conversationTUI)
+	if !strings.Contains(model.deltaBuffer.String(), "stream continues") {
+		t.Fatalf("editing approval blocked conversation events: %q", model.deltaBuffer.String())
+	}
+}
+
 func TestConversationTUICompletionStateSurvivesNonEditingMessages(t *testing.T) {
 	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 30}
 	model.slashCommands.Register(SlashCommand{Name: "/clear"})

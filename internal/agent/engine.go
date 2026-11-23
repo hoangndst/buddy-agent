@@ -918,6 +918,7 @@ func (e *Engine) executeLoop(
 		toolResults := make([]history.ToolResult, 0, len(genResp.ToolCalls))
 		cumulativeBytes := 0
 		maxTurnBytes := session.MaxTurnOutputBytes()
+		var toolAuthorizationErr error
 
 		for i := range genResp.ToolCalls {
 			tc := &genResp.ToolCalls[i]
@@ -930,14 +931,18 @@ func (e *Engine) executeLoop(
 			if e.toolInterceptor != nil && toolExists {
 				allow, modifiedArgs, err := e.toolInterceptor(ctx, tc.Name, args)
 				if err != nil && !errors.As(err, &denied) {
-					return "", fmt.Errorf("authorize tool %s: %w", tc.Name, err)
+					toolAuthorizationErr = fmt.Errorf("authorize tool %s: %w", tc.Name, err)
+					genResp.ToolCalls = genResp.ToolCalls[:i]
+					break
 				}
 				if denied == nil && !allow {
 					denied = &ToolDeniedError{Reason: "denied by user"}
 				}
 				if denied == nil && len(modifiedArgs) > 0 {
 					if !json.Valid(modifiedArgs) {
-						return "", fmt.Errorf("authorize tool %s: modified arguments are not valid JSON", tc.Name)
+						toolAuthorizationErr = fmt.Errorf("authorize tool %s: modified arguments are not valid JSON", tc.Name)
+						genResp.ToolCalls = genResp.ToolCalls[:i]
+						break
 					}
 					args = modifiedArgs
 					tc.Arguments = string(modifiedArgs)
@@ -1021,6 +1026,9 @@ func (e *Engine) executeLoop(
 				Content:    result,
 			})
 		}
+		if toolAuthorizationErr != nil && len(toolResults) == 0 {
+			return "", toolAuthorizationErr
+		}
 
 		// Atomic turn block commit
 		session.CommitToolTurn(genResp.ToChatMessage(), toolResults)
@@ -1077,6 +1085,9 @@ func (e *Engine) executeLoop(
 				cancel()
 			}
 			return "", ctx.Err()
+		}
+		if toolAuthorizationErr != nil {
+			return "", toolAuthorizationErr
 		}
 
 		// Watermark check: execute staged micro-pruning or macro-distillation

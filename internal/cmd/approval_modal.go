@@ -32,49 +32,49 @@ func (m *approvalModalState) resize(width, height int) {
 	m.editor.SetHeight(min(8, max(3, height/4)))
 }
 
-func (m *approvalModalState) handleKey(msg tea.KeyPressMsg, request protocol.PermissionRequestNotification) (*protocol.PermissionRespondParams, bool) {
+func (m *approvalModalState) handleKey(msg tea.KeyPressMsg, request protocol.PermissionRequestNotification) (*protocol.PermissionRespondParams, bool, tea.Cmd) {
 	if m.editing {
 		switch msg.String() {
 		case "esc":
 			m.editing = false
 			m.err = ""
-			return nil, false
+			return nil, false, nil
 		case "enter":
 			var args map[string]any
 			if err := json.Unmarshal([]byte(m.editor.Value()), &args); err != nil || args == nil {
 				m.err = "Arguments must be a JSON object."
-				return nil, false
+				return nil, false, nil
 			}
 			return &protocol.PermissionRespondParams{
 				Decision: protocol.DecisionAllowOnce, ModifiedArguments: &args,
-			}, true
+			}, true, nil
 		default:
 			var cmd tea.Cmd
 			m.editor, cmd = m.editor.Update(msg)
-			_ = cmd
 			m.err = ""
-			return nil, false
+			return nil, false, cmd
 		}
 	}
 	switch strings.ToLower(msg.String()) {
 	case "1", "y", "a":
-		return &protocol.PermissionRespondParams{Decision: protocol.DecisionAllowOnce}, true
+		return &protocol.PermissionRespondParams{Decision: protocol.DecisionAllowOnce}, true, nil
 	case "2":
 		if request.Tool == "bash" || supportsSessionToolApproval(request.Tool) {
 			response := &protocol.PermissionRespondParams{Decision: protocol.DecisionAllowSession, SessionWhitelist: true}
 			if request.Tool == "bash" {
 				response.CommandPattern, _ = request.Arguments["command"].(string)
 			}
-			return response, true
+			return response, true, nil
 		}
 	case "3", "n", "d":
-		return &protocol.PermissionRespondParams{Decision: protocol.DecisionDeny, DenialReason: "denied by user"}, true
+		return &protocol.PermissionRespondParams{Decision: protocol.DecisionDeny, DenialReason: "denied by user"}, true, nil
 	case "4":
 		m.editing = true
-		_ = m.editor.Focus()
+		cmd := m.editor.Focus()
 		m.err = ""
+		return nil, false, cmd
 	}
-	return nil, false
+	return nil, false, nil
 }
 
 func supportsSessionToolApproval(tool string) bool {

@@ -204,6 +204,57 @@ func TestEngineToolInterceptorExecutesModifiedArguments(t *testing.T) {
 	}
 }
 
+func TestEnginePersistsCompletedToolsBeforeLaterAuthorizationError(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := persistence.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	registry := tools.NewRegistry(1000)
+	registry.Register(tools.NewWriteFileTool(workspace))
+	client := &mockChatClient{responses: []*openai.ChatCompletion{{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{
+		Role: "assistant",
+		ToolCalls: []openai.ChatCompletionMessageToolCall{
+			{ID: "first", Function: openai.ChatCompletionMessageToolCallFunction{Name: "write_file", Arguments: `{"path":"first.txt","content":"written"}`}},
+			{ID: "second", Function: openai.ChatCompletionMessageToolCallFunction{Name: "write_file", Arguments: `{"path":"second.txt","content":"not written"}`}},
+		},
+	}}}}}}
+	interceptions := 0
+	engine := NewEngine(client, "test-model", 3, registry, memory.NewManager(workspace), func(Event) {},
+		WithStore(store), WithSessionIDOverride("partial-tool-turn-test"),
+		WithToolInterceptor(func(context.Context, string, json.RawMessage) (bool, json.RawMessage, error) {
+			interceptions++
+			if interceptions == 2 {
+				return false, nil, errors.New("approval timed out")
+			}
+			return true, nil, nil
+		}),
+	)
+	if _, err := engine.Run(context.Background(), "write both files"); err == nil || !strings.Contains(err.Error(), "approval timed out") {
+		t.Fatalf("Run error = %v, want approval timeout", err)
+	}
+	if content, err := os.ReadFile(filepath.Join(workspace, "first.txt")); err != nil || string(content) != "written" {
+		t.Fatalf("first tool side effect = %q, %v", content, err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "second.txt")); !os.IsNotExist(err) {
+		t.Fatalf("second tool ran despite failed approval: %v", err)
+	}
+	turns, err := store.GetAllTurns(context.Background(), "partial-tool-turn-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorded *persistence.TurnRecord
+	for _, turn := range turns {
+		if len(turn.ToolCalls) > 0 {
+			recorded = turn
+		}
+	}
+	if recorded == nil || len(recorded.ToolCalls) != 1 || recorded.ToolCalls[0].ID != "first" || recorded.ToolCalls[0].Result == "" {
+		t.Fatalf("completed tool not represented in durable history: %+v", turns)
+	}
+}
+
 func TestEngineToolDenialSkipsDispatchAndContinues(t *testing.T) {
 	workspace := t.TempDir()
 	registry := tools.NewRegistry(1000)
