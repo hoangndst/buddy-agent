@@ -19,7 +19,7 @@ Buddy Agent includes an interactive, full-screen terminal interface built with C
 │                                                             │
 ├─────────────────────────────────────────────────────────────┤
 │ ┌─────────────────────────────────────────────────────────┐ │
-│ │ Type prompt, / for commands, @ for files                │ │
+│ │ Type prompt or / for commands                            │ │
 │ └─────────────────────────────────────────────────────────┘ │
 ├─────────────────────────────────────────────────────────────┤
 │ [Model: gpt-4o] [Ctx: 42k/128k (32%)] [Turn: 4.2s] [Cost: $]│
@@ -28,13 +28,8 @@ Buddy Agent includes an interactive, full-screen terminal interface built with C
 
 ## Core Interaction Patterns
 
-### 1. Multiline Composer & Line-Zero History Ring
+### 1. Multiline Composer
 * **Multiline Editing**: Press `Shift+Enter` to insert a newline. Press `Enter` to submit the prompt.
-* **Line-Zero History Traversal**:
-  * Pressing `Up Arrow` when the cursor is at line 0 traverses previous prompt history.
-  * Pressing `Down Arrow` at the bottom row traverses forward; reaching the end restores the unsubmitted dirty draft.
-  * `Ctrl+P` and `Ctrl+N` navigate prompt history unconditionally regardless of cursor position.
-* **History Storage**: Prompts are stored in `~/.buddy/history.jsonl` (capped at 500 entries with consecutive duplicate deduplication).
 
 ### 2. Slash Commands
 Type `/` commands in the composer:
@@ -46,21 +41,16 @@ Type `/` commands in the composer:
 * `/clear`: Clear the visible transcript viewport.
 * `/quit` or `/exit`: Detach from the session and leave background daemon tasks running.
 
-### 3. File Path Autocompletion (`@`)
-* Type `@` in the composer to open a fuzzy-filtered list of files in the active workspace.
-* Selecting a file inserts its relative path directly into your prompt.
-
-### 4. Interactive Tool Approvals
+### 3. Interactive Tool Approvals
 When a tool call requires user confirmation, the TUI displays an approval prompt above the composer. Press `y` or `a` to allow the tool call, or `n` or `d` to deny it.
 
-### 5. Keyboard Shortcuts
+### 4. Keyboard Shortcuts
 
 | Shortcut | Context | Action |
 | :--- | :--- | :--- |
 | `Enter` | Idle / Working | Submit prompt (runs immediately when idle; queues when busy). |
 | `Esc` | Session picker | Close the workspace or conversation picker. |
 | `Ctrl+C` | Any | Immediately exit the client. |
-| `Ctrl+P` / `Ctrl+N` | Composer | Traverse prompt history ring (previous / next). |
 | `PageUp` / `PageDown` | Viewport | Scroll conversation transcript history. |
 
 Use `/interrupt` to stop the active turn. Use `/quit`, `/exit`, or `Ctrl+C` to leave the client; daemon execution continues after the client exits.
