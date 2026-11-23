@@ -19,15 +19,18 @@ A robust, self-evolving autonomous agent harness built in pure Go, supporting bo
 - **Self-Improving Skill System**: Dynamically captures discovered procedures and workflows into an extensible `skills/` library.
 - **Zero CGO**: Pure Go for fast, static single-binary compilation across platforms (`linux`, `darwin`, `windows`).
 
-## Architecture & Design Specifications
+## Documentation
 
-Approved milestone design specifications are maintained under [`docs/designs/`](docs/designs/):
-- [`docs/designs/02_subprocess_safety.md`](docs/designs/02_subprocess_safety.md): Subprocess process group isolation, staged termination, and output safety.
-- [`docs/designs/03_context_compaction.md`](docs/designs/03_context_compaction.md): Context compaction pipeline, atomic turn blocks, dual token accounting, and episodic anchoring.
-- [`docs/designs/04_model_context_protocol.md`](docs/designs/04_model_context_protocol.md): Supervised MCP client integration and two-tier tool configuration.
-- [`docs/designs/05_universal_model_protocols_and_ux.md`](docs/designs/05_universal_model_protocols_and_ux.md): Dual protocol engine, reasoning visibility, and clean REPL UX.
-- [`docs/designs/06_sqlite_state_persistence.md`](docs/designs/06_sqlite_state_persistence.md): Pure Go SQLite episodic trajectory store, atomic turn persistence, secret redaction, and crash recovery.
-- [`docs/designs/09_terminal_user_interface.md`](docs/designs/09_terminal_user_interface.md): Bubble Tea conversation UI, queue and steer behavior, daemon reconnection, and standalone conversation runtime.
+Comprehensive system and developer documentation is available in [`docs/`](docs/):
+- [Documentation Index](docs/README.md): Overview and guide directory.
+- [CLI Reference](docs/cli.md): Commands, flags, and execution modes.
+- [System Architecture](docs/architecture.md): Decoupled daemon-client architecture and execution lifecycle.
+- [Daemon & IPC](docs/daemon.md): Background daemon, Unix domain socket wire protocol, and process isolation.
+- [Terminal User Interface](docs/terminal-ui.md): Interactive Bubble Tea conversation TUI, slash commands, approvals, and diff review.
+- [Configuration](docs/configuration.md): YAML configuration, environment variables, and model endpoints.
+- [Model Context Protocol (MCP)](docs/mcp.md): Stdio and SSE MCP server integration and process group security.
+- [Persistence & Compaction](docs/persistence.md): Pure Go SQLite trajectory storage and 3-partition memory compactor.
+- [Subagents](docs/subagents.md): Bounded subagent delegation, step budgets, and role constraints.
 
 ## Getting Started
 
