@@ -842,18 +842,43 @@ func TestConversationTUIHistoryNavigationRestoresDraft(t *testing.T) {
 	}
 	model := &conversationTUI{textarea: textarea.New(), history: history, lineCountCache: make(map[string]int), wrapCache: make(map[string][]string)}
 	model.textarea.SetValue("draft")
-	for _, key := range []tea.KeyPressMsg{{Code: tea.KeyUp}, {Code: tea.KeyUp}} {
-		updated, _ := model.Update(key)
-		model = updated.(*conversationTUI)
+	model.completionKind = "file"
+	model.fileMatches = []string{"stale"}
+	model.completionStart, model.completionEnd = 0, 5
+	updated, _ := model.Update(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
+	model = updated.(*conversationTUI)
+	if got := model.textarea.Value(); got != "newer" {
+		t.Fatalf("history up selected %q, want newer", got)
 	}
-	if got := model.textarea.Value(); got != "older" {
-		t.Fatalf("history up selected %q, want older", got)
+	if model.completionKind != "" || model.fileMatches != nil || model.completionEnd != 0 {
+		t.Fatalf("history navigation retained completion state: %+v", model)
 	}
-	for _, key := range []tea.KeyPressMsg{{Code: tea.KeyDown}, {Code: tea.KeyDown}} {
+	for _, key := range []tea.KeyPressMsg{{Code: 'p', Mod: tea.ModCtrl}, {Code: 'n', Mod: tea.ModCtrl}, {Code: 'n', Mod: tea.ModCtrl}} {
 		updated, _ := model.Update(key)
 		model = updated.(*conversationTUI)
 	}
 	if got := model.textarea.Value(); got != "draft" {
 		t.Fatalf("history down restored %q, want draft", got)
+	}
+}
+
+func TestConversationTUIFileCompletionKeepsSelectionVisible(t *testing.T) {
+	workspace := t.TempDir()
+	for i := 0; i < 12; i++ {
+		name := fmt.Sprintf("file-%02d", i)
+		if err := os.WriteFile(filepath.Join(workspace, name), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	model := &conversationTUI{textarea: textarea.New(), workspace: workspace, width: 80, height: 24}
+	model.textarea.SetValue("@")
+	model.updateCompletion()
+	for i := 0; i < 10; i++ {
+		updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		model = updated.(*conversationTUI)
+	}
+	selected := model.fileMatches[model.completionCursor]
+	if !strings.Contains(model.View().Content, "› "+selected) {
+		t.Fatalf("selected completion %q is not visible", selected)
 	}
 }

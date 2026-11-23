@@ -11,11 +11,13 @@ import (
 
 const inputHistoryLimit = 500
 
+// HistoryEntry is one persisted prompt history record.
 type HistoryEntry struct {
 	Prompt    string `json:"prompt"`
 	Timestamp int64  `json:"timestamp"`
 }
 
+// InputHistoryRing stores and navigates recent prompts.
 type InputHistoryRing struct {
 	path    string
 	entries []HistoryEntry
@@ -23,6 +25,7 @@ type InputHistoryRing struct {
 	draft   string
 }
 
+// NewInputHistoryRing loads prompt history from path.
 func NewInputHistoryRing(path string) (*InputHistoryRing, error) {
 	if path == "" {
 		home, err := os.UserHomeDir()
@@ -39,7 +42,6 @@ func NewInputHistoryRing(path string) (*InputHistoryRing, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 4096), 2*1024*1024)
 	for scanner.Scan() {
@@ -51,13 +53,19 @@ func NewInputHistoryRing(path string) (*InputHistoryRing, error) {
 			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
+	scanErr := scanner.Err()
+	closeErr := file.Close()
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
 	}
 	h.index = len(h.entries)
 	return h, nil
 }
 
+// Add appends a prompt to the persistent history.
 func (h *InputHistoryRing) Add(prompt string) error {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" || (len(h.entries) > 0 && h.entries[len(h.entries)-1].Prompt == prompt) {
@@ -127,6 +135,7 @@ func (h *InputHistoryRing) Add(prompt string) error {
 	return nil
 }
 
+// Previous moves to the previous prompt and saves the current draft.
 func (h *InputHistoryRing) Previous(current string) (string, bool) {
 	if len(h.entries) == 0 || h.index == 0 {
 		return "", false
@@ -138,6 +147,7 @@ func (h *InputHistoryRing) Previous(current string) (string, bool) {
 	return h.entries[h.index].Prompt, true
 }
 
+// Next moves forward through history, restoring the saved draft at the end.
 func (h *InputHistoryRing) Next() (string, bool) {
 	if h.index >= len(h.entries) {
 		return "", false
@@ -149,6 +159,7 @@ func (h *InputHistoryRing) Next() (string, bool) {
 	return h.entries[h.index].Prompt, true
 }
 
+// Reset returns navigation to the end of history.
 func (h *InputHistoryRing) Reset() {
 	h.index = len(h.entries)
 	h.draft = ""

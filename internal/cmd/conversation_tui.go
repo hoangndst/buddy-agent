@@ -947,12 +947,14 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if prompt, ok := m.history.Previous(m.textarea.Value()); ok {
 					m.textarea.SetValue(prompt)
 					m.textarea.CursorEnd()
+					m.clearCompletion()
 				}
 				return m, nil
 			case "ctrl+n":
 				if prompt, ok := m.history.Next(); ok {
 					m.textarea.SetValue(prompt)
 					m.textarea.CursorEnd()
+					m.clearCompletion()
 				}
 				return m, nil
 			case "up":
@@ -960,6 +962,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if prompt, ok := m.history.Previous(m.textarea.Value()); ok {
 						m.textarea.SetValue(prompt)
 						m.textarea.CursorEnd()
+						m.clearCompletion()
 						return m, nil
 					}
 				}
@@ -968,6 +971,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if prompt, ok := m.history.Next(); ok {
 						m.textarea.SetValue(prompt)
 						m.textarea.CursorEnd()
+						m.clearCompletion()
 						return m, nil
 					}
 				}
@@ -1122,6 +1126,15 @@ func (m *conversationTUI) completionCount() int {
 	return len(m.commandMatches)
 }
 
+func (m *conversationTUI) clearCompletion() {
+	m.completionKind = ""
+	m.commandMatches = nil
+	m.fileMatches = nil
+	m.completionCursor = 0
+	m.completionStart = 0
+	m.completionEnd = 0
+}
+
 func (m *conversationTUI) replaceCompletion(value string) {
 	text := m.textarea.Value()
 	if m.completionStart <= m.completionEnd && m.completionEnd <= len(text) {
@@ -1167,6 +1180,7 @@ func (m *conversationTUI) updateCompletion() {
 		return
 	}
 	if strings.HasPrefix(word, "@") {
+		m.fileMatches = nil
 		entries, err := os.ReadDir(m.workspace)
 		if err != nil {
 			m.completionKind = ""
@@ -1264,10 +1278,9 @@ func (m *conversationTUI) View() tea.View {
 				b.WriteString(marker + command.Name + "  " + uiMutedStyle.Render(command.Description+" "+command.ArgsHint) + "\n")
 			}
 		} else if m.completionKind == "file" {
-			for i, path := range m.fileMatches {
-				if i >= 8 {
-					break
-				}
+			start := min(max(0, m.completionCursor-7), max(0, len(m.fileMatches)-8))
+			for i := start; i < min(start+8, len(m.fileMatches)); i++ {
+				path := m.fileMatches[i]
 				marker := "  "
 				if i == m.completionCursor {
 					marker = "› "
