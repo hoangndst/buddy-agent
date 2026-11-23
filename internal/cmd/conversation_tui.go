@@ -1116,8 +1116,13 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	var cmd tea.Cmd
+	beforeValue := m.textarea.Value()
+	beforeLine := m.textarea.Line()
+	beforeLineInfo := m.textarea.LineInfo()
 	m.textarea, cmd = m.textarea.Update(msg)
-	m.updateCompletion()
+	if beforeValue != m.textarea.Value() || beforeLine != m.textarea.Line() || beforeLineInfo != m.textarea.LineInfo() {
+		m.updateCompletion()
+	}
 	return m, cmd
 }
 

@@ -836,6 +836,31 @@ func TestConversationTUIComposerCompletions(t *testing.T) {
 	}
 }
 
+func TestConversationTUICompletionStateSurvivesNonEditingMessages(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 30}
+	model.slashCommands.Register(SlashCommand{Name: "/clear"})
+	model.slashCommands.Register(SlashCommand{Name: "/copy"})
+	model.textarea.SetValue("/c")
+	model.updateCompletion()
+	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	model = updated.(*conversationTUI)
+	if model.completionCursor != 1 {
+		t.Fatalf("completion selection = %d, want 1", model.completionCursor)
+	}
+	updated, _ = model.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	model = updated.(*conversationTUI)
+	if model.completionKind != "command" || model.completionCursor != 1 {
+		t.Fatalf("non-editing message changed completion selection: kind=%q cursor=%d", model.completionKind, model.completionCursor)
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	model = updated.(*conversationTUI)
+	updated, _ = model.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	model = updated.(*conversationTUI)
+	if model.completionKind != "" || model.completionRows() != 0 {
+		t.Fatalf("non-editing message reopened dismissed completion: kind=%q rows=%d", model.completionKind, model.completionRows())
+	}
+}
+
 func TestConversationTUIHistoryNavigationRestoresDraft(t *testing.T) {
 	history, err := NewInputHistoryRing(filepath.Join(t.TempDir(), "history.jsonl"))
 	if err != nil {
