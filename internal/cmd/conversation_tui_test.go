@@ -797,7 +797,7 @@ func TestConversationTUIComposerCompletions(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workspace, "notes.md"), []byte(""), 0600); err != nil {
 		t.Fatal(err)
 	}
-	model := &conversationTUI{textarea: textarea.New(), workspace: workspace}
+	model := &conversationTUI{textarea: textarea.New(), workspace: workspace, height: 30}
 	model.slashCommands.Register(SlashCommand{Name: "/clear", Description: "Clear transcript"})
 	model.slashCommands.Register(SlashCommand{Name: "/copy", Description: "Copy transcript"})
 	model.textarea.SetValue("/cl")
@@ -812,10 +812,17 @@ func TestConversationTUIComposerCompletions(t *testing.T) {
 	}
 	model.textarea.SetValue("/co")
 	model.updateCompletion()
+	shortenedViewport := model.viewportHeight()
+	if model.completionRows() == 0 {
+		t.Fatal("active completion popup did not reserve viewport rows")
+	}
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	model = updated.(*conversationTUI)
 	if model.completionKind != "" || model.textarea.Value() != "/co" {
 		t.Fatalf("escape changed composer draft: popup=%q draft=%q", model.completionKind, model.textarea.Value())
+	}
+	if model.completionRows() != 0 || model.viewportHeight() <= shortenedViewport {
+		t.Fatalf("dismissed popup still reserves transcript rows: rows=%d viewport=%d", model.completionRows(), model.viewportHeight())
 	}
 	model.textarea.SetValue("@not")
 	model.updateCompletion()

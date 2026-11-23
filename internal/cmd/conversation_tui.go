@@ -1496,6 +1496,9 @@ func (m *conversationTUI) viewportOverhead() int {
 }
 
 func (m *conversationTUI) completionRows() int {
+	if m.completionKind == "" {
+		return 0
+	}
 	return min(8, min(m.completionCount(), max(0, m.height-m.viewportOverhead()-4)))
 }
 
