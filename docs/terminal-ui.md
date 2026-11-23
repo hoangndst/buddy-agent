@@ -51,11 +51,7 @@ Type `/` commands in the composer:
 * Selecting a file inserts its relative path directly into your prompt.
 
 ### 4. Interactive Tool Approvals
-When a tool call requires user confirmation (e.g. destructive shell commands), an interactive modal appears above the composer:
-* `[1] Allow Once`: Authorize this single tool execution.
-* `[2] Allow for Session`: Whitelist this tool in the active conversation session.
-* `[3] Deny`: Cancel the tool call and provide optional feedback text.
-* `[4] Edit Arguments`: Open an inline JSON sub-composer to modify the tool arguments before execution.
+When a tool call requires user confirmation, the TUI displays an approval prompt above the composer. Press `y` or `a` to allow the tool call, or `n` or `d` to deny it.
 
 ### 5. Keyboard Shortcuts
 

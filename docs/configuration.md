@@ -39,8 +39,8 @@ BUDDY_MAX_CONTEXT_TOKENS=64000
 BUDDY_MAX_OUTPUT_CHARS=25000
 
 # Daemon and Persistence
-BUDDY_SOCKET_PATH=~/.buddy/daemon.sock
-BUDDY_DB_PATH=~/.buddy/history.db
+# Leave BUDDY_SOCKET_PATH and BUDDY_DB_PATH unset to use platform defaults.
+# Set either to an absolute path when overriding it.
 ```
 
 ---
