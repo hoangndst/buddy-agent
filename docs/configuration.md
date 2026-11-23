@@ -12,7 +12,7 @@ Buddy Agent automatically loads a `.env` file in the working directory on startu
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `BUDDY_API_KEY` / `OPENAI_API_KEY` | `""` | API key for the model provider. |
-| `BUDDY_BASE_URL` / `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Endpoint base URL. Supports Ollama (`http://localhost:11434/v1`), vLLM, and OpenRouter. |
+| `BUDDY_BASE_URL` / `OPENAI_BASE_URL` | `http://localhost:11434/v1` | Endpoint base URL. Set it to the provider endpoint for OpenAI, vLLM, and OpenRouter. |
 | `BUDDY_MODEL` | `gpt-4o` | Default model identifier. |
 | `BUDDY_API_TYPE` | `""` | Explicit protocol selection: `chat` or `responses`. If empty, auto-detected from model name. |
 | `BUDDY_REASONING_EFFORT` | `""` | Reasoning effort for reasoning models (`low`, `medium`, `high`). |
