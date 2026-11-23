@@ -52,3 +52,33 @@ func TestInputHistoryRingPersistenceNavigationAndLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestInputHistoryRingConcurrentInstancesPreserveCompactedEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	a, err := NewInputHistoryRing(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < inputHistoryLimit; i++ {
+		if err := a.Add(fmt.Sprintf("prompt-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := NewInputHistoryRing(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Add("from-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Add("from-b"); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewInputHistoryRing(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.entries) != inputHistoryLimit || reloaded.entries[len(reloaded.entries)-2].Prompt != "from-a" || reloaded.entries[len(reloaded.entries)-1].Prompt != "from-b" {
+		t.Fatalf("compaction lost concurrent prompts: len=%d tail=%+v", len(reloaded.entries), reloaded.entries[max(0, len(reloaded.entries)-2):])
+	}
+}

@@ -958,7 +958,8 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "up":
-				if m.textarea.Line() == 0 {
+				lineInfo := m.textarea.LineInfo()
+				if m.textarea.Line() == 0 && lineInfo.RowOffset == 0 {
 					if prompt, ok := m.history.Previous(m.textarea.Value()); ok {
 						m.textarea.SetValue(prompt)
 						m.textarea.CursorEnd()
@@ -967,7 +968,8 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			case "down":
-				if m.textarea.Line() == m.textarea.LineCount()-1 {
+				lineInfo := m.textarea.LineInfo()
+				if m.textarea.Line() == m.textarea.LineCount()-1 && lineInfo.RowOffset+1 >= lineInfo.Height {
 					if prompt, ok := m.history.Next(); ok {
 						m.textarea.SetValue(prompt)
 						m.textarea.CursorEnd()

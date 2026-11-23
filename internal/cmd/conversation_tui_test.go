@@ -862,6 +862,35 @@ func TestConversationTUIHistoryNavigationRestoresDraft(t *testing.T) {
 	}
 }
 
+func TestConversationTUIHistoryNavigationRespectsSoftWrapRows(t *testing.T) {
+	history, err := NewInputHistoryRing(filepath.Join(t.TempDir(), "history.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Add("saved prompt"); err != nil {
+		t.Fatal(err)
+	}
+	input := textarea.New()
+	input.SetWidth(8)
+	input.SetValue("a long wrapped draft")
+	input.CursorStart()
+	model := &conversationTUI{textarea: input, history: history}
+	if info := model.textarea.LineInfo(); info.Height < 2 {
+		t.Fatalf("test draft did not wrap: %+v", info)
+	}
+	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	model = updated.(*conversationTUI)
+	if got := model.textarea.Value(); got != "a long wrapped draft" || history.index != len(history.entries) {
+		t.Fatalf("Down recalled history from a non-final visual row: draft=%q index=%d", got, history.index)
+	}
+	model.textarea.CursorEnd()
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	model = updated.(*conversationTUI)
+	if got := model.textarea.Value(); got != "a long wrapped draft" || history.index != len(history.entries) {
+		t.Fatalf("Up recalled history from a non-first visual row: draft=%q index=%d", got, history.index)
+	}
+}
+
 func TestConversationTUIFileCompletionKeepsSelectionVisible(t *testing.T) {
 	workspace := t.TempDir()
 	for i := 0; i < 12; i++ {

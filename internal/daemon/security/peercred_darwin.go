@@ -1,5 +1,6 @@
 //go:build darwin
 
+// Package security verifies peer credentials for daemon connections.
 package security
 
 import (

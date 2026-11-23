@@ -35,21 +35,32 @@ func NewInputHistoryRing(path string) (*InputHistoryRing, error) {
 		path = filepath.Join(home, ".buddy", "history.jsonl")
 	}
 	h := &InputHistoryRing{path: path}
+	entries, err := readHistory(path)
+	if err != nil {
+		return nil, err
+	}
+	h.entries = entries
+	h.index = len(h.entries)
+	return h, nil
+}
+
+func readHistory(path string) ([]HistoryEntry, error) {
 	file, err := os.Open(path)
 	if os.IsNotExist(err) {
-		return h, nil
+		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	var entries []HistoryEntry
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 4096), 2*1024*1024)
 	for scanner.Scan() {
 		var entry HistoryEntry
 		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.Prompt != "" {
-			h.entries = append(h.entries, entry)
-			if len(h.entries) > inputHistoryLimit {
-				h.entries = h.entries[1:]
+			entries = append(entries, entry)
+			if len(entries) > inputHistoryLimit {
+				entries = entries[1:]
 			}
 		}
 	}
@@ -61,22 +72,41 @@ func NewInputHistoryRing(path string) (*InputHistoryRing, error) {
 	if closeErr != nil {
 		return nil, closeErr
 	}
-	h.index = len(h.entries)
-	return h, nil
+	return entries, nil
 }
 
 // Add appends a prompt to the persistent history.
 func (h *InputHistoryRing) Add(prompt string) error {
 	prompt = strings.TrimSpace(prompt)
-	if prompt == "" || (len(h.entries) > 0 && h.entries[len(h.entries)-1].Prompt == prompt) {
+	if prompt == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(h.path), 0700); err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(h.path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	if err := acquireHistoryFileLock(lock); err != nil {
+		_ = lock.Close()
+		return err
+	}
+	defer func() {
+		_ = releaseHistoryFileLock(lock)
+		_ = lock.Close()
+	}()
+	entries, err := readHistory(h.path)
+	if err != nil {
+		return err
+	}
+	h.entries = entries
+	if len(h.entries) > 0 && h.entries[len(h.entries)-1].Prompt == prompt {
 		return nil
 	}
 	entry := HistoryEntry{Prompt: prompt, Timestamp: time.Now().Unix()}
 	data, err := json.Marshal(entry)
 	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(h.path), 0700); err != nil {
 		return err
 	}
 	if len(h.entries) == inputHistoryLimit {
