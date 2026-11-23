@@ -58,9 +58,9 @@ When a tool call requires user confirmation, the TUI displays an approval prompt
 | Shortcut | Context | Action |
 | :--- | :--- | :--- |
 | `Enter` | Idle / Working | Submit prompt (runs immediately when idle; queues when busy). |
-| `Esc` | Modal / Popup | Dismiss overlay / cancel popup without losing draft. |
-| `Esc` | Active Turn | Interrupt the currently running turn. |
-| `Ctrl+D` | Any | Detach from the session without stopping daemon execution. |
+| `Esc` | Session picker | Close the workspace or conversation picker. |
 | `Ctrl+C` | Any | Immediately exit the client. |
 | `Ctrl+P` / `Ctrl+N` | Composer | Traverse prompt history ring (previous / next). |
 | `PageUp` / `PageDown` | Viewport | Scroll conversation transcript history. |
+
+Use `/interrupt` to stop the active turn. Use `/quit`, `/exit`, or `Ctrl+C` to leave the client; daemon execution continues after the client exits.
