@@ -19,7 +19,7 @@ Buddy Agent includes an interactive, full-screen terminal interface built with C
 │                                                             │
 ├─────────────────────────────────────────────────────────────┤
 │ ┌─────────────────────────────────────────────────────────┐ │
-│ │ Type prompt or / for commands                            │ │
+│ │ Type prompt, / for commands, @ for files                 │ │
 │ └─────────────────────────────────────────────────────────┘ │
 ├─────────────────────────────────────────────────────────────┤
 │ [Model: gpt-4o] [Ctx: 42k/128k (32%)] [Turn: 4.2s] [Cost: $]│
@@ -30,6 +30,7 @@ Buddy Agent includes an interactive, full-screen terminal interface built with C
 
 ### 1. Multiline Composer
 * **Multiline Editing**: Press `Shift+Enter` to insert a newline. Press `Enter` to submit the prompt.
+* **Prompt History**: Use `Up` at the first line and `Down` at the last line to browse submitted prompts. `Ctrl+P` and `Ctrl+N` browse history from any line. Returning past the newest entry restores the unsent draft. The latest 500 prompts persist in `~/.buddy/history.jsonl`; `BUDDY_HISTORY_FILE` overrides the path.
 
 ### 2. Slash Commands
 Type `/` commands in the composer:
@@ -37,9 +38,12 @@ Type `/` commands in the composer:
 * `/queue <prompt>`: Queue a follow-up prompt behind the active turn.
 * `/interrupt`: Cancel the currently executing turn immediately.
 * `/resume`: Open the project and conversation picker to switch sessions.
+* `/help`: Show available commands.
 * `/copy`: Copy the full un-truncated conversation markdown transcript to the system clipboard via OSC 52 escape sequences.
 * `/clear`: Clear the visible transcript viewport.
 * `/quit` or `/exit`: Detach from the session and leave background daemon tasks running.
+
+Typing `/` shows matching commands. Use `Up` and `Down` to select, `Tab` to complete, `Enter` to run a command without arguments, and `Esc` to close the list. Typing `@` shows up to 50 matching entries from the workspace root; use `Tab` or `Enter` to insert the selected relative path.
 
 ### 3. Interactive Tool Approvals
 When a tool call requires user confirmation, the TUI displays an approval prompt above the composer. Press `y` or `a` to allow the tool call, or `n` or `d` to deny it.
@@ -49,7 +53,9 @@ When a tool call requires user confirmation, the TUI displays an approval prompt
 | Shortcut | Context | Action |
 | :--- | :--- | :--- |
 | `Enter` | Idle / Working | Submit prompt (runs immediately when idle; queues when busy). |
-| `Esc` | Session picker | Close the workspace or conversation picker. |
+| `Up` / `Down` | Composer | Navigate prompt history at the first or last line; otherwise move within the draft. |
+| `Ctrl+P` / `Ctrl+N` | Composer | Navigate prompt history. |
+| `Esc` | Picker | Close the workspace, conversation, or composer completion list. |
 | `Ctrl+C` | Any | Immediately exit the client. |
 | `PageUp` / `PageDown` | Viewport | Scroll conversation transcript history. |
 

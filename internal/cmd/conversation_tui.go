@@ -54,6 +54,14 @@ type conversationTUI struct {
 	queued                 []string
 	steers                 []string
 	textarea               textarea.Model
+	history                *InputHistoryRing
+	slashCommands          SlashCommandRegistry
+	completionKind         string
+	commandMatches         []SlashCommand
+	fileMatches            []string
+	completionCursor       int
+	completionStart        int
+	completionEnd          int
 	width                  int
 	height                 int
 	errorText              string
@@ -198,6 +206,7 @@ func runConversationTUI(ctx context.Context, f *cmdutil.Factory, socketPath stri
 	input.SetStyles(textarea.DefaultStyles(true))
 	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"), key.WithHelp("shift+enter", "new line"))
 	input.Focus()
+	history, historyErr := NewInputHistoryRing(os.Getenv("BUDDY_HISTORY_FILE"))
 	m := &conversationTUI{
 		ctx:            ctx,
 		client:         api,
@@ -207,10 +216,26 @@ func runConversationTUI(ctx context.Context, f *cmdutil.Factory, socketPath stri
 		standalone:     standalone,
 		state:          "ready",
 		textarea:       input,
+		history:        history,
 		width:          80,
 		height:         24,
 		lineCountCache: make(map[string]int),
 		wrapCache:      make(map[string][]string),
+	}
+	for _, command := range []SlashCommand{
+		{Name: "/help", Description: "Show available commands"},
+		{Name: "/clear", Description: "Clear the transcript"},
+		{Name: "/quit", Description: "Exit the client"},
+		{Name: "/resume", Description: "Resume a conversation"},
+		{Name: "/steer", Description: "Guide the active turn", ArgsHint: "<instruction>"},
+		{Name: "/interrupt", Description: "Stop the active turn"},
+		{Name: "/queue", Description: "Queue a prompt", ArgsHint: "<prompt>"},
+		{Name: "/copy", Description: "Copy the transcript"},
+	} {
+		m.slashCommands.Register(command)
+	}
+	if historyErr != nil {
+		m.errorText = fmt.Sprintf("load prompt history: %v", historyErr)
 	}
 	if f.MCPConfigLoader != nil {
 		home := ""
@@ -878,6 +903,81 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "n", "d":
 				return m, m.respondPermission("deny")
 			}
+			return m, nil
+		}
+		if m.completionKind != "" {
+			switch msg.String() {
+			case "esc":
+				m.completionKind = ""
+				return m, nil
+			case "up", "down":
+				items := m.completionCount()
+				if items > 0 {
+					step := -1
+					if msg.String() == "down" {
+						step = 1
+					}
+					m.completionCursor = (m.completionCursor + step + items) % items
+				}
+				return m, nil
+			case "tab", "enter":
+				if m.completionCount() > 0 {
+					isEnter := msg.String() == "enter"
+					if m.completionKind == "file" {
+						m.replaceCompletion(m.fileMatches[m.completionCursor])
+						m.completionKind = ""
+						return m, nil
+					}
+					command := m.commandMatches[m.completionCursor]
+					suffix := ""
+					if command.ArgsHint != "" {
+						suffix = " "
+					}
+					m.replaceCompletion(command.Name + suffix)
+					m.completionKind = ""
+					if !isEnter || suffix != "" {
+						return m, nil
+					}
+				}
+			}
+		}
+		if m.choosing == "" && m.history != nil {
+			switch msg.String() {
+			case "ctrl+p":
+				if prompt, ok := m.history.Previous(m.textarea.Value()); ok {
+					m.textarea.SetValue(prompt)
+					m.textarea.CursorEnd()
+					m.clearCompletion()
+				}
+				return m, nil
+			case "ctrl+n":
+				if prompt, ok := m.history.Next(); ok {
+					m.textarea.SetValue(prompt)
+					m.textarea.CursorEnd()
+					m.clearCompletion()
+				}
+				return m, nil
+			case "up":
+				lineInfo := m.textarea.LineInfo()
+				if m.textarea.Line() == 0 && lineInfo.RowOffset == 0 {
+					if prompt, ok := m.history.Previous(m.textarea.Value()); ok {
+						m.textarea.SetValue(prompt)
+						m.textarea.CursorEnd()
+						m.clearCompletion()
+						return m, nil
+					}
+				}
+			case "down":
+				lineInfo := m.textarea.LineInfo()
+				if m.textarea.Line() == m.textarea.LineCount()-1 && lineInfo.RowOffset+1 >= lineInfo.Height {
+					if prompt, ok := m.history.Next(); ok {
+						m.textarea.SetValue(prompt)
+						m.textarea.CursorEnd()
+						m.clearCompletion()
+						return m, nil
+					}
+				}
+			}
 		}
 		if m.choosing == "" {
 			switch msg.String() {
@@ -925,8 +1025,22 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.textarea.Reset()
 			m.errorText = ""
+			if m.history != nil {
+				if err := m.history.Add(text); err != nil {
+					m.errorText = fmt.Sprintf("save prompt history: %v", err)
+				}
+				m.history.Reset()
+			}
 			if text == "/resume" {
 				return m, m.listWorkspaces()
+			}
+			if text == "/help" {
+				var help strings.Builder
+				for _, command := range m.slashCommands.commands {
+					help.WriteString(command.Name + " " + command.ArgsHint + "  " + command.Description + "\n")
+				}
+				m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockSystemStatus, Role: "system", Header: "Help", Body: strings.TrimSpace(help.String()), CreatedAt: time.Now()})
+				return m, nil
 			}
 			if text == "/interrupt" {
 				if m.conversation == "" {
@@ -1002,8 +1116,97 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	var cmd tea.Cmd
+	beforeValue := m.textarea.Value()
+	beforeLine := m.textarea.Line()
+	beforeLineInfo := m.textarea.LineInfo()
 	m.textarea, cmd = m.textarea.Update(msg)
+	if beforeValue != m.textarea.Value() || beforeLine != m.textarea.Line() || beforeLineInfo != m.textarea.LineInfo() {
+		m.updateCompletion()
+	}
 	return m, cmd
+}
+
+func (m *conversationTUI) completionCount() int {
+	if m.completionKind == "file" {
+		return len(m.fileMatches)
+	}
+	return len(m.commandMatches)
+}
+
+func (m *conversationTUI) clearCompletion() {
+	m.completionKind = ""
+	m.commandMatches = nil
+	m.fileMatches = nil
+	m.completionCursor = 0
+	m.completionStart = 0
+	m.completionEnd = 0
+}
+
+func (m *conversationTUI) replaceCompletion(value string) {
+	text := m.textarea.Value()
+	if m.completionStart <= m.completionEnd && m.completionEnd <= len(text) {
+		m.textarea.SetValue(text[:m.completionStart] + value + text[m.completionEnd:])
+		m.textarea.CursorEnd()
+	}
+}
+
+func (m *conversationTUI) updateCompletion() {
+	text := m.textarea.Value()
+	line := m.textarea.Line()
+	lines := strings.Split(text, "\n")
+	if line >= len(lines) {
+		m.completionKind = ""
+		return
+	}
+	current := lines[line]
+	runes := []rune(current)
+	lineInfo := m.textarea.LineInfo()
+	cursor := min(len(runes), lineInfo.StartColumn+lineInfo.ColumnOffset)
+	start, end := cursor, cursor
+	for start > 0 && runes[start-1] != ' ' && runes[start-1] != '\t' {
+		start--
+	}
+	for end < len(runes) && runes[end] != ' ' && runes[end] != '\t' {
+		end++
+	}
+	word := string(runes[start:cursor])
+	lineStart := 0
+	for i := 0; i < line; i++ {
+		lineStart += len(lines[i]) + 1
+	}
+	m.completionStart = lineStart + len(string(runes[:start]))
+	m.completionEnd = lineStart + len(string(runes[:end]))
+	m.completionCursor = 0
+	if strings.HasPrefix(word, "/") {
+		m.commandMatches = m.slashCommands.Match(word)
+		m.fileMatches = nil
+		m.completionKind = "command"
+		if len(m.commandMatches) == 0 {
+			m.completionKind = ""
+		}
+		return
+	}
+	if strings.HasPrefix(word, "@") {
+		m.fileMatches = nil
+		entries, err := os.ReadDir(m.workspace)
+		if err != nil {
+			m.completionKind = ""
+			return
+		}
+		prefix := strings.TrimPrefix(word, "@")
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), prefix) && len(m.fileMatches) < 50 {
+				m.fileMatches = append(m.fileMatches, entry.Name())
+			}
+		}
+		m.commandMatches = nil
+		m.completionKind = "file"
+		if len(m.fileMatches) == 0 {
+			m.completionKind = ""
+		}
+		return
+	}
+	m.completionKind = ""
 }
 
 func (m *conversationTUI) View() tea.View {
@@ -1068,6 +1271,28 @@ func (m *conversationTUI) View() tea.View {
 					preview = preview[:500] + "…"
 				}
 				b.WriteString(uiMutedStyle.Render(preview) + "\n")
+			}
+		}
+		switch m.completionKind {
+		case "command":
+			start := m.completionWindowStart()
+			for i := start; i < min(start+m.completionRows(), len(m.commandMatches)); i++ {
+				command := m.commandMatches[i]
+				marker := "  "
+				if i == m.completionCursor {
+					marker = "› "
+				}
+				b.WriteString(marker + command.Name + "  " + uiMutedStyle.Render(command.Description+" "+command.ArgsHint) + "\n")
+			}
+		case "file":
+			start := m.completionWindowStart()
+			for i := start; i < min(start+m.completionRows(), len(m.fileMatches)); i++ {
+				path := m.fileMatches[i]
+				marker := "  "
+				if i == m.completionCursor {
+					marker = "› "
+				}
+				b.WriteString(marker + path + "\n")
 			}
 		}
 		b.WriteString(m.renderTextarea())
@@ -1252,6 +1477,14 @@ func (m *conversationTUI) renderTextarea() string {
 }
 
 func (m *conversationTUI) viewportHeight() int {
+	h := m.height - m.viewportOverhead() - m.completionRows()
+	if h < 4 {
+		return 4
+	}
+	return h
+}
+
+func (m *conversationTUI) viewportOverhead() int {
 	headerHeight := 3
 	if m.conversation != "" {
 		headerHeight = 4
@@ -1264,11 +1497,19 @@ func (m *conversationTUI) viewportHeight() int {
 	if m.errorText != "" {
 		overhead += 2
 	}
-	h := m.height - overhead
-	if h < 4 {
-		return 4
+	return overhead
+}
+
+func (m *conversationTUI) completionRows() int {
+	if m.completionKind == "" {
+		return 0
 	}
-	return h
+	return min(8, min(m.completionCount(), max(0, m.height-m.viewportOverhead()-4)))
+}
+
+func (m *conversationTUI) completionWindowStart() int {
+	rows := m.completionRows()
+	return min(max(0, m.completionCursor-rows+1), max(0, m.completionCount()-rows))
 }
 
 func (m *conversationTUI) clearCache() {

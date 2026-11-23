@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -787,5 +789,191 @@ func TestConversationTUIClearKeepsStreamingBlock(t *testing.T) {
 	cleared := updated.(*conversationTUI)
 	if len(cleared.blocks) != 1 || cleared.blocks[0].ID != "active" || cleared.activeBlockID != "active" {
 		t.Fatalf("clear lost active streaming block: blocks=%+v active=%q", cleared.blocks, cleared.activeBlockID)
+	}
+}
+
+func TestConversationTUIComposerCompletions(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "notes.md"), []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+	model := &conversationTUI{textarea: textarea.New(), workspace: workspace, height: 30}
+	model.slashCommands.Register(SlashCommand{Name: "/clear", Description: "Clear transcript"})
+	model.slashCommands.Register(SlashCommand{Name: "/copy", Description: "Copy transcript"})
+	model.textarea.SetValue("/cl")
+	model.updateCompletion()
+	if model.completionKind != "command" || len(model.commandMatches) != 1 {
+		t.Fatalf("slash completion = %q, %+v", model.completionKind, model.commandMatches)
+	}
+	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	model = updated.(*conversationTUI)
+	if got := model.textarea.Value(); got != "/clear" {
+		t.Fatalf("slash completion inserted %q", got)
+	}
+	model.textarea.SetValue("/co")
+	model.updateCompletion()
+	shortenedViewport := model.viewportHeight()
+	if model.completionRows() == 0 {
+		t.Fatal("active completion popup did not reserve viewport rows")
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	model = updated.(*conversationTUI)
+	if model.completionKind != "" || model.textarea.Value() != "/co" {
+		t.Fatalf("escape changed composer draft: popup=%q draft=%q", model.completionKind, model.textarea.Value())
+	}
+	if model.completionRows() != 0 || model.viewportHeight() <= shortenedViewport {
+		t.Fatalf("dismissed popup still reserves transcript rows: rows=%d viewport=%d", model.completionRows(), model.viewportHeight())
+	}
+	model.textarea.SetValue("@not")
+	model.updateCompletion()
+	if model.completionKind != "file" || len(model.fileMatches) != 1 || model.fileMatches[0] != "notes.md" {
+		t.Fatalf("file completion = %q, %+v", model.completionKind, model.fileMatches)
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	model = updated.(*conversationTUI)
+	if got := model.textarea.Value(); got != "notes.md" {
+		t.Fatalf("file completion inserted %q", got)
+	}
+}
+
+func TestConversationTUICompletionStateSurvivesNonEditingMessages(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 30}
+	model.slashCommands.Register(SlashCommand{Name: "/clear"})
+	model.slashCommands.Register(SlashCommand{Name: "/copy"})
+	model.textarea.SetValue("/c")
+	model.updateCompletion()
+	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	model = updated.(*conversationTUI)
+	if model.completionCursor != 1 {
+		t.Fatalf("completion selection = %d, want 1", model.completionCursor)
+	}
+	updated, _ = model.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	model = updated.(*conversationTUI)
+	if model.completionKind != "command" || model.completionCursor != 1 {
+		t.Fatalf("non-editing message changed completion selection: kind=%q cursor=%d", model.completionKind, model.completionCursor)
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	model = updated.(*conversationTUI)
+	updated, _ = model.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	model = updated.(*conversationTUI)
+	if model.completionKind != "" || model.completionRows() != 0 {
+		t.Fatalf("non-editing message reopened dismissed completion: kind=%q rows=%d", model.completionKind, model.completionRows())
+	}
+}
+
+func TestConversationTUIHistoryNavigationRestoresDraft(t *testing.T) {
+	history, err := NewInputHistoryRing(filepath.Join(t.TempDir(), "history.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Add("older"); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Add("newer"); err != nil {
+		t.Fatal(err)
+	}
+	model := &conversationTUI{textarea: textarea.New(), history: history, lineCountCache: make(map[string]int), wrapCache: make(map[string][]string)}
+	model.textarea.SetValue("draft")
+	model.completionKind = "file"
+	model.fileMatches = []string{"stale"}
+	model.completionStart, model.completionEnd = 0, 5
+	updated, _ := model.Update(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
+	model = updated.(*conversationTUI)
+	if got := model.textarea.Value(); got != "newer" {
+		t.Fatalf("history up selected %q, want newer", got)
+	}
+	if model.completionKind != "" || model.fileMatches != nil || model.completionEnd != 0 {
+		t.Fatalf("history navigation retained completion state: %+v", model)
+	}
+	for _, key := range []tea.KeyPressMsg{{Code: 'p', Mod: tea.ModCtrl}, {Code: 'n', Mod: tea.ModCtrl}, {Code: 'n', Mod: tea.ModCtrl}} {
+		updated, _ := model.Update(key)
+		model = updated.(*conversationTUI)
+	}
+	if got := model.textarea.Value(); got != "draft" {
+		t.Fatalf("history down restored %q, want draft", got)
+	}
+}
+
+func TestConversationTUIHistoryNavigationRespectsSoftWrapRows(t *testing.T) {
+	history, err := NewInputHistoryRing(filepath.Join(t.TempDir(), "history.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Add("saved prompt"); err != nil {
+		t.Fatal(err)
+	}
+	input := textarea.New()
+	input.SetWidth(8)
+	input.SetValue("a long wrapped draft")
+	input.CursorStart()
+	model := &conversationTUI{textarea: input, history: history}
+	if info := model.textarea.LineInfo(); info.Height < 2 {
+		t.Fatalf("test draft did not wrap: %+v", info)
+	}
+	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	model = updated.(*conversationTUI)
+	if got := model.textarea.Value(); got != "a long wrapped draft" || history.index != len(history.entries) {
+		t.Fatalf("Down recalled history from a non-final visual row: draft=%q index=%d", got, history.index)
+	}
+	model.textarea.CursorEnd()
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	model = updated.(*conversationTUI)
+	if got := model.textarea.Value(); got != "a long wrapped draft" || history.index != len(history.entries) {
+		t.Fatalf("Up recalled history from a non-first visual row: draft=%q index=%d", got, history.index)
+	}
+}
+
+func TestConversationTUIFileCompletionKeepsSelectionVisible(t *testing.T) {
+	workspace := t.TempDir()
+	for i := 0; i < 12; i++ {
+		name := fmt.Sprintf("file-%02d", i)
+		if err := os.WriteFile(filepath.Join(workspace, name), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	model := &conversationTUI{textarea: textarea.New(), workspace: workspace, width: 80, height: 24}
+	model.textarea.SetValue("@")
+	model.updateCompletion()
+	for i := 0; i < 10; i++ {
+		updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		model = updated.(*conversationTUI)
+	}
+	selected := model.fileMatches[model.completionCursor]
+	if !strings.Contains(model.View().Content, "› "+selected) {
+		t.Fatalf("selected completion %q is not visible", selected)
+	}
+}
+
+func TestConversationTUICompletionReservesViewportRows(t *testing.T) {
+	workspace := t.TempDir()
+	for i := 0; i < 12; i++ {
+		if err := os.WriteFile(filepath.Join(workspace, fmt.Sprintf("file-%02d", i)), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	model := &conversationTUI{textarea: textarea.New(), workspace: workspace, width: 80, height: 19}
+	model.textarea.SetValue("@")
+	model.updateCompletion()
+	for i := 0; i < 10; i++ {
+		updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		model = updated.(*conversationTUI)
+	}
+	if got := model.completionRows(); got != 4 {
+		t.Fatalf("completion rows = %d, want 4", got)
+	}
+	if got := model.viewportHeight(); got != 4 {
+		t.Fatalf("transcript viewport height = %d, want 4 after reserving completion rows", got)
+	}
+	visible := 0
+	for _, line := range strings.Split(model.View().Content, "\n") {
+		if strings.HasPrefix(line, "  file-") || strings.HasPrefix(line, "› file-") {
+			visible++
+		}
+	}
+	if visible != 4 {
+		t.Fatalf("rendered %d completion rows, want 4", visible)
+	}
+	if !strings.Contains(model.View().Content, "› "+model.fileMatches[model.completionCursor]) {
+		t.Fatal("selected completion is not visible in the constrained popup")
 	}
 }
