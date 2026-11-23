@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -403,9 +404,10 @@ func TestConversationPermissionSyncReconnectAndStaleRequest(t *testing.T) {
 	worker := &ConversationWorker{
 		conversationID: started.ConversationID, store: store, ctx: workerCtx, cancel: cancelWorker,
 		active: true, currentTurn: "permission-turn", currentTurnCtx: turnCtx,
-		approvalChan: make(chan string, 1), controller: controller,
+		controller: controller, approvalTimeout: time.Minute, detachedTimeout: time.Minute,
 		subscribers: map[ClientConn]struct{}{controller: {}}, replaying: make(map[ClientConn][]sequencedEvent),
 		ring: NewEventRingBuffer(DefaultRingBufferCapacity), workerEpoch: "permission-epoch",
+		sessionToolAllow: make(map[string]struct{}), sessionBashAllow: make(map[string]struct{}),
 	}
 	decision := make(chan bool, 1)
 	requestErr := make(chan error, 1)
@@ -454,13 +456,13 @@ func TestConversationPermissionSyncReconnectAndStaleRequest(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("pending approval was not replayed on controller attach")
 	}
-	if err := worker.RespondPermission(newController, "old-turn", request.RequestID, "allow"); err == nil {
+	if err := worker.RespondPermission(newController, protocol.PermissionRespondParams{TurnID: "old-turn", RequestID: request.RequestID, Decision: protocol.DecisionAllowOnce}); err == nil {
 		t.Fatal("accepted stale-turn permission response")
 	}
-	if err := worker.RespondPermission(observer, request.TurnID, request.RequestID, "allow"); err == nil {
+	if err := worker.RespondPermission(observer, protocol.PermissionRespondParams{TurnID: request.TurnID, RequestID: request.RequestID, Decision: protocol.DecisionAllowOnce}); err == nil {
 		t.Fatal("accepted permission response from observer")
 	}
-	if err := worker.RespondPermission(newController, request.TurnID, request.RequestID, "allow"); err != nil {
+	if err := worker.RespondPermission(newController, protocol.PermissionRespondParams{TurnID: request.TurnID, RequestID: request.RequestID, Decision: protocol.DecisionAllowOnce}); err != nil {
 		t.Fatalf("respond to current request: %v", err)
 	}
 	select {
@@ -474,8 +476,159 @@ func TestConversationPermissionSyncReconnectAndStaleRequest(t *testing.T) {
 	if err := <-requestErr; err != nil {
 		t.Fatalf("permission request returned error: %v", err)
 	}
-	if err := worker.RespondPermission(newController, request.TurnID, request.RequestID, "allow"); err == nil {
+	if err := worker.RespondPermission(newController, protocol.PermissionRespondParams{TurnID: request.TurnID, RequestID: request.RequestID, Decision: protocol.DecisionAllowOnce}); err == nil {
 		t.Fatal("accepted stale permission request after resolution")
+	}
+}
+
+func newApprovalLifecycleWorker(controller ClientConn, attachedTimeout, detachedTimeout time.Duration) (*ConversationWorker, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &ConversationWorker{
+		conversationID: "approval-lifecycle", active: true, currentTurn: "turn-1", currentTurnCtx: ctx,
+		controller: controller, approvalTimeout: attachedTimeout, detachedTimeout: detachedTimeout,
+		sessionToolAllow: make(map[string]struct{}), sessionBashAllow: make(map[string]struct{}),
+	}, cancel
+}
+
+func TestConversationWorkerApprovalTimeoutAndStickyDisconnectDeadline(t *testing.T) {
+	controller := &permissionTestConn{id: "controller-1", messages: make(chan *protocol.JSONRPCMessage, 4)}
+	worker, cancel := newApprovalLifecycleWorker(controller, time.Second, 60*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := worker.requestPermission(worker.currentTurnCtx, "bash", map[string]any{"command": "echo safe"})
+		result <- err
+	}()
+	select {
+	case <-controller.messages:
+	case <-time.After(time.Second):
+		t.Fatal("approval request was not sent")
+	}
+	worker.Detach(controller)
+	worker.mu.Lock()
+	pending := worker.pendingApproval
+	firstDeadline := pending.deadline
+	worker.controller = &permissionTestConn{id: "controller-2", messages: make(chan *protocol.JSONRPCMessage, 4)}
+	controller2 := worker.controller
+	worker.mu.Unlock()
+	worker.Detach(controller2)
+	worker.mu.Lock()
+	if !worker.pendingApproval.deadline.Equal(firstDeadline) {
+		t.Fatalf("second detach extended deadline: got %v want %v", worker.pendingApproval.deadline, firstDeadline)
+	}
+	worker.mu.Unlock()
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("approval timeout error = %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("detached approval did not time out")
+	}
+}
+
+func TestConversationWorkerBashSessionApprovalMatchesExactCommand(t *testing.T) {
+	controller := &permissionTestConn{id: "controller", messages: make(chan *protocol.JSONRPCMessage, 8)}
+	worker, cancel := newApprovalLifecycleWorker(controller, time.Second, time.Second)
+	defer cancel()
+	command := "git status"
+	result := make(chan protocol.PermissionRespondParams, 1)
+	go func() {
+		response, err := worker.requestPermission(context.Background(), "bash", map[string]any{"command": command})
+		if err != nil {
+			result <- protocol.PermissionRespondParams{DenialReason: err.Error()}
+			return
+		}
+		result <- response
+	}()
+	var request protocol.PermissionRequestNotification
+	select {
+	case message := <-controller.messages:
+		if err := json.Unmarshal(message.Params, &request); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval request was not sent")
+	}
+	bad := protocol.PermissionRespondParams{RequestID: request.RequestID, TurnID: request.TurnID, Decision: protocol.DecisionAllowSession, CommandPattern: "git"}
+	if err := worker.RespondPermission(controller, bad); err == nil {
+		t.Fatal("accepted a command prefix instead of the exact command")
+	}
+	good := protocol.PermissionRespondParams{RequestID: request.RequestID, TurnID: request.TurnID, Decision: protocol.DecisionAllowSession, CommandPattern: command}
+	if err := worker.RespondPermission(controller, good); err != nil {
+		t.Fatalf("respond to exact command: %v", err)
+	}
+	select {
+	case response := <-result:
+		if response.Decision != protocol.DecisionAllowSession {
+			t.Fatalf("session approval result = %+v", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval response was not returned")
+	}
+	response, err := worker.requestPermission(context.Background(), "bash", map[string]any{"command": command})
+	if err != nil || response.Decision != protocol.DecisionAllowOnce {
+		t.Fatalf("exact command was not cached: response=%+v err=%v", response, err)
+	}
+	different := "git status; rm -rf ./tmp"
+	result = make(chan protocol.PermissionRespondParams, 1)
+	go func() {
+		response, err := worker.requestPermission(context.Background(), "bash", map[string]any{"command": different})
+		if err != nil {
+			result <- protocol.PermissionRespondParams{DenialReason: err.Error()}
+			return
+		}
+		result <- response
+	}()
+	select {
+	case message := <-controller.messages:
+		if err := json.Unmarshal(message.Params, &request); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("changed command bypassed the session approval")
+	}
+	if err := worker.RespondPermission(controller, protocol.PermissionRespondParams{
+		RequestID: request.RequestID, TurnID: request.TurnID, Decision: protocol.DecisionAllowOnce,
+	}); err != nil {
+		t.Fatalf("respond to changed command: %v", err)
+	}
+	if response := <-result; response.Decision != protocol.DecisionAllowOnce {
+		t.Fatalf("changed command response = %+v", response)
+	}
+}
+
+func TestConversationWorkerCancellationWinsAgainstApproval(t *testing.T) {
+	controller := &permissionTestConn{id: "controller", messages: make(chan *protocol.JSONRPCMessage, 2)}
+	worker, cancel := newApprovalLifecycleWorker(controller, time.Second, time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := worker.requestPermission(worker.currentTurnCtx, "bash", map[string]any{"command": "echo safe"})
+		result <- err
+	}()
+	var request protocol.PermissionRequestNotification
+	select {
+	case message := <-controller.messages:
+		if err := json.Unmarshal(message.Params, &request); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval request was not sent")
+	}
+	cancel()
+	if err := worker.RespondPermission(controller, protocol.PermissionRespondParams{
+		RequestID: request.RequestID, TurnID: request.TurnID, Decision: protocol.DecisionAllowOnce,
+	}); err == nil {
+		t.Fatal("accepted approval after turn cancellation")
+	}
+	select {
+	case err := <-result:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("approval wait error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled approval wait did not return")
 	}
 }
 

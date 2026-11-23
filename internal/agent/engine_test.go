@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -150,6 +152,87 @@ func TestEngineExecutionFlow(t *testing.T) {
 
 	if !hasTextComplete || !hasToolCall || !hasToolResult || !hasFinished {
 		t.Errorf("missing expected events in trace: %+v", events)
+	}
+}
+
+func TestEngineToolInterceptorExecutesModifiedArguments(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := persistence.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	registry := tools.NewRegistry(1000)
+	registry.Register(tools.NewWriteFileTool(workspace))
+	client := &mockChatClient{responses: []*openai.ChatCompletion{
+		{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Role: "assistant", ToolCalls: []openai.ChatCompletionMessageToolCall{{
+			ID: "write", Function: openai.ChatCompletionMessageToolCallFunction{Name: "write_file", Arguments: `{"path":"original.txt","content":"original"}`},
+		}}}}}},
+		{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Role: "assistant", Content: "done"}}}},
+	}}
+	var events []Event
+	engine := NewEngine(client, "test-model", 3, registry, memory.NewManager(workspace), func(event Event) { events = append(events, event) }, WithStore(store), WithSessionIDOverride("approval-interceptor-test"), WithToolInterceptor(func(_ context.Context, tool string, args json.RawMessage) (bool, json.RawMessage, error) {
+		if tool != "write_file" || !strings.Contains(string(args), "original.txt") {
+			t.Fatalf("interceptor args = %s for %s", args, tool)
+		}
+		return true, json.RawMessage(`{"path":"approved.txt","content":"approved"}`), nil
+	}))
+	if _, err := engine.Run(context.Background(), "write a file"); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(workspace, "approved.txt"))
+	if err != nil || string(content) != "approved" {
+		t.Fatalf("modified arguments were not executed: content=%q err=%v", content, err)
+	}
+	turns, err := store.GetAllTurns(context.Background(), "approval-interceptor-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundArgs := false
+	for _, turn := range turns {
+		for _, call := range turn.ToolCalls {
+			foundArgs = foundArgs || strings.Contains(call.Args, "approved.txt")
+		}
+	}
+	if !foundArgs {
+		t.Fatalf("approved tool arguments were not persisted: %+v", turns)
+	}
+	for _, event := range events {
+		if event.Type == EventToolCall && !strings.Contains(event.ToolArgs, "approved.txt") {
+			t.Fatalf("tool event did not record approved arguments: %s", event.ToolArgs)
+		}
+	}
+}
+
+func TestEngineToolDenialSkipsDispatchAndContinues(t *testing.T) {
+	workspace := t.TempDir()
+	registry := tools.NewRegistry(1000)
+	registry.Register(tools.NewWriteFileTool(workspace))
+	client := &mockChatClient{responses: []*openai.ChatCompletion{
+		{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Role: "assistant", ToolCalls: []openai.ChatCompletionMessageToolCall{{
+			ID: "write", Function: openai.ChatCompletionMessageToolCallFunction{Name: "write_file", Arguments: `{"path":"denied.txt","content":"no"}`},
+		}}}}}},
+		{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Role: "assistant", Content: "I will not write it."}}}},
+	}}
+	var events []Event
+	engine := NewEngine(client, "test-model", 3, registry, memory.NewManager(workspace), func(event Event) { events = append(events, event) }, WithToolInterceptor(func(context.Context, string, json.RawMessage) (bool, json.RawMessage, error) {
+		return false, nil, &ToolDeniedError{Reason: "policy"}
+	}))
+	result, err := engine.Run(context.Background(), "write a file")
+	if err != nil || result != "I will not write it." {
+		t.Fatalf("turn did not recover from denial: result=%q err=%v", result, err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "denied.txt")); !os.IsNotExist(err) {
+		t.Fatalf("denied tool was executed: stat error=%v", err)
+	}
+	foundDenial := false
+	for _, event := range events {
+		if event.Type == EventToolResult && strings.Contains(event.ToolResult, "denied by user: policy") {
+			foundDenial = true
+		}
+	}
+	if !foundDenial {
+		t.Fatalf("tool denial was not returned to the model: %+v", events)
 	}
 }
 

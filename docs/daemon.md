@@ -49,4 +49,5 @@ Communication over the socket uses line-delimited JSON-RPC 2.0 (NDJSON). Each fr
 ### Detached Ergonomics & Zero Deadlocks
 * When a client disconnects (`Ctrl+D`, closed terminal, or SSH drop), the worker continues running in the background.
 * Live events are buffered in a monotonic in-memory ring buffer (up to 2,048 events) for subsequent reattachment.
-* If a tool requires permission while the session is detached, the worker starts a 5-minute fail-closed timer. Reattaching immediately replays the approval prompt. If the timer expires without a controller, the tool call fails closed.
+* A pending approval expires after 15 minutes from creation. The first controller disconnect shortens the deadline to five minutes from that disconnect; reconnects and later disconnects do not extend it. Reattaching immediately replays the pending request.
+* `allow_session` caches read-only tool names or the exact raw bash command string in the current conversation worker. Modified arguments are allowed once and are recorded as executed.

@@ -546,7 +546,8 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 
 	case protocol.MethodPermissionRespond:
 		var params protocol.PermissionRespondParams
-		if err := json.Unmarshal(msg.Params, &params); err != nil || params.RequestID == "" {
+		if err := json.Unmarshal(msg.Params, &params); err != nil || params.RequestID == "" ||
+			(params.Decision != protocol.DecisionAllowOnce && params.Decision != protocol.DecisionAllowSession && params.Decision != protocol.DecisionDeny) {
 			errRes := protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid permission.respond params", nil)
 			_ = client.Send(errRes)
 			return
@@ -564,11 +565,15 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 				_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodePermissionDenied, "only the conversation controller may respond to permission requests", nil))
 				return
 			}
-			if err := worker.RespondPermission(client, params.TurnID, params.RequestID, params.Decision); err != nil {
+			if err := worker.RespondPermission(client, params); err != nil {
 				_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeConflict, err.Error(), nil))
 				return
 			}
 		} else {
+			if params.Decision == protocol.DecisionAllowSession || params.SessionWhitelist || params.ModifiedArguments != nil || params.CommandPattern != "" {
+				_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "structured approvals require a conversation session", nil))
+				return
+			}
 			client.sessMu.Lock()
 			workers := make([]*SessionWorker, 0, len(client.activeSess))
 			for _, worker := range client.activeSess {
@@ -583,7 +588,11 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 				if !worker.IsController(client) {
 					continue
 				}
-				if err := worker.RespondPermission(params.RequestID, params.Decision); err == nil {
+				decision := "deny"
+				if params.Decision == protocol.DecisionAllowOnce {
+					decision = "allow"
+				}
+				if err := worker.RespondPermission(params.RequestID, decision); err == nil {
 					responded = true
 					break
 				}

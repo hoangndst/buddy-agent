@@ -140,15 +140,15 @@ func (a *localConversationAPI) InterruptTurn(params protocol.TurnInterruptParams
 	return &protocol.TurnInterruptResult{ConversationID: params.ConversationID, TurnID: params.TurnID, Status: "interrupting"}, nil
 }
 
-func (a *localConversationAPI) RespondConversationPermission(conversationID, turnID, requestID, decision string) error {
-	worker, ok := a.manager.GetConversation(conversationID)
+func (a *localConversationAPI) RespondConversationPermissionParams(params protocol.PermissionRespondParams) error {
+	worker, ok := a.manager.GetConversation(params.ConversationID)
 	if !ok {
 		return persistence.ErrSessionNotFound
 	}
 	if !worker.IsController(a.conn) {
 		return errors.New("only the conversation controller may respond to permission requests")
 	}
-	return worker.RespondPermission(a.conn, turnID, requestID, decision)
+	return worker.RespondPermission(a.conn, params)
 }
 
 func (a *localConversationAPI) ConversationEvents() <-chan protocol.SessionEventNotification {

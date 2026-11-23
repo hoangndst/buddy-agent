@@ -60,6 +60,31 @@ func TestConversationRPCShapesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPermissionRespondParamsLegacyAndStructuredDecisions(t *testing.T) {
+	var legacy PermissionRespondParams
+	if err := json.Unmarshal([]byte(`{"request_id":"r1","decision":"allow"}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Decision != DecisionAllowOnce {
+		t.Fatalf("legacy allow decoded as %q", legacy.Decision)
+	}
+	params := PermissionRespondParams{
+		RequestID: "r2", ConversationID: "c1", TurnID: "t1", Decision: DecisionAllowSession,
+		SessionWhitelist: true, CommandPattern: "git status", ModifiedArguments: map[string]any{"path": "main.go"},
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded PermissionRespondParams
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Decision != DecisionAllowSession || decoded.CommandPattern != params.CommandPattern || decoded.ModifiedArguments["path"] != "main.go" {
+		t.Fatalf("structured permission response round trip mismatch: %+v", decoded)
+	}
+}
+
 func TestJSONRPCProtocol_EncodeDecode(t *testing.T) {
 	// 1. Request roundtrip
 	effort := "medium"

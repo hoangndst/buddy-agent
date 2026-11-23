@@ -46,7 +46,7 @@ Type `/` commands in the composer:
 Typing `/` shows matching commands. Use `Up` and `Down` to select, `Tab` to complete, `Enter` to run a command without arguments, and `Esc` to close the list. Typing `@` shows up to 50 matching entries from the workspace root; use `Tab` or `Enter` to insert the selected relative path.
 
 ### 3. Interactive Tool Approvals
-When a tool call requires user confirmation, the TUI displays an approval prompt above the composer. Press `y` or `a` to allow the tool call, or `n` or `d` to deny it.
+When a tool call requires confirmation, the TUI shows its arguments in an approval card while conversation events continue streaming. Press `1` to allow once, `2` to allow matching read-only tools or the exact same bash command for this conversation, `3` to deny, or `4` to edit the JSON arguments and allow once. In the editor, `Enter` submits and `Shift+Enter` inserts a newline. `Esc` returns to the approval choices.
 
 ### 4. Keyboard Shortcuts
 

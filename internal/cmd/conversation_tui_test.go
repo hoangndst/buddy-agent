@@ -56,7 +56,7 @@ func (f *conversationAPITestDouble) SubmitConversation(params protocol.Conversat
 func (f *conversationAPITestDouble) InterruptTurn(protocol.TurnInterruptParams) (*protocol.TurnInterruptResult, error) {
 	return nil, nil
 }
-func (f *conversationAPITestDouble) RespondConversationPermission(string, string, string, string) error {
+func (f *conversationAPITestDouble) RespondConversationPermissionParams(protocol.PermissionRespondParams) error {
 	return nil
 }
 func (f *conversationAPITestDouble) ConversationEvents() <-chan protocol.SessionEventNotification {
@@ -833,6 +833,42 @@ func TestConversationTUIComposerCompletions(t *testing.T) {
 	model = updated.(*conversationTUI)
 	if got := model.textarea.Value(); got != "notes.md" {
 		t.Fatalf("file completion inserted %q", got)
+	}
+}
+
+func TestConversationTUILoadSyncSkipsEmptyAssistantToolSteps(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	model.loadSync(&protocol.ConversationSyncResult{ConversationID: "conversation-1", Transcript: []protocol.ConversationTranscriptEntry{
+		{Role: "user", Content: "inspect files"},
+		{Role: "assistant", Content: ""},
+		{Role: "assistant", Content: " \n  "},
+		{Role: "assistant", Content: "Found one file."},
+	}})
+	if len(model.blocks) != 2 {
+		t.Fatalf("restored visible block count = %d, want 2: %+v", len(model.blocks), model.blocks)
+	}
+	lines := strings.Join(model.computeVisibleLines(), "\n")
+	if strings.Count(lines, "Buddy") != 1 || !strings.Contains(lines, "Found one file.") {
+		t.Fatalf("restored transcript contains empty assistant rows: %q", lines)
+	}
+}
+
+func TestConversationTUIKeepsStreamingWhileApprovalCardIsOpen(t *testing.T) {
+	model := &conversationTUI{
+		conversation: "conversation-1", state: "running", width: 80, height: 24,
+		textarea: textarea.New(),
+	}
+	updated, _ := model.Update(permissionRequestMsg(protocol.PermissionRequestNotification{
+		ConversationID: "conversation-1", TurnID: "turn-1", RequestID: "request-1", Tool: "bash",
+		Arguments: map[string]any{"command": "go test ./..."},
+	}))
+	model = updated.(*conversationTUI)
+	updated, _ = model.Update(conversationEventMsg(protocol.SessionEventNotification{
+		ConversationID: "conversation-1", TurnID: "turn-1", Type: string(agent.EventTextDelta), Content: "Still working",
+	}))
+	model = updated.(*conversationTUI)
+	if model.pendingApproval == nil || model.approvalModal == nil || model.activeBlockID == "" {
+		t.Fatalf("approval card blocked streaming: approval=%+v activeBlock=%q", model.pendingApproval, model.activeBlockID)
 	}
 }
 

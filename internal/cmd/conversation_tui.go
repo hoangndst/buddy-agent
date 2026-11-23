@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -51,6 +50,7 @@ type conversationTUI struct {
 	activeBlockID          string
 	streamingText          string
 	pendingApproval        *protocol.PermissionRequestNotification
+	approvalModal          *approvalModalState
 	queued                 []string
 	steers                 []string
 	textarea               textarea.Model
@@ -116,7 +116,7 @@ type conversationAPI interface {
 	ListConversations(protocol.ConversationListParams) (*protocol.ConversationListResult, error)
 	SubmitConversation(protocol.ConversationSubmitParams) (*protocol.ConversationSubmitResult, error)
 	InterruptTurn(protocol.TurnInterruptParams) (*protocol.TurnInterruptResult, error)
-	RespondConversationPermission(string, string, string, string) error
+	RespondConversationPermissionParams(protocol.PermissionRespondParams) error
 	ConversationEvents() <-chan protocol.SessionEventNotification
 	PermissionRequests() <-chan protocol.PermissionRequestNotification
 	ConversationEventGaps() <-chan struct{}
@@ -549,6 +549,9 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.textarea.SetWidth(max(20, msg.Width-6))
 			m.textarea.SetHeight(min(5, max(3, msg.Height/5)))
 		}()
+		if m.approvalModal != nil {
+			m.approvalModal.resize(msg.Width, msg.Height)
+		}
 		m.clearCache()
 		if m.activeBlockID != "" {
 			for _, b := range m.blocks {
@@ -815,6 +818,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.ConversationID == m.conversation && msg.TurnID != "" && msg.RequestID != "" {
 			request := protocol.PermissionRequestNotification(msg)
 			m.pendingApproval = &request
+			m.approvalModal = newApprovalModalState(request.Arguments, m.width, m.height)
 			m.state = "awaiting_approval"
 		}
 		return m, m.watchPermission()
@@ -823,6 +827,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorText = msg.err.Error()
 		} else if m.pendingApproval != nil && m.pendingApproval.RequestID == msg.requestID {
 			m.pendingApproval = nil
+			m.approvalModal = nil
 			return m, m.syncConversation()
 		}
 		return m, nil
@@ -897,11 +902,14 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if m.pendingApproval != nil {
-			switch strings.ToLower(msg.String()) {
-			case "y", "a":
-				return m, m.respondPermission("allow")
-			case "n", "d":
-				return m, m.respondPermission("deny")
+			if m.approvalModal == nil {
+				m.approvalModal = newApprovalModalState(m.pendingApproval.Arguments, m.width, m.height)
+			}
+			if response, done := m.approvalModal.handleKey(msg, *m.pendingApproval); done {
+				response.RequestID = m.pendingApproval.RequestID
+				response.ConversationID = m.pendingApproval.ConversationID
+				response.TurnID = m.pendingApproval.TurnID
+				return m, m.respondPermission(*response)
 			}
 			return m, nil
 		}
@@ -1263,14 +1271,10 @@ func (m *conversationTUI) View() tea.View {
 			b.WriteByte('\n')
 		}
 		if m.pendingApproval != nil {
-			b.WriteString(errStyle.Render("Approval required for "+m.pendingApproval.Tool+" · press y to allow or n to deny") + "\n")
-			if len(m.pendingApproval.Arguments) > 0 {
-				args, _ := json.Marshal(m.pendingApproval.Arguments)
-				preview := string(args)
-				if len(preview) > 500 {
-					preview = preview[:500] + "…"
-				}
-				b.WriteString(uiMutedStyle.Render(preview) + "\n")
+			if m.approvalModal != nil {
+				b.WriteString(m.approvalModal.view(*m.pendingApproval, m.width, m.height) + "\n")
+			} else {
+				b.WriteString(errStyle.Render("Approval required for "+m.pendingApproval.Tool) + "\n")
 			}
 		}
 		switch m.completionKind {
@@ -1299,6 +1303,9 @@ func (m *conversationTUI) View() tea.View {
 		footer := "Enter send  ·  Shift+Enter newline  ·  /steer <prompt>  ·  /resume  ·  Ctrl+C detach"
 		if m.standalone {
 			footer = "Enter send  ·  Shift+Enter newline  ·  /steer <prompt>  ·  /resume  ·  Ctrl+C stop local run"
+		}
+		if m.pendingApproval != nil {
+			footer = "Approval · 1 allow once  ·  2 allow session  ·  3 deny  ·  4 edit args  ·  Ctrl+C detach"
 		}
 		b.WriteString("\n" + uiMutedStyle.Render(footer) + "\n")
 	}
@@ -1389,13 +1396,14 @@ func (m *conversationTUI) watchPermission() tea.Cmd {
 	}
 }
 
-func (m *conversationTUI) respondPermission(decision string) tea.Cmd {
+func (m *conversationTUI) respondPermission(params protocol.PermissionRespondParams) tea.Cmd {
 	request := m.pendingApproval
 	if request == nil {
 		return nil
 	}
+	params.RequestID, params.ConversationID, params.TurnID = request.RequestID, request.ConversationID, request.TurnID
 	return func() tea.Msg {
-		err := m.client.RespondConversationPermission(request.ConversationID, request.TurnID, request.RequestID, decision)
+		err := m.client.RespondConversationPermissionParams(params)
 		return permissionRespondedMsg{requestID: request.RequestID, err: err}
 	}
 }
@@ -1414,6 +1422,7 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	m.tickerActive = false
 	m.activeBlockID = ""
 	m.pendingApproval = nil
+	m.approvalModal = nil
 	if result == nil {
 		return
 	}
@@ -1426,6 +1435,7 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	if len(result.PendingApprovals) > 0 {
 		request := result.PendingApprovals[0]
 		m.pendingApproval = &request
+		m.approvalModal = newApprovalModalState(request.Arguments, m.width, m.height)
 	}
 	m.lastSequence = result.EventWatermark
 	m.transcript = m.transcript[:0]
@@ -1455,6 +1465,9 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			}
 		}
 		if entry.Role == "assistant" {
+			if strings.TrimSpace(entry.Content) == "" {
+				continue
+			}
 			m.appendBlock(TranscriptBlock{
 				ID:        newConversationID("block"),
 				TurnID:    entry.TurnID,
@@ -1492,7 +1505,11 @@ func (m *conversationTUI) viewportOverhead() int {
 	composerHeight := m.textarea.Height() + 2
 	overhead := headerHeight + composerHeight + len(m.queued) + len(m.steers) + len(m.pendingStart)
 	if m.pendingApproval != nil {
-		overhead += 3
+		if m.approvalModal != nil {
+			overhead += lipgloss.Height(m.approvalModal.view(*m.pendingApproval, m.width, m.height))
+		} else {
+			overhead += 3
+		}
 	}
 	if m.errorText != "" {
 		overhead += 2
