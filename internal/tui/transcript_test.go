@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestTranscriptVisibleWindowCachesAndAnchors(t *testing.T) {
@@ -13,7 +15,8 @@ func TestTranscriptVisibleWindowCachesAndAnchors(t *testing.T) {
 	}
 	transcript.SetRenderState("", "", false)
 	before := strings.Join(transcript.VisibleLines(8, 80), "\n")
-	if strings.Contains(before, "Message 0") || !strings.Contains(before, "Message 49") {
+	plainBefore := ansi.Strip(before)
+	if strings.Contains(plainBefore, "Message 0") || !strings.Contains(plainBefore, "Message 49") {
 		t.Fatalf("visible window does not show only transcript tail: %q", before)
 	}
 	if len(transcript.wrapCache) >= len(transcript.Blocks) {
