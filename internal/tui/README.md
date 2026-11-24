@@ -8,7 +8,8 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 
 - `InputHistoryRing` loads and stores prompt history at a caller-supplied path.
 - `SlashCommandRegistry` stores and matches composer commands.
-- `TranscriptBlock` and `Activity` are UI-owned transcript values; `RenderMarkdown` converts source Markdown to terminal output.
+- `Transcript` owns canonical blocks, reading offset, rendered-row caching, reflow, and visible-window selection; `TranscriptBlock` and `Activity` are UI-owned values.
+- `RenderMarkdown` converts source Markdown to terminal output, and `WrapLines` wraps rendered terminal text by display-cell width.
 - `Screen` and `RenderScreen` allocate a fullscreen frame to header, body, and footer regions and apply terminal width clipping.
 - `Header` and `RenderHeader` format the compact and standard workspace/model/branch header.
 - `RenderChoiceList` and `RenderCompletion` draw picker and composer completion rows.
@@ -22,6 +23,7 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 - OSC 8 links are only presentation; displayed paths remain readable when links are unavailable.
 - Screen layout receives rendered strings and dimensions only; it has no workspace, daemon, or runtime dependencies.
 - Transcript bodies retain source Markdown; activity values contain only allowlisted display metadata.
+- The command adapter may map protocol events into transcript blocks, but transcript layout and cache behavior stay in this package.
 
 ## Side Effects
 
