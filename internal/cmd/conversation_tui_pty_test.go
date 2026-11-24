@@ -81,7 +81,9 @@ func TestConversationTUIUsesAndRestoresRealPTY(t *testing.T) {
 		for {
 			n, readErr := unix.Read(int(master.Fd()), buf)
 			if n > 0 {
+				outputMu.Lock()
 				output.Write(buf[:n])
+				outputMu.Unlock()
 			}
 			if readErr != nil {
 				if errors.Is(readErr, unix.EAGAIN) || errors.Is(readErr, unix.EWOULDBLOCK) {
