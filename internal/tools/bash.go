@@ -1,10 +1,12 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/hoangndst/buddy-agent/internal/tools/subprocess"
@@ -88,19 +90,66 @@ func (b *BashTool) Parameters() any {
 	}
 }
 
-type bashInput struct {
-	Command string `json:"command"`
+// ParseBashCommand accepts exactly one lowercase command field and rejects ambiguous JSON.
+func ParseBashCommand(raw json.RawMessage) (string, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return "", errors.New("arguments must be an object containing one command field")
+	}
+	commandSeen := false
+	command := ""
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return "", err
+		}
+		key, ok := token.(string)
+		if !ok || key != "command" {
+			return "", fmt.Errorf("unexpected bash argument field %q", key)
+		}
+		if commandSeen {
+			return "", errors.New("duplicate bash command field")
+		}
+		var value any
+		if err := dec.Decode(&value); err != nil {
+			return "", err
+		}
+		var okString bool
+		command, okString = value.(string)
+		if !okString {
+			return "", errors.New("bash command field must be a string")
+		}
+		commandSeen = true
+	}
+	closing, err := dec.Token()
+	if err != nil {
+		return "", err
+	}
+	if closing != json.Delim('}') {
+		return "", errors.New("bash arguments object is not closed")
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return "", errors.New("unexpected data after bash arguments")
+		}
+		return "", err
+	}
+	if !commandSeen {
+		return "", errors.New("bash command field is required")
+	}
+	if command == "" {
+		return "", errors.New("command argument cannot be empty")
+	}
+	return command, nil
 }
 
 // Execute runs the specified bash command with timeout in the workspace.
 func (b *BashTool) Execute(ctx context.Context, raw json.RawMessage) (string, error) {
-	var input bashInput
-	if err := json.Unmarshal(raw, &input); err != nil {
+	command, err := ParseBashCommand(raw)
+	if err != nil {
 		return "", fmt.Errorf("invalid bash tool arguments: %w", err)
-	}
-
-	if input.Command == "" {
-		return "", errors.New("command argument cannot be empty")
 	}
 
 	// Reserve 256 bytes for execution summary headers so res.Combined <= b.maxOutputBytes
@@ -110,7 +159,7 @@ func (b *BashTool) Execute(ctx context.Context, raw json.RawMessage) (string, er
 	}
 
 	res, err := b.runner.Run(ctx, subprocess.ExecutionOptions{
-		Command:        input.Command,
+		Command:        command,
 		Dir:            b.workspace,
 		Timeout:        b.timeout,
 		MaxOutputBytes: runnerMaxBytes,

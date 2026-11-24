@@ -422,15 +422,24 @@ func (c *Client) CancelSession(sessionID string) error {
 func (c *Client) RespondPermission(requestID string, decision string) error {
 	_, err := c.call(protocol.MethodPermissionRespond, protocol.PermissionRespondParams{
 		RequestID: requestID,
-		Decision:  decision,
+		Decision:  protocol.PermissionDecision(decision),
 	})
 	return err
 }
 
 // RespondConversationPermission answers a request bound to one conversation and turn.
 func (c *Client) RespondConversationPermission(conversationID, turnID, requestID, decision string) error {
+	return c.RespondConversationPermissionParams(protocol.PermissionRespondParams{
+		ConversationID: conversationID, TurnID: turnID, RequestID: requestID, Decision: protocol.PermissionDecision(decision),
+	})
+}
+
+// RespondConversationPermissionParams sends a structured decision for one conversation approval.
+func (c *Client) RespondConversationPermissionParams(params protocol.PermissionRespondParams) error {
 	_, err := c.call(protocol.MethodPermissionRespond, protocol.PermissionRespondParams{
-		ConversationID: conversationID, TurnID: turnID, RequestID: requestID, Decision: decision,
+		ConversationID: params.ConversationID, TurnID: params.TurnID, RequestID: params.RequestID, Decision: params.Decision,
+		SessionWhitelist: params.SessionWhitelist, CommandPattern: params.CommandPattern,
+		ModifiedArguments: params.ModifiedArguments, DenialReason: params.DenialReason,
 	})
 	return err
 }

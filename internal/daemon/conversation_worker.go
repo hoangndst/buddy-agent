@@ -18,6 +18,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	"github.com/hoangndst/buddy-agent/internal/history"
 	"github.com/hoangndst/buddy-agent/internal/persistence"
+	"github.com/hoangndst/buddy-agent/internal/tools"
 )
 
 // ConversationWorker keeps a conversation runtime resident and runs its accepted
@@ -44,8 +45,11 @@ type ConversationWorker struct {
 	currentTurn         string
 	currentTurnCtx      context.Context
 	currentCancel       context.CancelFunc
-	approvalChan        chan string
-	pendingApproval     *protocol.PermissionRequestNotification
+	pendingApproval     *pendingConversationApproval
+	approvalTimeout     time.Duration
+	detachedTimeout     time.Duration
+	sessionToolAllow    map[string]struct{}
+	sessionBashAllow    map[string]struct{}
 	currentTerminalSent bool
 	controller          ClientConn
 	subscribers         map[ClientConn]struct{}
@@ -64,6 +68,22 @@ type ConversationWorker struct {
 	doneOnce            sync.Once
 }
 
+type pendingConversationApproval struct {
+	request      protocol.PermissionRequestNotification
+	result       chan protocol.PermissionRespondParams
+	disconnected chan struct{}
+	detachedAt   time.Time
+	deadline     time.Time
+	responded    bool
+}
+
+func earlierTime(a, b time.Time) time.Time {
+	if a.IsZero() || b.Before(a) {
+		return b
+	}
+	return a
+}
+
 type sequencedEvent struct {
 	sequence    uint64
 	message     *protocol.JSONRPCMessage
@@ -79,14 +99,17 @@ func NewConversationWorker(parent context.Context, id string, engine *agent.Engi
 	w := &ConversationWorker{
 		conversationID: id, engine: engine, runtime: runtime, store: engine.PersistenceStore(),
 		ctx: ctx, cancel: cancel, pending: make(map[string]struct{}), attachedSteers: make(map[string][]string), queueWake: make(chan struct{}, 1),
-		done: make(chan struct{}), controller: controller, subscribers: make(map[ClientConn]struct{}), replaying: make(map[ClientConn][]sequencedEvent), approvalChan: make(chan string, 1),
+		done: make(chan struct{}), controller: controller, subscribers: make(map[ClientConn]struct{}), replaying: make(map[ClientConn][]sequencedEvent),
 		ring: NewEventRingBuffer(DefaultRingBufferCapacity), pendingBroadcasts: make(map[uint64]sequencedEvent), nextBroadcast: 1, workerEpoch: generateWorkerID("epoch"), cleanup: cleanup,
+		approvalTimeout: 15 * time.Minute, detachedTimeout: 5 * time.Minute,
+		sessionToolAllow: make(map[string]struct{}), sessionBashAllow: make(map[string]struct{}),
 	}
 	if controller != nil {
 		w.subscribers[controller] = struct{}{}
 	}
 	engine.SetConversationCommitHook(w.commitWithEvents)
 	engine.SetConversationBoundaryHook(w.beforeModelRequest)
+	engine.SetToolInterceptor(w.interceptTool)
 	runtime.SetApplySubmissionHook(w.applySubmission)
 	runtime.SetTurnOutcomeHook(w.finishTurn)
 	return w, nil
@@ -545,8 +568,8 @@ func (w *ConversationWorker) Sync(ctx context.Context, params protocol.Conversat
 	lastDurableSequence := w.lastDurableSequence
 	executionBlocked := w.executionBlocked
 	var pendingApprovals []protocol.PermissionRequestNotification
-	if conn != nil && w.controller == conn && w.pendingApproval != nil {
-		pendingApprovals = []protocol.PermissionRequestNotification{boundedPermissionRequest(*w.pendingApproval)}
+	if conn != nil && w.controller == conn && w.pendingApproval != nil && !w.pendingApproval.responded {
+		pendingApprovals = []protocol.PermissionRequestNotification{boundedPermissionRequest(w.pendingApproval.request)}
 	}
 	w.mu.Unlock()
 	revision := params.HistoryRevision
@@ -744,6 +767,14 @@ func (w *ConversationWorker) Detach(c ClientConn) {
 	delete(w.subscribers, c)
 	if w.controller == c {
 		w.controller = nil
+		if pending := w.pendingApproval; pending != nil && pending.detachedAt.IsZero() {
+			pending.detachedAt = time.Now()
+			pending.deadline = earlierTime(pending.deadline, time.Now().Add(w.detachedTimeout))
+			select {
+			case pending.disconnected <- struct{}{}:
+			default:
+			}
+		}
 	}
 	w.mu.Unlock()
 	w.eventMu.Unlock()
@@ -767,66 +798,301 @@ func (w *ConversationWorker) Interrupt(turnID string) error {
 // The request remains worker-local so reconnect can replay it, while the active
 // turn keeps the worker pinned against idle eviction.
 func (w *ConversationWorker) RequestPermission(tool string, args map[string]any) (bool, error) {
+	response, err := w.requestPermission(w.currentTurnContext(), tool, args)
+	if err != nil {
+		return false, err
+	}
+	return response.Decision == protocol.DecisionAllowOnce || response.Decision == protocol.DecisionAllowSession, nil
+}
+
+func (w *ConversationWorker) currentTurnContext() context.Context {
 	w.mu.Lock()
-	if !w.active || w.currentTurn == "" || w.currentTurnCtx == nil {
+	defer w.mu.Unlock()
+	return w.currentTurnCtx
+}
+
+func (w *ConversationWorker) interceptTool(ctx context.Context, tool string, raw json.RawMessage) (bool, json.RawMessage, error) {
+	var args map[string]any
+	var canonicalArgs json.RawMessage
+	if tool == "bash" {
+		command, err := tools.ParseBashCommand(raw)
+		if err != nil {
+			return false, nil, fmt.Errorf("decode bash tool arguments for approval: %w", err)
+		}
+		args = map[string]any{"command": command}
+		canonicalArgs, err = json.Marshal(args)
+		if err != nil {
+			return false, nil, fmt.Errorf("encode bash tool arguments for approval: %w", err)
+		}
+	} else {
+		args = make(map[string]any)
+	}
+	if tool != "bash" && len(raw) > 0 {
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return false, nil, fmt.Errorf("decode %s arguments for approval: %w", tool, err)
+		}
+	}
+	response, err := w.requestPermission(ctx, tool, args)
+	if err != nil {
+		return false, nil, err
+	}
+	if response.Decision == protocol.DecisionDeny {
+		return false, nil, &agent.ToolDeniedError{Reason: response.DenialReason}
+	}
+	if response.ModifiedArguments == nil {
+		if tool == "bash" {
+			return true, canonicalArgs, nil
+		}
+		return true, nil, nil
+	}
+	modified, err := json.Marshal(*response.ModifiedArguments)
+	if err != nil {
+		return false, nil, fmt.Errorf("encode modified %s arguments: %w", tool, err)
+	}
+	if tool == "bash" {
+		command, err := tools.ParseBashCommand(modified)
+		if err != nil {
+			return false, nil, fmt.Errorf("decode modified bash arguments: %w", err)
+		}
+		canonical, err := json.Marshal(map[string]string{"command": command})
+		if err != nil {
+			return false, nil, fmt.Errorf("encode modified bash arguments: %w", err)
+		}
+		return true, canonical, nil
+	}
+	return true, modified, nil
+}
+
+func (w *ConversationWorker) requestPermission(ctx context.Context, tool string, args map[string]any) (protocol.PermissionRespondParams, error) {
+	w.mu.Lock()
+	if !w.active || w.currentTurn == "" || w.currentTurnCtx == nil || ctx == nil {
 		w.mu.Unlock()
-		return false, errors.New("permission request requires an active conversation turn")
+		return protocol.PermissionRespondParams{}, errors.New("permission request requires an active conversation turn")
+	}
+	if ctx.Err() != nil {
+		w.mu.Unlock()
+		return protocol.PermissionRespondParams{}, ctx.Err()
+	}
+	if w.sessionToolIsAllowedLocked(tool, args) {
+		w.mu.Unlock()
+		return protocol.PermissionRespondParams{Decision: protocol.DecisionAllowOnce}, nil
 	}
 	if w.pendingApproval != nil {
 		w.mu.Unlock()
-		return false, errors.New("conversation already has a pending permission request")
+		return protocol.PermissionRespondParams{}, errors.New("conversation already has a pending permission request")
 	}
 	req := protocol.PermissionRequestNotification{
 		RequestID: generateWorkerID("permission"), SessionID: w.conversationID, ConversationID: w.conversationID,
 		TurnID: w.currentTurn, Tool: tool, Arguments: args,
 	}
-	w.pendingApproval = &req
-	turnCtx := w.currentTurnCtx
+	now := time.Now()
+	pending := &pendingConversationApproval{
+		request: req, result: make(chan protocol.PermissionRespondParams, 1), disconnected: make(chan struct{}, 1),
+		deadline: now.Add(w.approvalTimeout),
+	}
 	controller := w.controller
+	if controller == nil {
+		pending.detachedAt = now
+		pending.deadline = earlierTime(pending.deadline, now.Add(w.detachedTimeout))
+	}
+	w.pendingApproval = pending
+	deadline := pending.deadline
 	w.mu.Unlock()
 
 	if controller != nil {
-		_ = sendPermissionRequest(controller, req)
+		if err := sendPermissionRequest(controller, req); err != nil {
+			w.Detach(controller)
+		}
 	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
-	case decision := <-w.approvalChan:
-		if err := turnCtx.Err(); err != nil {
-			return false, err
-		}
-		return decision == "allow", nil
-	case <-turnCtx.Done():
-		select {
-		case <-w.approvalChan:
-		default:
-		}
+	case response := <-pending.result:
 		w.mu.Lock()
-		if w.pendingApproval != nil && w.pendingApproval.RequestID == req.RequestID {
+		if err := ctx.Err(); err != nil {
+			if w.pendingApproval == pending {
+				w.pendingApproval = nil
+			}
+			w.mu.Unlock()
+			return protocol.PermissionRespondParams{}, err
+		}
+		if w.pendingApproval == pending {
 			w.pendingApproval = nil
+			w.cacheSessionApprovalLocked(tool, args, response)
+			w.mu.Unlock()
+			return response, nil
 		}
 		w.mu.Unlock()
-		return false, turnCtx.Err()
+		return protocol.PermissionRespondParams{}, errors.New("permission request is no longer pending")
+	case <-ctx.Done():
+		w.clearPendingApproval(pending)
+		return protocol.PermissionRespondParams{}, ctx.Err()
+	case <-pending.disconnected:
+		w.mu.Lock()
+		deadline := pending.deadline
+		w.mu.Unlock()
+		resetTimer(timer, time.Until(deadline))
+		select {
+		case response := <-pending.result:
+			w.mu.Lock()
+			if err := ctx.Err(); err != nil {
+				if w.pendingApproval == pending {
+					w.pendingApproval = nil
+				}
+				w.mu.Unlock()
+				return protocol.PermissionRespondParams{}, err
+			}
+			if w.pendingApproval == pending {
+				w.pendingApproval = nil
+				w.cacheSessionApprovalLocked(tool, args, response)
+				w.mu.Unlock()
+				return response, nil
+			}
+			w.mu.Unlock()
+			return protocol.PermissionRespondParams{}, errors.New("permission request is no longer pending")
+		case <-ctx.Done():
+			w.clearPendingApproval(pending)
+			return protocol.PermissionRespondParams{}, ctx.Err()
+		case <-timer.C:
+			return w.expireApproval(ctx, pending)
+		}
+	case <-timer.C:
+		return w.expireApproval(ctx, pending)
+	}
+}
+
+func (w *ConversationWorker) clearPendingApproval(pending *pendingConversationApproval) {
+	w.mu.Lock()
+	if w.pendingApproval == pending {
+		w.pendingApproval = nil
+	}
+	w.mu.Unlock()
+}
+
+func (w *ConversationWorker) expireApproval(ctx context.Context, pending *pendingConversationApproval) (protocol.PermissionRespondParams, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		if w.pendingApproval == pending {
+			w.pendingApproval = nil
+		}
+		return protocol.PermissionRespondParams{}, err
+	}
+	if w.pendingApproval == pending && pending.responded {
+		select {
+		case response := <-pending.result:
+			w.pendingApproval = nil
+			w.cacheSessionApprovalLocked(pending.request.Tool, pending.request.Arguments, response)
+			return response, nil
+		default:
+		}
+	}
+	if w.pendingApproval == pending {
+		w.pendingApproval = nil
+	}
+	return protocol.PermissionRespondParams{}, errors.New("tool approval timed out")
+}
+
+func resetTimer(timer *time.Timer, delay time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	timer.Reset(delay)
+}
+
+func (w *ConversationWorker) sessionToolIsAllowedLocked(tool string, args map[string]any) bool {
+	if tool == "bash" {
+		command, _ := args["command"].(string)
+		_, ok := w.sessionBashAllow[command]
+		return ok && command != ""
+	}
+	_, ok := w.sessionToolAllow[tool]
+	return ok && isReadOnlyTool(tool)
+}
+
+func isReadOnlyTool(tool string) bool {
+	switch tool {
+	case "read_file", "list_directory", "search_files":
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *ConversationWorker) cacheSessionApprovalLocked(tool string, args map[string]any, response protocol.PermissionRespondParams) {
+	if response.Decision != protocol.DecisionAllowSession {
+		return
+	}
+	if tool == "bash" {
+		command, _ := args["command"].(string)
+		if command != "" {
+			if w.sessionBashAllow == nil {
+				w.sessionBashAllow = make(map[string]struct{})
+			}
+			w.sessionBashAllow[command] = struct{}{}
+		}
+	} else if isReadOnlyTool(tool) {
+		if w.sessionToolAllow == nil {
+			w.sessionToolAllow = make(map[string]struct{})
+		}
+		w.sessionToolAllow[tool] = struct{}{}
 	}
 }
 
 // RespondPermission applies a controller's decision to the exact active request.
-func (w *ConversationWorker) RespondPermission(conn ClientConn, turnID, requestID, decision string) error {
-	if decision != "allow" && decision != "deny" {
-		return errors.New("permission decision must be allow or deny")
+func (w *ConversationWorker) RespondPermission(conn ClientConn, params protocol.PermissionRespondParams) error {
+	if params.Decision != protocol.DecisionAllowOnce && params.Decision != protocol.DecisionAllowSession && params.Decision != protocol.DecisionDeny {
+		return errors.New("permission decision must be allow_once, allow_session, or deny")
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if conn == nil || w.controller != conn {
 		return errors.New("only the current conversation controller may respond to permission requests")
 	}
-	if !w.active || w.currentTurn != turnID || w.pendingApproval == nil ||
-		w.pendingApproval.RequestID != requestID || w.pendingApproval.TurnID != turnID {
+	pending := w.pendingApproval
+	if !w.active || w.currentTurn != params.TurnID || pending == nil || pending.responded ||
+		pending.request.RequestID != params.RequestID || pending.request.TurnID != params.TurnID {
 		return errors.New("no pending permission request matching conversation turn and request ID")
 	}
-	w.pendingApproval = nil
+	if w.currentTurnCtx == nil || w.currentTurnCtx.Err() != nil {
+		return errors.New("conversation turn is no longer active")
+	}
+	if time.Now().After(pending.deadline) {
+		return errors.New("permission request has expired")
+	}
+	if params.Decision != protocol.DecisionAllowOnce && params.ModifiedArguments != nil {
+		return errors.New("modified arguments can only be approved once")
+	}
+	if params.Decision == protocol.DecisionAllowSession {
+		if pending.request.Tool == "bash" {
+			command, _ := pending.request.Arguments["command"].(string)
+			if command == "" {
+				return errors.New("cannot authorize an empty bash command for the session")
+			}
+			if params.CommandPattern != "" && params.CommandPattern != command {
+				return errors.New("bash session authorization must match the exact approved command")
+			}
+			params.CommandPattern = command
+		} else if !isReadOnlyTool(pending.request.Tool) {
+			return errors.New("session authorization is limited to read-only tools and exact bash commands")
+		} else if params.CommandPattern != "" {
+			return errors.New("command patterns apply only to bash session authorization")
+		}
+	}
+	params.ConversationID = w.conversationID
+	params.TurnID = pending.request.TurnID
+	pending.responded = true
 	select {
-	case w.approvalChan <- decision:
+	case pending.result <- params:
 		return nil
 	default:
+		pending.responded = false
 		return errors.New("permission approval channel busy")
 	}
 }
@@ -834,10 +1100,10 @@ func (w *ConversationWorker) RespondPermission(conn ClientConn, turnID, requestI
 func (w *ConversationWorker) pendingPermissionForController(conn ClientConn) []protocol.PermissionRequestNotification {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if conn == nil || w.controller != conn || w.pendingApproval == nil {
+	if conn == nil || w.controller != conn || w.pendingApproval == nil || w.pendingApproval.responded {
 		return nil
 	}
-	return []protocol.PermissionRequestNotification{*w.pendingApproval}
+	return []protocol.PermissionRequestNotification{w.pendingApproval.request}
 }
 
 func sendPermissionRequest(conn ClientConn, req protocol.PermissionRequestNotification) error {

@@ -298,13 +298,42 @@ type SessionCancelParams struct {
 	SessionID string `json:"session_id"`
 }
 
-// PermissionRespondParams delivers user decision for a pending dangerous tool call.
+// PermissionDecision is the action taken on a pending tool approval.
+type PermissionDecision string
+
+const (
+	// DecisionAllowOnce allows one tool invocation.
+	DecisionAllowOnce PermissionDecision = "allow_once"
+	// DecisionAllowSession allows matching tool invocations for the conversation.
+	DecisionAllowSession PermissionDecision = "allow_session"
+	// DecisionDeny rejects the pending tool invocation.
+	DecisionDeny PermissionDecision = "deny"
+)
+
+// UnmarshalJSON accepts the legacy "allow" decision as allow_once.
+func (d *PermissionDecision) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if value == "allow" {
+		value = string(DecisionAllowOnce)
+	}
+	*d = PermissionDecision(value)
+	return nil
+}
+
+// PermissionRespondParams delivers a user's decision for a pending tool call.
 type PermissionRespondParams struct {
-	RequestID      string `json:"request_id"`
-	Decision       string `json:"decision"` // "allow" or "deny"
-	SessionID      string `json:"session_id,omitempty"`
-	ConversationID string `json:"conversation_id,omitempty"`
-	TurnID         string `json:"turn_id,omitempty"`
+	RequestID         string             `json:"request_id"`
+	Decision          PermissionDecision `json:"decision"`
+	SessionID         string             `json:"session_id,omitempty"`
+	ConversationID    string             `json:"conversation_id,omitempty"`
+	TurnID            string             `json:"turn_id,omitempty"`
+	SessionWhitelist  bool               `json:"session_whitelist,omitempty"`
+	CommandPattern    string             `json:"command_pattern,omitempty"`
+	ModifiedArguments *map[string]any    `json:"modified_arguments,omitempty"`
+	DenialReason      string             `json:"denial_reason,omitempty"`
 }
 
 // PermissionRequestNotification prompts the client for human-in-the-loop tool approval.

@@ -22,6 +22,19 @@ import (
 // EngineOption configures operational parameters for the Agent Engine.
 type EngineOption func(*Engine)
 
+// ToolInterceptor authorizes a tool call and may replace its JSON arguments.
+type ToolInterceptor func(ctx context.Context, tool string, args json.RawMessage) (allow bool, modifiedArgs json.RawMessage, err error)
+
+// ToolDeniedError reports an explicit user denial without aborting the ReAct turn.
+type ToolDeniedError struct{ Reason string }
+
+func (e *ToolDeniedError) Error() string { return e.Reason }
+
+// WithToolInterceptor configures human authorization for tool execution.
+func WithToolInterceptor(interceptor ToolInterceptor) EngineOption {
+	return func(e *Engine) { e.SetToolInterceptor(interceptor) }
+}
+
 // WithMaxContextTokens sets the hard context token ceiling on the engine.
 func WithMaxContextTokens(tokens int) EngineOption {
 	return func(e *Engine) {
@@ -181,6 +194,7 @@ type Engine struct {
 	registry                 *tools.Registry
 	memoryMgr                *memory.Manager
 	eventHandler             EventHandler
+	toolInterceptor          ToolInterceptor
 	store                    persistence.Store
 	workspaceDir             string
 	depth                    int
@@ -203,6 +217,18 @@ func (e *Engine) SetConversationCommitHook(hook func(func() error, []Event) erro
 // SetConversationBoundaryHook installs a callback run before each model request.
 func (e *Engine) SetConversationBoundaryHook(hook func(context.Context, string, string, *history.Session, int) error) {
 	e.conversationBoundaryHook = hook
+}
+
+// SetToolInterceptor installs the tool authorization callback on this engine and its subagent tool.
+func (e *Engine) SetToolInterceptor(interceptor ToolInterceptor) {
+	e.toolInterceptor = interceptor
+	if e.registry != nil {
+		if tool, ok := e.registry.Get("invoke_subagent"); ok {
+			if subagent, ok := tool.(*InvokeSubagentTool); ok {
+				subagent.SetToolInterceptor(interceptor)
+			}
+		}
+	}
 }
 
 func (e *Engine) commitAndEmit(commit func() error, events ...Event) error {
@@ -901,20 +927,48 @@ func (e *Engine) executeLoop(
 		toolResults := make([]history.ToolResult, 0, len(genResp.ToolCalls))
 		cumulativeBytes := 0
 		maxTurnBytes := session.MaxTurnOutputBytes()
+		var toolAuthorizationErr error
 
-		for _, tc := range genResp.ToolCalls {
+		for i := range genResp.ToolCalls {
+			tc := &genResp.ToolCalls[i]
+			args := json.RawMessage(tc.Arguments)
+			var denied *ToolDeniedError
+			toolExists := false
+			if e.registry != nil {
+				_, toolExists = e.registry.Get(tc.Name)
+			}
+			if e.toolInterceptor != nil && toolExists {
+				allow, modifiedArgs, err := e.toolInterceptor(ctx, tc.Name, args)
+				if err != nil && !errors.As(err, &denied) {
+					toolAuthorizationErr = fmt.Errorf("authorize tool %s: %w", tc.Name, err)
+					genResp.ToolCalls = genResp.ToolCalls[:i]
+					break
+				}
+				if denied == nil && !allow {
+					denied = &ToolDeniedError{Reason: "denied by user"}
+				}
+				if denied == nil && len(modifiedArgs) > 0 {
+					if !json.Valid(modifiedArgs) {
+						toolAuthorizationErr = fmt.Errorf("authorize tool %s: modified arguments are not valid JSON", tc.Name)
+						genResp.ToolCalls = genResp.ToolCalls[:i]
+						break
+					}
+					args = modifiedArgs
+					tc.Arguments = string(modifiedArgs)
+				}
+			}
 			e.eventHandler(Event{
 				Type:       EventToolCall,
 				Step:       step,
 				Timestamp:  time.Now(),
 				ToolCallID: tc.ID,
 				ToolName:   tc.Name,
-				ToolArgs:   tc.Arguments,
+				ToolArgs:   string(args),
 				Protocol:   genResp.Protocol,
 			})
 
 			// Telemetry hook: track file access for StateTracker
-			if tc.Name == "write_file" || tc.Name == "edit_file" {
+			if denied == nil && (tc.Name == "write_file" || tc.Name == "edit_file") {
 				var args struct{ Path string }
 				if json.Unmarshal([]byte(tc.Arguments), &args) == nil && args.Path != "" {
 					session.RecordFileAccess(args.Path, "modified")
@@ -922,7 +976,18 @@ func (e *Engine) executeLoop(
 			}
 
 			startTool := time.Now()
-			result := e.registry.Dispatch(ctx, tc.Name, json.RawMessage(tc.Arguments))
+			result := ""
+			if denied != nil {
+				reason := strings.TrimSpace(denied.Reason)
+				if reason == "" {
+					reason = "denied by user"
+				}
+				result = fmt.Sprintf("Tool %s execution denied by user: %s\nexit code: 1", tc.Name, reason)
+			} else if e.registry == nil {
+				result = "Tool error: tool registry is not configured"
+			} else {
+				result = e.registry.Dispatch(ctx, tc.Name, args)
+			}
 			toolDuration := time.Since(startTool)
 			exitCode := parseToolExitCode(result)
 
@@ -932,7 +997,7 @@ func (e *Engine) executeLoop(
 			}
 
 			// Invariant refresh: reload system anchor if durable notes were updated
-			if tc.Name == "save_memory" {
+			if denied == nil && tc.Name == "save_memory" {
 				if refreshedPrompt, err := e.memoryMgr.LoadSystemPrompt(); err == nil {
 					session.ReloadSystemAnchor(refreshedPrompt)
 				}
@@ -969,6 +1034,9 @@ func (e *Engine) executeLoop(
 				Name:       tc.Name,
 				Content:    result,
 			})
+		}
+		if toolAuthorizationErr != nil && len(toolResults) == 0 {
+			return "", toolAuthorizationErr
 		}
 
 		// Atomic turn block commit
@@ -1026,6 +1094,9 @@ func (e *Engine) executeLoop(
 				cancel()
 			}
 			return "", ctx.Err()
+		}
+		if toolAuthorizationErr != nil {
+			return "", toolAuthorizationErr
 		}
 
 		// Watermark check: execute staged micro-pruning or macro-distillation

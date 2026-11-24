@@ -56,7 +56,7 @@ func (f *conversationAPITestDouble) SubmitConversation(params protocol.Conversat
 func (f *conversationAPITestDouble) InterruptTurn(protocol.TurnInterruptParams) (*protocol.TurnInterruptResult, error) {
 	return nil, nil
 }
-func (f *conversationAPITestDouble) RespondConversationPermission(string, string, string, string) error {
+func (f *conversationAPITestDouble) RespondConversationPermissionParams(protocol.PermissionRespondParams) error {
 	return nil
 }
 func (f *conversationAPITestDouble) ConversationEvents() <-chan protocol.SessionEventNotification {
@@ -833,6 +833,75 @@ func TestConversationTUIComposerCompletions(t *testing.T) {
 	model = updated.(*conversationTUI)
 	if got := model.textarea.Value(); got != "notes.md" {
 		t.Fatalf("file completion inserted %q", got)
+	}
+}
+
+func TestConversationTUILoadSyncSkipsEmptyAssistantToolSteps(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	model.loadSync(&protocol.ConversationSyncResult{ConversationID: "conversation-1", Transcript: []protocol.ConversationTranscriptEntry{
+		{Role: "user", Content: "inspect files"},
+		{Role: "assistant", Content: ""},
+		{Role: "assistant", Content: " \n  "},
+		{Role: "assistant", Content: "Found one file."},
+	}})
+	if len(model.blocks) != 2 {
+		t.Fatalf("restored visible block count = %d, want 2: %+v", len(model.blocks), model.blocks)
+	}
+	lines := strings.Join(model.computeVisibleLines(), "\n")
+	if strings.Count(lines, "Buddy") != 1 || !strings.Contains(lines, "Found one file.") {
+		t.Fatalf("restored transcript contains empty assistant rows: %q", lines)
+	}
+}
+
+func TestConversationTUIKeepsStreamingWhileApprovalCardIsOpen(t *testing.T) {
+	model := &conversationTUI{
+		conversation: "conversation-1", state: "running", width: 80, height: 24,
+		textarea: textarea.New(),
+	}
+	updated, _ := model.Update(permissionRequestMsg(protocol.PermissionRequestNotification{
+		ConversationID: "conversation-1", TurnID: "turn-1", RequestID: "request-1", Tool: "bash",
+		Arguments: map[string]any{"command": "go test ./..."},
+	}))
+	model = updated.(*conversationTUI)
+	updated, _ = model.Update(conversationEventMsg(protocol.SessionEventNotification{
+		ConversationID: "conversation-1", TurnID: "turn-1", Type: string(agent.EventTextDelta), Content: "Still working",
+	}))
+	model = updated.(*conversationTUI)
+	if model.pendingApproval == nil || model.approvalModal == nil || model.activeBlockID == "" {
+		t.Fatalf("approval card blocked streaming: approval=%+v activeBlock=%q", model.pendingApproval, model.activeBlockID)
+	}
+}
+
+func TestConversationTUIRoutesPasteToApprovalEditor(t *testing.T) {
+	request := &protocol.PermissionRequestNotification{RequestID: "request-1", Tool: "write_file", Arguments: map[string]any{"path": "old.go"}}
+	model := &conversationTUI{
+		textarea:        textarea.New(),
+		pendingApproval: request,
+		approvalModal:   newApprovalModalState(request.Arguments, 80, 24),
+		conversation:    "conversation-1",
+	}
+	model.textarea.SetValue("draft")
+	updated, _ := model.Update(tea.KeyPressMsg{Text: "4", Code: '4'})
+	model = updated.(*conversationTUI)
+	model.approvalModal.editor.CursorEnd()
+	for range len(model.approvalModal.editor.Value()) {
+		updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+		model = updated.(*conversationTUI)
+	}
+	updated, _ = model.Update(tea.PasteMsg{Content: `{"path":"pasted.go"}`})
+	model = updated.(*conversationTUI)
+	if model.textarea.Value() != "draft" {
+		t.Fatalf("paste changed main composer: %q", model.textarea.Value())
+	}
+	if model.approvalModal.editor.Value() != `{"path":"pasted.go"}` {
+		t.Fatalf("paste did not update approval editor: %q", model.approvalModal.editor.Value())
+	}
+	updated, _ = model.Update(conversationEventMsg{
+		ConversationID: "conversation-1", TurnID: "turn-1", Type: string(agent.EventTextDelta), Content: "stream continues",
+	})
+	model = updated.(*conversationTUI)
+	if !strings.Contains(model.deltaBuffer.String(), "stream continues") {
+		t.Fatalf("editing approval blocked conversation events: %q", model.deltaBuffer.String())
 	}
 }
 
