@@ -185,6 +185,16 @@ func inspectWorkspaceDiff(ctx context.Context, workspace string, state history.S
 		boundDiffResult(result)
 		return result, nil
 	}
+	if len(changes) == 0 {
+		return result, nil
+	}
+	base, err := gitDiffBase(ctx, workspace)
+	if err != nil {
+		result.Warning = "Git diff is unavailable; unable to determine the comparison base"
+		result.OmittedPaths += len(changes)
+		result.Truncated = true
+		return result, nil
+	}
 	for _, change := range changes {
 		if err := ctx.Err(); err != nil {
 			result.Warning = "Git inspection timed out; showing partial results"
@@ -202,7 +212,7 @@ func inspectWorkspaceDiff(ctx context.Context, workspace string, state history.S
 		if !state.BaselineKnown {
 			entry.WasDirtyAtStart = false
 		}
-		data, binary, truncated, diffErr := diffChange(ctx, workspace, change)
+		data, binary, truncated, diffErr := diffChange(ctx, workspace, base, change)
 		if diffErr != nil {
 			entry.AttributionUnknown = true
 			result.Warning = "Some Git changes could not be read safely"
@@ -338,6 +348,15 @@ func gitChanges(ctx context.Context, workspace string) ([]gitChange, int, error)
 	return changes, omitted, nil
 }
 
+func gitDiffBase(ctx context.Context, workspace string) (string, error) {
+	base, err := exec.CommandContext(ctx, "git", "-C", workspace, "rev-parse", "--verify", "--quiet", "HEAD").Output()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		base, err = exec.CommandContext(ctx, "git", "-C", workspace, "hash-object", "-t", "tree", "--stdin").Output()
+	}
+	return strings.TrimSpace(string(base)), err
+}
+
 func safeDiffFile(workspace, path string) (string, os.FileInfo, error) {
 	if filepath.IsAbs(path) || filepath.Clean(path) == ".." || strings.HasPrefix(filepath.Clean(path), ".."+string(filepath.Separator)) {
 		return "", nil, errors.New("path escapes workspace")
@@ -361,7 +380,7 @@ func safeDiffFile(workspace, path string) (string, os.FileInfo, error) {
 	return full, info, nil
 }
 
-func diffChange(ctx context.Context, workspace string, change gitChange) (string, bool, bool, error) {
+func diffChange(ctx context.Context, workspace, base string, change gitChange) (string, bool, bool, error) {
 	path := change.path
 	full, info, err := safeDiffFile(workspace, path)
 	if err != nil {
@@ -400,7 +419,7 @@ func diffChange(ctx context.Context, workspace string, change gitChange) (string
 		return "--- /dev/null\n+++ b/" + path + "\n" + prefixLines(lines, "+") + truncationSuffix(truncated), false, truncated, nil
 	}
 	buf := &cappedBuffer{limit: 256 << 10}
-	args := []string{"-C", workspace, "diff", "--no-ext-diff", "--unified=3", "--find-renames", "HEAD", "--", ":(literal)" + path}
+	args := []string{"-C", workspace, "diff", "--no-ext-diff", "--unified=3", "--find-renames", base, "--", ":(literal)" + path}
 	if change.renameFrom != "" {
 		_, source, err := safeDiffFile(workspace, change.renameFrom)
 		if err != nil {

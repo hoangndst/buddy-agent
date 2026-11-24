@@ -187,6 +187,37 @@ func TestInspectWorkspaceDiffIncludesBothSidesOfStagedRename(t *testing.T) {
 	}
 }
 
+func TestInspectWorkspaceDiffBeforeFirstCommit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	workspace := t.TempDir()
+	if out, err := exec.Command("git", "-C", workspace, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	path := filepath.Join(workspace, "staged.txt")
+	if err := os.WriteFile(path, []byte("staged content\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", workspace, "add", "staged.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v: %s", err, out)
+	}
+	if err := os.WriteFile(path, []byte("staged content\nworktree edit\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := inspectWorkspaceDiff(context.Background(), workspace, history.StateTrackerData{})
+	if err != nil || len(result.Files) != 1 || result.Warning != "" {
+		t.Fatalf("initial repository diff=%+v err=%v", result, err)
+	}
+	file := result.Files[0]
+	if file.Path != "staged.txt" || !strings.Contains(file.Diff, "+staged content\n+worktree edit\n") {
+		t.Fatalf("initial repository diff entry=%+v", file)
+	}
+	if result.Stats != (protocol.DiffStats{FilesChanged: 1, Additions: 2}) {
+		t.Fatalf("initial repository diff stats=%+v", result.Stats)
+	}
+}
+
 func TestInspectWorkspaceDiffBoundsNonGitFallback(t *testing.T) {
 	workspace := t.TempDir()
 	tracker := history.NewStateTracker("task", nil)
@@ -230,7 +261,7 @@ func TestDiffPathTruncatesAtUTF8Boundary(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("界", 100000)), 0600); err != nil {
 		t.Fatal(err)
 	}
-	diff, binary, truncated, err := diffChange(context.Background(), workspace, gitChange{path: "unicode.txt"})
+	diff, binary, truncated, err := diffChange(context.Background(), workspace, "HEAD", gitChange{path: "unicode.txt"})
 	if err != nil || binary || !truncated || !utf8.ValidString(diff) {
 		t.Fatalf("diff=%q binary=%v truncated=%v err=%v", diff[len(diff)-min(20, len(diff)):], binary, truncated, err)
 	}
@@ -270,7 +301,7 @@ func TestGitChangedPathsAndSafeDiffPath(t *testing.T) {
 		t.Fatalf("paths=%q omitted=%d", paths, omitted)
 	}
 	for _, path := range paths {
-		diff, binary, _, err := diffChange(context.Background(), workspace, gitChange{path: path})
+		diff, binary, _, err := diffChange(context.Background(), workspace, "HEAD", gitChange{path: path})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -288,7 +319,7 @@ func TestGitChangedPathsAndSafeDiffPath(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(workspace, "linked")); err != nil {
 		t.Fatal(err)
 	}
-	diff, _, _, err := diffChange(context.Background(), workspace, gitChange{path: "linked"})
+	diff, _, _, err := diffChange(context.Background(), workspace, "HEAD", gitChange{path: "linked"})
 	if err != nil || !strings.Contains(diff, "Symlink omitted") {
 		t.Fatalf("symlink diff=%q err=%v", diff, err)
 	}
