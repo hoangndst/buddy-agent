@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -24,6 +25,7 @@ func newApprovalModalState(args map[string]any, width, height int) *approvalModa
 	editor.SetWidth(max(20, width-10))
 	editor.SetHeight(min(8, max(3, height/4)))
 	editor.Prompt = ""
+	editor.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"), key.WithHelp("shift+enter", "new line"))
 	return &approvalModalState{editor: editor}
 }
 

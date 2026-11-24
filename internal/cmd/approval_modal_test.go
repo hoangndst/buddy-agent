@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -48,5 +49,23 @@ func TestApprovalModalEditsJSONArguments(t *testing.T) {
 	response, done, _ = modal.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter}, request)
 	if done || response != nil || modal.err == "" {
 		t.Fatalf("invalid arguments were accepted: response=%+v done=%t err=%q", response, done, modal.err)
+	}
+}
+
+func TestApprovalModalShiftEnterInsertsNewline(t *testing.T) {
+	request := protocol.PermissionRequestNotification{Tool: "write_file", Arguments: map[string]any{"path": "old.go"}}
+	modal := newApprovalModalState(request.Arguments, 80, 24)
+	modal.handleKey(tea.KeyPressMsg{Text: "4", Code: '4'}, request)
+
+	_, done, _ := modal.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModShift}, request)
+	if done {
+		t.Fatal("Shift+Enter submitted the approval")
+	}
+	if got := modal.editor.Value(); !strings.Contains(got, "\n") {
+		t.Fatalf("Shift+Enter did not insert a newline: %q", got)
+	}
+	response, done, _ := modal.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter}, request)
+	if !done || response == nil || response.Decision != protocol.DecisionAllowOnce {
+		t.Fatalf("normal Enter did not submit approval: response=%+v done=%t", response, done)
 	}
 }
