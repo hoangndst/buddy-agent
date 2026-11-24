@@ -2440,6 +2440,9 @@ func (m *conversationTUI) computeVisibleLines() []string {
 	var visibleLines []string
 	curLine := 0
 	for i, b := range m.blocks {
+		if b.ParentID != "" {
+			continue
+		}
 		blockStart := curLine
 		blockEnd := curLine + lineCounts[i]
 		curLine = blockEnd

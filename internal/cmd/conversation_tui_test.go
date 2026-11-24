@@ -983,6 +983,24 @@ func TestConversationTUILongBlockClipping(t *testing.T) {
 	}
 }
 
+func TestConversationTUIClippedTranscriptSkipsNestedChildRows(t *testing.T) {
+	m := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	m.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: strings.Repeat("older response\n", m.viewportHeight())})
+	m.appendBlock(TranscriptBlock{ID: "parent", Kind: BlockToolActivity, Header: "subagent", Collapsed: true})
+	for range 10 {
+		m.appendBlock(TranscriptBlock{ParentID: "parent", Kind: BlockSubagentActivity, Header: "child activity", Completed: true})
+	}
+	m.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "latest response"})
+	lines := m.computeVisibleLines()
+	if len(lines) != m.viewportHeight() {
+		t.Fatalf("clipped transcript has %d rows, want %d", len(lines), m.viewportHeight())
+	}
+	view := strings.Join(lines, "\n")
+	if !strings.Contains(view, "subagent (10 steps completed)") || !strings.Contains(view, "latest response") {
+		t.Fatalf("clipped transcript lost visible activity: %q", view)
+	}
+}
+
 func TestConversationTUIQuitCommand(t *testing.T) {
 	for _, cmdStr := range []string{"/quit", "/exit"} {
 		model := &conversationTUI{

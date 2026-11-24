@@ -157,13 +157,13 @@ func TestInspectWorkspaceDiffIncludesBothSidesOfStagedRename(t *testing.T) {
 	git("config", "user.name", "Test")
 	git("config", "status.renames", "true")
 	common := strings.Repeat("unchanged common text\n", 5)
-	if err := os.WriteFile(filepath.Join(workspace, "source.txt"), []byte("old line\n"+common), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(workspace, "source.txt"), []byte("---\n"+common), 0600); err != nil {
 		t.Fatal(err)
 	}
 	git("add", "source.txt")
 	git("commit", "-qm", "base")
 	git("mv", "source.txt", "destination.txt")
-	if err := os.WriteFile(filepath.Join(workspace, "destination.txt"), []byte("new line\n"+common), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(workspace, "destination.txt"), []byte("++counter;\n++ value\n"+common), 0600); err != nil {
 		t.Fatal(err)
 	}
 	tracker := history.NewStateTracker("task", nil)
@@ -177,12 +177,12 @@ func TestInspectWorkspaceDiffIncludesBothSidesOfStagedRename(t *testing.T) {
 	if file.Path != "destination.txt" || !file.WasDirtyAtStart || !file.IsBuddyEdit || file.AttributionUnknown {
 		t.Fatalf("rename path and attribution=%+v", file)
 	}
-	for _, want := range []string{"rename from source.txt\n", "rename to destination.txt\n", "-old line\n", "+new line\n"} {
+	for _, want := range []string{"rename from source.txt\n", "rename to destination.txt\n", "----\n", "+++counter;\n", "+++ value\n"} {
 		if !strings.Contains(file.Diff, want) {
 			t.Errorf("rename patch missing %q: %s", want, file.Diff)
 		}
 	}
-	if result.Stats != (protocol.DiffStats{FilesChanged: 1, Deletions: 1, Additions: 1}) {
+	if result.Stats != (protocol.DiffStats{FilesChanged: 1, Deletions: 1, Additions: 2}) {
 		t.Fatalf("rename stats=%+v", result.Stats)
 	}
 }
@@ -230,6 +230,7 @@ func TestInspectWorkspaceDiffUntrackedLineCounts(t *testing.T) {
 	}{
 		{name: "newline terminated", content: "hello\n", patch: "+hello", additions: 1},
 		{name: "blank line at end", content: "hello\n\n", patch: "+hello\n+", additions: 2},
+		{name: "leading plus signs", content: "++counter;\n", patch: "+++counter;", additions: 1},
 		{name: "empty"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -251,6 +252,16 @@ func TestInspectWorkspaceDiffUntrackedLineCounts(t *testing.T) {
 				t.Errorf("untracked diff stats=%+v, want %d additions", result.Stats, tc.additions)
 			}
 		})
+	}
+}
+
+func TestCountDiffStatsDistinguishesHeadersFromIdenticalContent(t *testing.T) {
+	diff := "diff --git a/one b/one\n--- a/one\n+++ b/one\n@@ -1 +1 @@\n--- a/one\n+++ b/one\n" +
+		"diff --git a/two b/two\n--- a/two\n+++ b/two\n@@ -1 +1 @@\n-before\n+after\n"
+	var stats protocol.DiffStats
+	countDiffStats(&stats, diff)
+	if stats.Additions != 2 || stats.Deletions != 2 {
+		t.Fatalf("diff stats=%+v, want two additions and two deletions", stats)
 	}
 }
 

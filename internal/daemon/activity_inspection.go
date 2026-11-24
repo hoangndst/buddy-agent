@@ -476,11 +476,23 @@ func truncationSuffix(truncated bool) string {
 	return ""
 }
 func countDiffStats(stats *protocol.DiffStats, diff string) {
-	for _, line := range strings.Split(diff, "\n") {
-		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+	// Untracked previews start with two file headers and have no hunk header.
+	inHunk := strings.HasPrefix(diff, "--- /dev/null\n")
+	if inHunk {
+		_, diff, _ = strings.Cut(diff, "\n")
+		_, diff, _ = strings.Cut(diff, "\n")
+	}
+	for line := range strings.SplitSeq(diff, "\n") {
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			inHunk = false
+		case strings.HasPrefix(line, "@@ "):
+			inHunk = true
+		case !inHunk:
+			continue
+		case strings.HasPrefix(line, "+"):
 			stats.Additions++
-		}
-		if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+		case strings.HasPrefix(line, "-"):
 			stats.Deletions++
 		}
 	}
