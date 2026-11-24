@@ -1036,14 +1036,16 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, cmd
 		}
-		if m.diffView != nil || m.diffLoading {
+		if m.diffLoading && m.diffView == nil {
+			if msg.String() == "esc" {
+				m.diffLoading = false
+				m.diffRequestGeneration++
+			}
+			return m, nil
+		}
+		if m.diffView != nil {
 			switch msg.String() {
 			case "esc":
-				if m.diffView == nil {
-					m.diffLoading = false
-					m.diffRequestGeneration++
-					return m, nil
-				}
 				if m.diffFileOpen {
 					m.diffFileOpen = false
 					m.diffScroll = 0
@@ -1060,7 +1062,8 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "down", "j":
 				if m.diffFileOpen {
-					m.diffScroll++
+					lastLine := strings.Count(m.diffView.Files[m.diffSelected].Diff, "\n")
+					m.diffScroll = min(lastLine, m.diffScroll+1)
 				} else if m.diffSelected+1 < len(m.diffView.Files) {
 					m.diffSelected++
 				}
@@ -1705,7 +1708,7 @@ func (m *conversationTUI) moveDiffHunk(direction int) {
 				return
 			}
 		}
-		m.diffScroll += max(1, m.height/2)
+		m.diffScroll = min(len(lines)-1, m.diffScroll+max(1, m.height/2))
 		return
 	}
 	for i := m.diffScroll - 1; i >= 0; i-- {

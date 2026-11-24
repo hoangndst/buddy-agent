@@ -269,6 +269,11 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 }
 
 func gitChangedPaths(ctx context.Context, workspace string) ([]string, int, error) {
+	prefixOutput, err := exec.CommandContext(ctx, "git", "-C", workspace, "rev-parse", "--show-prefix").Output()
+	if err != nil {
+		return nil, 0, err
+	}
+	prefix := strings.TrimSuffix(string(prefixOutput), "\n")
 	cmd := exec.CommandContext(ctx, "git", "-C", workspace, "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	buf := &cappedBuffer{limit: 2 << 20}
 	cmd.Stdout = buf
@@ -289,14 +294,17 @@ func gitChangedPaths(ctx context.Context, workspace string) ([]string, int, erro
 		if len(item) < 4 {
 			continue
 		}
-		path := item[3:]
+		if strings.ContainsAny(item[:2], "RC") && i+1 < len(parts) {
+			i++
+		}
+		path, inWorkspace := strings.CutPrefix(item[3:], prefix)
+		if !inWorkspace {
+			continue
+		}
 		if !utf8.ValidString(path) {
 			omitted++
 		} else {
 			paths = append(paths, path)
-		}
-		if strings.ContainsAny(item[:2], "RC") && i+1 < len(parts) {
-			i++
 		}
 	}
 	return paths, omitted, nil

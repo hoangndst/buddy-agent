@@ -89,6 +89,57 @@ func TestInspectWorkspaceDiffAttribution(t *testing.T) {
 	}
 }
 
+func TestInspectWorkspaceDiffFromRepositorySubdirectory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	workspace := filepath.Join(root, "nested", "workspace")
+	if err := os.MkdirAll(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	write := func(path, contents string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(contents+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	inside := filepath.Join(workspace, "tracked.txt")
+	outside := filepath.Join(root, "outside.txt")
+	write(inside, "before")
+	write(outside, "before")
+	git("add", ".")
+	git("commit", "-qm", "base")
+	write(inside, "dirty at start")
+	write(outside, "outside change")
+	paths, omitted, err := gitChangedPaths(context.Background(), workspace)
+	if err != nil || omitted != 0 || len(paths) != 1 || paths[0] != "tracked.txt" {
+		t.Fatalf("workspace baseline paths=%q omitted=%d err=%v", paths, omitted, err)
+	}
+	tracker := history.NewStateTracker("task", nil)
+	tracker.SetInitialDirtyPaths(paths, true)
+	tracker.RecordFileAccess("tracked.txt", "modified")
+	write(inside, "after")
+	result, err := inspectWorkspaceDiff(context.Background(), workspace, tracker.ExportData())
+	if err != nil || len(result.Files) != 1 || result.Warning != "" {
+		t.Fatalf("workspace diff=%+v err=%v", result, err)
+	}
+	file := result.Files[0]
+	if file.Path != "tracked.txt" || !file.WasDirtyAtStart || !file.IsBuddyEdit || file.AttributionUnknown || !strings.Contains(file.Diff, "+after\n") {
+		t.Fatalf("workspace diff entry=%+v", file)
+	}
+}
+
 func TestInspectWorkspaceDiffBoundsNonGitFallback(t *testing.T) {
 	workspace := t.TempDir()
 	tracker := history.NewStateTracker("task", nil)

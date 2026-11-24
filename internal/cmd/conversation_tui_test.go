@@ -758,6 +758,44 @@ func TestConversationTUIDiffNavigationAndDismissal(t *testing.T) {
 	}
 }
 
+func TestConversationTUIIgnoresDiffNavigationWhileLoading(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New()}
+	model.inspectDiff()
+	for _, key := range []tea.KeyPressMsg{
+		{Code: tea.KeyUp}, {Code: 'k', Text: "k"}, {Code: tea.KeyDown}, {Code: 'j', Text: "j"},
+		{Code: tea.KeyEnter}, {Code: tea.KeyPgUp}, {Code: tea.KeyPgDown},
+	} {
+		_, cmd := model.Update(key)
+		if cmd != nil || !model.diffLoading || model.diffSelected != 0 || model.diffFileOpen || model.diffScroll != 0 || model.textarea.Value() != "" {
+			t.Fatalf("%q changed the UI while the diff was loading", key.String())
+		}
+	}
+	generation := model.diffRequestGeneration
+	model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	model.Update(diffInspectMsg{generation: generation, result: &protocol.DiffInspectResult{}})
+	if model.diffLoading || model.diffView != nil {
+		t.Fatal("Escape did not dismiss the pending diff")
+	}
+}
+
+func TestConversationTUIDiffPageUpAfterPageDownAtEnd(t *testing.T) {
+	model := &conversationTUI{height: 24, diffView: &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{
+		{Path: "tiny.go", Diff: "@@ -1 +1 @@\n-a\n+b"},
+	}}}
+	model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	model.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	pageDownOffset := model.diffScroll
+	model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	downOffset := model.diffScroll
+	model.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+	if model.diffScroll != 0 {
+		t.Fatalf("PageUp did not return to the hunk: %d", model.diffScroll)
+	}
+	if pageDownOffset != 2 || downOffset != 2 {
+		t.Fatalf("scrolling exceeded the last line: PageDown=%d Down=%d", pageDownOffset, downOffset)
+	}
+}
+
 func TestActivityIdentityIncludesModelStep(t *testing.T) {
 	one := map[string]any{"activity_id": map[string]any{"turn_id": "turn-1", "step": float64(2), "tool_call_id": "call-1"}}
 	two := map[string]any{"activity_id": map[string]any{"turn_id": "turn-1", "step": float64(3), "tool_call_id": "call-1"}}
