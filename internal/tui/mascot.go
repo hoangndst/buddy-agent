@@ -11,8 +11,10 @@ import (
 type MascotSize uint8
 
 const (
+	// MascotWelcome renders 8 columns by 4 rows for the welcome header.
+	MascotWelcome MascotSize = iota
 	// MascotCompact renders 24 columns by 12 rows.
-	MascotCompact MascotSize = iota
+	MascotCompact
 	// MascotLarge renders 48 columns by 24 rows.
 	MascotLarge
 )
@@ -45,7 +47,7 @@ const mascotPixelGrid = "0000000000000000000000000000000000000000000000000000000
 	"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
 	"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
 
-var mascotPalette = [7]string{"", "#100D0D", "#FFAD65", "#FBF0E5", "#8050BF", "#FA9DA8", "#FFFFFF"}
+var mascotPalette = [7]string{"", "#100D0D", "#FFAD65", "#FBF0E5", "#D97745", "#FA9DA8", "#FFFFFF"}
 
 func buildMascotStyles() [7][7]lipgloss.Style {
 	var styles [7][7]lipgloss.Style
@@ -66,10 +68,13 @@ func buildMascotStyles() [7][7]lipgloss.Style {
 }
 
 // RenderMascot converts the checked-in Buddy SVG raster into ANSI half-block pixels.
-// Compact uses a 24 by 12 cell canvas; Large uses 48 by 24 cells.
+// Welcome uses an 8 by 4 cell canvas, Compact 24 by 12, and Large 48 by 24.
 func RenderMascot(size MascotSize) []string {
 	pixelSize := mascotPixelWidth
-	if size == MascotCompact {
+	switch size {
+	case MascotWelcome:
+		pixelSize = 8
+	case MascotCompact:
 		pixelSize /= 2
 	}
 	cellRows := (pixelSize + 1) / 2

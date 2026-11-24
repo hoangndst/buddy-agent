@@ -1,19 +1,14 @@
 ╭─ Buddy Agent vdev ───────────────────────────────────────────────────────────────────────────────╮
-│ Welcome back!                      │                                                             │
-│                   ███              │                                                             │
-│   ▓█▓█▓█       ██▓▓▓▓█             │ Tips for getting started                                    │
-│  █▓█▓▒█▓██    █▓▓▒▒▒█▓             │ Ask Buddy to explain this project or help with a coding     │
-│  █▓▓▒▒▒▒▓▓██▒▒▓▓▓▒▒▒▓▓█            │ task.                                                       │
-│  █▓▓▒▒▒▒█▓▓▓▓▒▒▓▓█▒▒█▓▀            │ ─────────────────────────────────────────────────────────── │
-│  ▀▓▒▓▒█▓▓▓▓▓▓▒▒▓▓▓▓███             │ What Buddy can do                                           │
-│   ▀▓█▓▓▓██▒▓▓▒▒▒██▓█▓█             │ Explore files, edit code, run tests, and review your        │
-│    █▓▓▓▓▓▓█▓▓░▓▒▓▓▓▒▓▒▓            │ changes.                                                    │
-│    ▒▓▒▒▒▒▒▓▒▓▓▒▒▒▒▒▓▓▓▓            │                                                             │
-│     ▓▒▒▒▒▒▒▒▒▒▒▓▒▒▒▒▓▓▀            │ Useful commands                                             │
-│     ▀▀▀▀▒▓▒▓▒▒▒▒▒▓▒▀               │ /help       Show available commands                         │
-│                                    │ /resume     Continue a previous conversation                │
-│ GPT-5.4                            │ /diff       Review working-tree changes                     │
-│ ~/Developer/buddy-agent            │                                                             │
+│  ▓▓  █▓█                           │ Tips for getting started                                    │
+│  ▓▒▓▓▓▒▓                           │ Ask Buddy to explain this project or help with a coding     │
+│  █▓█▒▓▒▒                           │ task.                                                       │
+│   ▀▓▒▓▓▀                           │ ─────────────────────────────────────────────────────────── │
+│ Welcome back!                      │ What Buddy can do                                           │
+│ GPT-5.4                            │ Explore files, edit code, run tests, and review your        │
+│ ~/Developer/buddy-agent            │ changes.                                                    │
 │ Version dev                        │                                                             │
-│ ● Connected                        │                                                             │
+│ ● Connected                        │ Useful commands                                             │
+│                                    │ /help       Show available commands                         │
+│                                    │ /resume     Continue a previous conversation                │
+│                                    │ /diff       Review working-tree changes                     │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

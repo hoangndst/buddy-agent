@@ -34,25 +34,15 @@ func RenderWelcome(w Welcome) []string {
 		return compactWelcome(width, model, workspace, version, status)
 	}
 
-	size := MascotCompact
-	if width >= 150 && w.Height >= 34 {
-		size = MascotLarge
-	}
-	art := RenderMascot(size)
+	art := RenderMascot(MascotWelcome)
 	leftWidth := min(52, max(34, width/3))
 	rightWidth := width - leftWidth - 7
 	if rightWidth < 24 {
 		return compactWelcome(width, model, workspace, version, status)
 	}
 
-	left := []string{titleStyle.Render("Welcome back!")}
-	if size == MascotLarge {
-		left = append(left, "")
-	}
-	left = append(left, art...)
-	if size == MascotLarge {
-		left = append(left, "")
-	}
+	left := append([]string{}, art...)
+	left = append(left, titleStyle.Render("Welcome back!"))
 	if model != "" {
 		left = append(left, mutedStyle.Render(ansi.Truncate(model, leftWidth, "…")))
 	}
@@ -123,8 +113,6 @@ func accentRule(width int) string {
 
 func padPane(lines []string, width, height int) []string {
 	if len(lines) < height {
-		padding := (height - len(lines)) / 2
-		lines = append(make([]string, padding), lines...)
 		lines = append(lines, make([]string, height-len(lines))...)
 	}
 	for i := range lines {

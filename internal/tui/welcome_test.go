@@ -43,7 +43,7 @@ func TestMascotVariantsAndNoColorFallback(t *testing.T) {
 		size MascotSize
 		rows int
 		cols int
-	}{{MascotCompact, 12, 24}, {MascotLarge, 24, 48}} {
+	}{{MascotWelcome, 4, 8}, {MascotCompact, 12, 24}, {MascotLarge, 24, 48}} {
 		art := RenderMascot(tc.size)
 		if len(art) != tc.rows {
 			t.Fatalf("mascot rows = %d, want %d", len(art), tc.rows)
