@@ -93,22 +93,17 @@ func TestConversationTUIUsesAndRestoresRealPTY(t *testing.T) {
 			if fds[0].Revents&unix.POLLIN == 0 {
 				continue
 			}
-			for {
-				n, readErr := unix.Read(masterFD, buf)
-				if n > 0 {
-					outputMu.Lock()
-					output.Write(buf[:n])
-					outputMu.Unlock()
-				}
-				if readErr != nil {
-					if errors.Is(readErr, unix.EAGAIN) || errors.Is(readErr, unix.EWOULDBLOCK) {
-						break
-					}
-					return
-				}
-				if n == 0 {
-					return
-				}
+			n, readErr := unix.Read(masterFD, buf)
+			if readErr != nil && !errors.Is(readErr, unix.EAGAIN) && !errors.Is(readErr, unix.EWOULDBLOCK) {
+				return
+			}
+			if n > 0 {
+				outputMu.Lock()
+				output.Write(buf[:n])
+				outputMu.Unlock()
+			}
+			if n == 0 && readErr == nil {
+				return
 			}
 		}
 	}()
