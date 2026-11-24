@@ -53,7 +53,7 @@ type conversationTUI struct {
 	activeBlockID          string
 	streamingText          string
 	pendingApproval        *protocol.PermissionRequestNotification
-	approvalModal          *approvalModalState
+	approvalModal          *tui.ApprovalModal
 	queued                 []string
 	steers                 []string
 	textarea               textarea.Model
@@ -584,7 +584,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.resizeComposer()
 		}()
 		if m.approvalModal != nil {
-			m.approvalModal.resize(msg.Width, msg.Height)
+			m.approvalModal.Resize(msg.Width, msg.Height)
 		}
 		m.clearCache()
 		if m.activeBlockID != "" {
@@ -1039,7 +1039,11 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.approvalModal == nil {
 				m.approvalModal = newApprovalModalState(m.pendingApproval.Arguments, m.width, m.height)
 			}
-			response, done, cmd := m.approvalModal.handleKey(msg, *m.pendingApproval)
+			response, done, cmd, err := approvalKeyResult(m.approvalModal, msg, *m.pendingApproval)
+			if err != nil {
+				m.errorText = err.Error()
+				return m, nil
+			}
 			if done {
 				response.RequestID = m.pendingApproval.RequestID
 				response.ConversationID = m.pendingApproval.ConversationID
@@ -1389,10 +1393,8 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.submit(text, persistence.SubmissionQueue)
 		}
 	case tea.PasteMsg:
-		if m.pendingApproval != nil && m.approvalModal != nil && m.approvalModal.editing {
-			var cmd tea.Cmd
-			m.approvalModal.editor, cmd = m.approvalModal.editor.Update(msg)
-			return m, cmd
+		if m.pendingApproval != nil && m.approvalModal != nil && m.approvalModal.Editing() {
+			return m, m.approvalModal.UpdateEditor(msg)
 		}
 	}
 	var cmd tea.Cmd
@@ -1602,7 +1604,7 @@ func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
 		approvalKeys = m.approvalActions(*request)
 		modalHeight := min(max(2, m.height/2), max(2, m.height))
 		if m.approvalModal != nil {
-			approvalView = m.approvalModal.view(*request, m.width, modalHeight)
+			approvalView = m.approvalModal.View(approvalViewRequest(*request), m.width, modalHeight)
 		} else {
 			approvalView = "Resize terminal to decide"
 		}
@@ -1625,7 +1627,7 @@ func (m *conversationTUI) approvalActions(request protocol.PermissionRequestNoti
 	if m.approvalModal == nil {
 		return "Resize terminal to decide"
 	}
-	return m.approvalModal.actionRow(request, max(1, m.width))
+	return m.approvalModal.ActionRow(approvalViewRequest(request), max(1, m.width))
 }
 
 func (m *conversationTUI) completionLines() []string {
@@ -1633,16 +1635,6 @@ func (m *conversationTUI) completionLines() []string {
 		Kind: m.completionKind, Commands: m.commandMatches, Files: m.fileMatches,
 		Cursor: m.completionCursor, Start: m.completionWindowStart(), Rows: m.completionRows(),
 	})
-}
-
-func fitTerminalRows(rows []string, height int) []string {
-	if height <= 0 {
-		return nil
-	}
-	if len(rows) > height {
-		return rows[len(rows)-height:]
-	}
-	return rows
 }
 
 func (m *conversationTUI) renderOutputView(height int) string {
@@ -2214,7 +2206,7 @@ func (m *conversationTUI) viewportOverhead() int {
 		}
 		modalHeight := min(max(2, height/2), max(2, height))
 		if m.approvalModal != nil {
-			return lipgloss.Height(m.approvalModal.view(*m.pendingApproval, width, modalHeight))
+			return lipgloss.Height(m.approvalModal.View(approvalViewRequest(*m.pendingApproval), width, modalHeight))
 		}
 		return 1
 	}
@@ -2230,7 +2222,7 @@ func (m *conversationTUI) viewportOverhead() int {
 		} else {
 			modalHeight := min(max(2, height/2), max(2, height))
 			if m.approvalModal != nil {
-				overhead += lipgloss.Height(m.approvalModal.view(*m.pendingApproval, width, modalHeight))
+				overhead += lipgloss.Height(m.approvalModal.View(approvalViewRequest(*m.pendingApproval), width, modalHeight))
 			} else {
 				overhead++
 			}

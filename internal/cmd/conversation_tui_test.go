@@ -1544,8 +1544,8 @@ func TestConversationTUIRoutesPasteToApprovalEditor(t *testing.T) {
 	model.textarea.SetValue("draft")
 	updated, _ := model.Update(tea.KeyPressMsg{Text: "4", Code: '4'})
 	model = updated.(*conversationTUI)
-	model.approvalModal.editor.CursorEnd()
-	for range len(model.approvalModal.editor.Value()) {
+	model.approvalModal.Editor.CursorEnd()
+	for range len(model.approvalModal.Editor.Value()) {
 		updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
 		model = updated.(*conversationTUI)
 	}
@@ -1554,8 +1554,8 @@ func TestConversationTUIRoutesPasteToApprovalEditor(t *testing.T) {
 	if model.textarea.Value() != "draft" {
 		t.Fatalf("paste changed main composer: %q", model.textarea.Value())
 	}
-	if model.approvalModal.editor.Value() != `{"path":"pasted.go"}` {
-		t.Fatalf("paste did not update approval editor: %q", model.approvalModal.editor.Value())
+	if model.approvalModal.Editor.Value() != `{"path":"pasted.go"}` {
+		t.Fatalf("paste did not update approval editor: %q", model.approvalModal.Editor.Value())
 	}
 	updated, _ = model.Update(conversationEventMsg{
 		ConversationID: "conversation-1", TurnID: "turn-1", Type: string(agent.EventTextDelta), Content: "stream continues",

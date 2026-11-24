@@ -11,6 +11,7 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 - `Transcript` owns canonical blocks, reading offset, rendered-row caching, reflow, and visible-window selection; `TranscriptBlock` and `Activity` are UI-owned values.
 - `RenderMarkdown` converts source Markdown to terminal output, and `WrapLines` wraps rendered terminal text by display-cell width.
 - `RenderMascot` draws compact or large Unicode half-block pixel art from the checked-in SVG palette; `RenderWelcome` adapts the welcome panel to terminal dimensions and color settings.
+- `ApprovalModal` owns approval presentation and argument editing, returning a protocol-neutral choice to the command adapter.
 - `Screen` and `RenderScreen` allocate a fullscreen frame to header, body, and footer regions and apply terminal width clipping.
 - `Header` and `RenderHeader` format the compact and standard workspace/model/branch header.
 - `RenderChoiceList` and `RenderCompletion` draw picker and composer completion rows.
@@ -25,6 +26,7 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 - Screen layout receives rendered strings and dimensions only; it has no workspace, daemon, or runtime dependencies.
 - Transcript bodies retain source Markdown; activity values contain only allowlisted display metadata.
 - The command adapter may map protocol events into transcript blocks, but transcript layout and cache behavior stay in this package.
+- Permission policy and protocol response construction stay in `internal/cmd`.
 
 ## Side Effects
 
