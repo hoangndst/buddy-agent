@@ -24,12 +24,91 @@ type permissionTestConn struct {
 }
 
 type approvalBashRunner struct {
+	mu       sync.Mutex
 	commands []string
 }
 
 func (r *approvalBashRunner) Run(_ context.Context, opts subprocess.ExecutionOptions) (*subprocess.ExecutionResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.commands = append(r.commands, opts.Command)
 	return &subprocess.ExecutionResult{Combined: "ok"}, nil
+}
+
+type childApprovalProvider struct {
+	calls int
+	mu    sync.Mutex
+}
+
+func (*childApprovalProvider) Protocol() string { return "test" }
+
+func (p *childApprovalProvider) Generate(context.Context, provider.GenerateRequest) (*provider.GenerateResponse, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	if p.calls == 1 {
+		return &provider.GenerateResponse{Protocol: "test", ToolCalls: []provider.ToolCall{{
+			ID: "child-bash", Name: "bash", Arguments: `{"command":"touch child-marker"}`,
+		}}}, nil
+	}
+	return &provider.GenerateResponse{Protocol: "test", Content: "finished"}, nil
+}
+
+func TestSubagentToolsUseParentApprovalInterceptor(t *testing.T) {
+	controller := &permissionTestConn{id: "controller", messages: make(chan *protocol.JSONRPCMessage, 2)}
+	worker, cancel := newApprovalLifecycleWorker(controller, time.Second, time.Second)
+	defer cancel()
+	workspace := t.TempDir()
+	runner := &approvalBashRunner{}
+	registry := tools.NewRegistry(1000)
+	registry.Register(tools.NewBashTool(workspace, time.Second, tools.WithRunner(runner)))
+	registry.Register(agent.NewInvokeSubagentTool(agent.SubagentToolConfig{
+		ParentRegistry: registry, Provider: &childApprovalProvider{}, Model: "test", WorkspaceDir: workspace,
+	}))
+	agent.NewEngine(nil, "test", 2, registry, nil, nil, agent.WithToolInterceptor(worker.interceptTool))
+	subagent, ok := registry.Get("invoke_subagent")
+	if !ok {
+		t.Fatal("invoke_subagent was not registered")
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := subagent.Execute(worker.currentTurnCtx, json.RawMessage(`{"task":"make a marker","role":"worker"}`))
+		result <- err
+	}()
+	var request protocol.PermissionRequestNotification
+	select {
+	case message := <-controller.messages:
+		if err := json.Unmarshal(message.Params, &request); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("child bash call bypassed the parent approval interceptor")
+	}
+	if request.TurnID != worker.currentTurn {
+		t.Fatalf("child approval turn ID = %q, want parent turn %q", request.TurnID, worker.currentTurn)
+	}
+	runner.mu.Lock()
+	commandsBeforeDecision := len(runner.commands)
+	runner.mu.Unlock()
+	if commandsBeforeDecision != 0 {
+		t.Fatalf("child command executed before approval: %v", runner.commands)
+	}
+	if err := worker.RespondPermission(controller, protocol.PermissionRespondParams{
+		RequestID: request.RequestID, TurnID: request.TurnID, Decision: protocol.DecisionDeny,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-result:
+	case <-time.After(time.Second):
+		t.Fatal("child did not stop after approval was denied")
+	}
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if len(runner.commands) != 0 {
+		t.Fatalf("denied child command executed: %v", runner.commands)
+	}
 }
 
 func TestConversationWorkerBashApprovalParsesAndCachesExactCommand(t *testing.T) {

@@ -32,7 +32,7 @@ func (e *ToolDeniedError) Error() string { return e.Reason }
 
 // WithToolInterceptor configures human authorization for tool execution.
 func WithToolInterceptor(interceptor ToolInterceptor) EngineOption {
-	return func(e *Engine) { e.toolInterceptor = interceptor }
+	return func(e *Engine) { e.SetToolInterceptor(interceptor) }
 }
 
 // WithMaxContextTokens sets the hard context token ceiling on the engine.
@@ -219,8 +219,17 @@ func (e *Engine) SetConversationBoundaryHook(hook func(context.Context, string, 
 	e.conversationBoundaryHook = hook
 }
 
-// SetToolInterceptor installs the daemon's tool authorization callback.
-func (e *Engine) SetToolInterceptor(interceptor ToolInterceptor) { e.toolInterceptor = interceptor }
+// SetToolInterceptor installs the tool authorization callback on this engine and its subagent tool.
+func (e *Engine) SetToolInterceptor(interceptor ToolInterceptor) {
+	e.toolInterceptor = interceptor
+	if e.registry != nil {
+		if tool, ok := e.registry.Get("invoke_subagent"); ok {
+			if subagent, ok := tool.(*InvokeSubagentTool); ok {
+				subagent.SetToolInterceptor(interceptor)
+			}
+		}
+	}
+}
 
 func (e *Engine) commitAndEmit(commit func() error, events ...Event) error {
 	if e.conversationCommitHook != nil {

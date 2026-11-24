@@ -30,40 +30,41 @@ type InvokeSubagentArgs struct {
 
 // InvokeSubagentTool enables an agent to delegate an isolated sub-task to a child agent.
 type InvokeSubagentTool struct {
-	mu              sync.Mutex
-	depth           int
-	callCount       int
-	maxCalls        int
-	childUsage      persistence.TokenUsage
-	parentSessionID string
-	parentTracker   *history.StateTracker
-	parentRegistry  *tools.Registry
-	provider        provider.ModelProvider
-	model           string
-	workspaceDir    string
-	reasoningEffort string
-	compClient      history.CompletionClient
-	store           persistence.Store
-	eventHandler    EventHandler
-	isLocal         bool
+	mu               sync.Mutex
+	depth            int
+	callCount        int
+	maxCalls         int
+	childUsage       persistence.TokenUsage
+	parentSessionID  string
+	parentTracker    *history.StateTracker
+	parentRegistry   *tools.Registry
+	provider         provider.ModelProvider
+	model            string
+	workspaceDir     string
+	reasoningEffort  string
+	compClient       history.CompletionClient
+	store            persistence.Store
+	eventHandler     EventHandler
+	isLocal          bool
 	maxContextTokens int
+	toolInterceptor  ToolInterceptor
 }
 
 // SubagentToolConfig specifies dependencies required to instantiate InvokeSubagentTool.
 type SubagentToolConfig struct {
-	Depth           int
-	ParentSessionID string
-	ParentTracker   *history.StateTracker
-	ParentRegistry  *tools.Registry
-	Provider        provider.ModelProvider
-	Model           string
-	WorkspaceDir    string
-	ReasoningEffort string
-	CompClient      history.CompletionClient
-	Store           persistence.Store
-	EventHandler    EventHandler
-	MaxCalls        int
-	IsLocal         bool
+	Depth            int
+	ParentSessionID  string
+	ParentTracker    *history.StateTracker
+	ParentRegistry   *tools.Registry
+	Provider         provider.ModelProvider
+	Model            string
+	WorkspaceDir     string
+	ReasoningEffort  string
+	CompClient       history.CompletionClient
+	Store            persistence.Store
+	EventHandler     EventHandler
+	MaxCalls         int
+	IsLocal          bool
 	MaxContextTokens int
 }
 
@@ -74,19 +75,19 @@ func NewInvokeSubagentTool(cfg SubagentToolConfig) *InvokeSubagentTool {
 		maxCalls = DefaultMaxSubagentCalls
 	}
 	return &InvokeSubagentTool{
-		depth:           cfg.Depth,
-		maxCalls:        maxCalls,
-		parentSessionID: cfg.ParentSessionID,
-		parentTracker:   cfg.ParentTracker,
-		parentRegistry:  cfg.ParentRegistry,
-		provider:        cfg.Provider,
-		model:           cfg.Model,
-		workspaceDir:    cfg.WorkspaceDir,
-		reasoningEffort: cfg.ReasoningEffort,
-		compClient:      cfg.CompClient,
-		store:           cfg.Store,
-		eventHandler:    cfg.EventHandler,
-		isLocal:         cfg.IsLocal,
+		depth:            cfg.Depth,
+		maxCalls:         maxCalls,
+		parentSessionID:  cfg.ParentSessionID,
+		parentTracker:    cfg.ParentTracker,
+		parentRegistry:   cfg.ParentRegistry,
+		provider:         cfg.Provider,
+		model:            cfg.Model,
+		workspaceDir:     cfg.WorkspaceDir,
+		reasoningEffort:  cfg.ReasoningEffort,
+		compClient:       cfg.CompClient,
+		store:            cfg.Store,
+		eventHandler:     cfg.EventHandler,
+		isLocal:          cfg.IsLocal,
 		maxContextTokens: cfg.MaxContextTokens,
 	}
 }
@@ -186,6 +187,7 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 	t.callCount++
 	parentSessionID := t.parentSessionID
 	parentTracker := t.parentTracker
+	toolInterceptor := t.toolInterceptor
 	t.mu.Unlock()
 
 	// 3. Parse and validate arguments
@@ -284,6 +286,7 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 		WithReasoningEffort(t.reasoningEffort),
 		WithIsLocal(t.isLocal),
 		WithMaxContextTokens(t.maxContextTokens),
+		WithToolInterceptor(toolInterceptor),
 	)
 
 	// 10. Execute child engine inside panic isolation cushion
@@ -344,6 +347,13 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 	}
 
 	return fmt.Sprintf("Status: success\nRole: %s\nSummary:\n%s", role, summary), nil
+}
+
+// SetToolInterceptor propagates parent-session approval handling into child engines.
+func (t *InvokeSubagentTool) SetToolInterceptor(interceptor ToolInterceptor) {
+	t.mu.Lock()
+	t.toolInterceptor = interceptor
+	t.mu.Unlock()
 }
 
 // buildChildRegistry constructs a filtered tools.Registry based on the assigned role.
