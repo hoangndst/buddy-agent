@@ -12,6 +12,7 @@ import (
 
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
 
@@ -719,8 +720,62 @@ func TestConversationTUIOutputPagerShowsExactByteRange(t *testing.T) {
 		outputPageStarts: []int64{131072},
 		outputPageIndex:  0,
 	}
-	if view := model.renderOutputView(); !strings.Contains(view, "Bytes 131073–131076 of 262144") {
+	if view := model.renderOutputView(24); !strings.Contains(view, "Bytes 131073–131076 of 262144") {
 		t.Fatalf("pager did not show exact byte range: %q", view)
+	}
+}
+
+func TestConversationTUIInspectionNoticesFitViewport(t *testing.T) {
+	files := make([]protocol.DiffFileEntry, 24)
+	for i := range files {
+		files[i] = protocol.DiffFileEntry{Path: fmt.Sprintf("file-%02d.txt", i), Diff: strings.Repeat("+changed line\n", 24), Truncated: true}
+	}
+	files[22].Path = strings.Repeat("long-path/", 12) + "file-22.txt"
+	for _, name := range []string{"output", "narrow output", "diff list", "diff file"} {
+		t.Run(name, func(t *testing.T) {
+			m := &conversationTUI{width: 80, height: 24, conversation: "conversation-1", textarea: textarea.New()}
+			var want []string
+			if name == "output" || name == "narrow output" {
+				if name == "narrow output" {
+					m.width = 35
+					m.errorText = "Could not retrieve a previous output page."
+					want = append(want, m.errorText)
+				}
+				data := strings.Repeat("output line\n", 24)
+				m.outputRef = "output-1"
+				m.outputPage = &protocol.OutputReadResult{Data: data, TotalBytes: int64(len(data)), Truncated: true}
+				want = append(want, "output line", "Output capped", "End of available output", "Esc returns to activity")
+			} else {
+				m.width = 58
+				m.diffView = &protocol.DiffInspectResult{
+					Files: files, Stats: protocol.DiffStats{FilesChanged: len(files)},
+					Warning: "Some Git changes could not be read safely\nCheck the worktree before continuing.", OmittedPaths: 3, Truncated: true,
+				}
+				want = []string{"could not be read safely", "Check the worktree", "3 paths omitted", "Diff output was capped"}
+				if name == "diff file" {
+					m.diffFileOpen = true
+					want = append(want, "+changed line", "Esc file list")
+				} else {
+					m.diffSelected = len(files) - 1
+					want = append(want, "› file-23.txt", "Esc close")
+				}
+			}
+			view := m.View().Content
+			if rows := strings.Count(strings.TrimSuffix(view, "\n"), "\n") + 1; rows > m.height {
+				t.Errorf("inspection uses %d rows for a %d-row terminal", rows, m.height)
+			}
+			for line := range strings.SplitSeq(view, "\n") {
+				if width := ansi.StringWidth(line); width > m.width {
+					t.Errorf("inspection line width %d exceeds terminal width %d: %q", width, m.width, line)
+				}
+			}
+			text := strings.Join(strings.Fields(ansi.Strip(view)), " ")
+			for _, fragment := range want {
+				if !strings.Contains(text, fragment) {
+					t.Errorf("inspection lost %q in %q", fragment, view)
+				}
+			}
+		})
 	}
 }
 
@@ -734,12 +789,12 @@ func TestConversationTUIInspectionPansLongLines(t *testing.T) {
 		{"output", func(m *conversationTUI) string {
 			m.outputRef = "output-1"
 			m.outputPage = &protocol.OutputReadResult{Data: line, TotalBytes: int64(len(line))}
-			return m.renderOutputView()
+			return m.renderOutputView(m.height)
 		}},
 		{"diff", func(m *conversationTUI) string {
 			m.diffView = &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: "file.go", Diff: line}}}
 			m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-			return m.renderDiffView()
+			return m.renderDiffView(m.height)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -850,7 +905,7 @@ func TestConversationTUIEscapesUntrustedTerminalContent(t *testing.T) {
 		t.Fatalf("terminal controls were not removed: %q", clean)
 	}
 	model := &conversationTUI{width: 80, height: 24, diffView: &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: malicious, Diff: malicious}}}}
-	view := model.renderDiffView()
+	view := model.renderDiffView(model.height)
 	if strings.Contains(view, "\x1b]52") || strings.Contains(view, "\x1b[2J") {
 		t.Fatalf("diff view retained terminal control sequences: %q", view)
 	}

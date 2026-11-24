@@ -1518,10 +1518,18 @@ func (m *conversationTUI) View() tea.View {
 			}
 			b.WriteString(marker + choice + "\n")
 		}
-	} else if m.pendingApproval == nil && (m.diffView != nil || m.diffLoading) {
-		b.WriteString(m.renderDiffView())
-	} else if m.pendingApproval == nil && m.outputRef != "" {
-		b.WriteString(m.renderOutputView())
+	} else if m.pendingApproval == nil && (m.diffView != nil || m.diffLoading || m.outputRef != "") {
+		header := wrapTranscriptLines(strings.TrimSuffix(b.String(), "\n"), m.width)
+		// Keep room for the inspection controls when the terminal is short.
+		header = header[:min(len(header), max(0, m.height-1))]
+		rows := m.height - len(header)
+		var inspection string
+		if m.diffView != nil || m.diffLoading {
+			inspection = m.renderDiffView(rows)
+		} else {
+			inspection = m.renderOutputView(rows)
+		}
+		return tea.NewView(strings.Join(append(header, inspection), "\n"))
 	} else {
 		if len(m.blocks) > 0 {
 			lines := m.computeVisibleLines()
@@ -1604,11 +1612,12 @@ func (m *conversationTUI) View() tea.View {
 	return tea.NewView(b.String())
 }
 
-func (m *conversationTUI) renderOutputView() string {
-	var b strings.Builder
-	b.WriteString(uiTitleStyle.Render("Tool output") + "  ·  " + uiMutedStyle.Render(m.outputRef) + "\n")
+func (m *conversationTUI) renderOutputView(height int) string {
+	var header, notices strings.Builder
+	var lines []string
+	header.WriteString(uiTitleStyle.Render("Tool output") + "  ·  " + uiMutedStyle.Render(m.outputRef) + "\n")
 	if m.outputLoading {
-		b.WriteString("Loading output page…\n")
+		header.WriteString("Loading output page…\n")
 	} else if m.outputPage != nil {
 		byteStart := int64(0)
 		if m.outputPageIndex < len(m.outputPageStarts) {
@@ -1619,74 +1628,104 @@ func (m *conversationTUI) renderOutputView() string {
 		if end > byteStart {
 			byteRange = fmt.Sprintf("Bytes %d–%d of %d", byteStart+1, end, m.outputPage.TotalBytes)
 		}
-		b.WriteString(uiMutedStyle.Render(byteRange) + "\n\n")
-		lines := strings.Split(m.outputPage.Data, "\n")
-		lineStart := min(m.outputLineScroll, max(0, len(lines)-1))
-		for _, line := range lines[lineStart:min(len(lines), lineStart+max(1, m.height-8))] {
-			b.WriteString(m.inspectionLine(line) + "\n")
-		}
+		header.WriteString(uiMutedStyle.Render(byteRange) + "\n\n")
+		lines = strings.Split(m.outputPage.Data, "\n")
 		if m.outputPage.Truncated {
-			b.WriteString(errStyle.Render("Output capped at 1 MiB; rerun the command with narrower output.") + "\n")
+			notices.WriteString(errStyle.Render("Output capped at 1 MiB; rerun the command with narrower output.") + "\n")
 		}
 		if !m.outputPage.HasMore {
-			b.WriteString(uiMutedStyle.Render("End of available output\n"))
+			notices.WriteString(uiMutedStyle.Render("End of available output") + "\n")
 		}
 	}
-	b.WriteString("\n" + uiMutedStyle.Render("↑/↓ scroll · ←/→ pan · PageUp/PageDown pages · Esc returns to activity"))
+	top, footer, rows := m.inspectionLayout(height, header.String(), notices.String(), "↑/↓ scroll · ←/→ pan · PageUp/PageDown pages · Esc returns to activity")
+	var b strings.Builder
+	b.WriteString(top)
+	m.writeInspectionLines(&b, lines, m.outputLineScroll, rows)
+	b.WriteString(footer)
 	return b.String()
 }
 
-func (m *conversationTUI) renderDiffView() string {
-	var b strings.Builder
-	b.WriteString(uiTitleStyle.Render("Working tree diff") + "  ·  " + uiMutedStyle.Render("/diff") + "\n")
+func (m *conversationTUI) renderDiffView(height int) string {
+	var header, notices strings.Builder
+	header.WriteString(uiTitleStyle.Render("Working tree diff") + "  ·  " + uiMutedStyle.Render("/diff") + "\n")
+	var files []protocol.DiffFileEntry
+	if m.diffView != nil && !m.diffLoading {
+		files = m.diffView.Files
+	}
 	if m.diffLoading {
-		b.WriteString("Inspecting Git changes…\n")
-		return b.String()
-	}
-	if m.diffView == nil || len(m.diffView.Files) == 0 {
-		b.WriteString("No changed files found.\n")
+		header.WriteString("Inspecting Git changes…\n")
+	} else if len(files) == 0 {
+		header.WriteString("No changed files found.\n")
 	} else if !m.diffFileOpen {
-		b.WriteString(fmt.Sprintf("%d files  ·  +%d  −%d\n\n", m.diffView.Stats.FilesChanged, m.diffView.Stats.Additions, m.diffView.Stats.Deletions))
-		rows := max(1, m.height-8)
-		start := max(0, min(m.diffSelected-rows+1, len(m.diffView.Files)-rows))
-		for i := start; i < min(len(m.diffView.Files), start+rows); i++ {
-			f := m.diffView.Files[i]
-			label := diffAttributionLabel(f)
-			line := fmt.Sprintf("%s %-18s %s", terminalText(f.Path), label, terminalText(diffFileNotice(f)))
-			if i == m.diffSelected {
-				line = "› " + line
-			} else {
-				line = "  " + line
-			}
-			b.WriteString(line + "\n")
-		}
+		header.WriteString(fmt.Sprintf("%d files  ·  +%d  −%d\n\n", m.diffView.Stats.FilesChanged, m.diffView.Stats.Additions, m.diffView.Stats.Deletions))
 	} else {
-		f := m.diffView.Files[m.diffSelected]
-		b.WriteString(terminalText(f.Path) + "  ·  " + diffAttributionLabel(f) + "\n")
-		if diffFileNotice(f) != "" {
-			b.WriteString(uiMutedStyle.Render(terminalText(diffFileNotice(f))) + "\n")
-		}
-		lines := strings.Split(f.Diff, "\n")
-		start := min(m.diffScroll, max(0, len(lines)-1))
-		for _, line := range lines[start:min(len(lines), start+max(1, m.height-8))] {
-			b.WriteString(m.inspectionLine(line) + "\n")
+		f := files[m.diffSelected]
+		header.WriteString(terminalText(f.Path) + "  ·  " + diffAttributionLabel(f) + "\n")
+		if notice := diffFileNotice(f); notice != "" {
+			header.WriteString(uiMutedStyle.Render(notice) + "\n")
 		}
 	}
-	if m.diffView != nil && m.diffView.Warning != "" {
-		b.WriteString(errStyle.Render(terminalText(m.diffView.Warning)) + "\n")
-	}
-	if m.diffView != nil && m.diffView.OmittedPaths > 0 {
-		b.WriteString(uiMutedStyle.Render(fmt.Sprintf("%d paths omitted because they could not be represented or read safely", m.diffView.OmittedPaths)) + "\n")
-	}
-	if m.diffView != nil && m.diffView.Truncated {
-		b.WriteString(errStyle.Render("Diff output was capped to fit the safe response limit.") + "\n")
+	if m.diffView != nil && !m.diffLoading {
+		if m.diffView.Warning != "" {
+			notices.WriteString(errStyle.Render(terminalText(m.diffView.Warning)) + "\n")
+		}
+		if m.diffView.OmittedPaths > 0 {
+			notices.WriteString(uiMutedStyle.Render(fmt.Sprintf("%d paths omitted because they could not be represented or read safely", m.diffView.OmittedPaths)) + "\n")
+		}
+		if m.diffView.Truncated {
+			notices.WriteString(errStyle.Render("Diff output was capped to fit the safe response limit.") + "\n")
+		}
 	}
 	hint := "↑/↓ files · Enter open · Esc close"
-	if m.diffFileOpen {
+	if m.diffLoading {
+		hint = "Esc close"
+	} else if m.diffFileOpen {
 		hint = "↑/↓ scroll · ←/→ pan · PageUp/PageDown hunks · Esc file list"
 	}
-	b.WriteString("\n" + uiMutedStyle.Render(hint))
+	top, footer, rows := m.inspectionLayout(height, header.String(), notices.String(), hint)
+	var b strings.Builder
+	b.WriteString(top)
+	if len(files) > 0 && m.diffFileOpen {
+		m.writeInspectionLines(&b, strings.Split(files[m.diffSelected].Diff, "\n"), m.diffScroll, rows)
+	} else if len(files) > 0 {
+		start := max(0, min(m.diffSelected-rows+1, len(files)-rows))
+		for i := start; i < min(len(files), start+rows); i++ {
+			f := files[i]
+			marker := "  "
+			if i == m.diffSelected {
+				marker = "› "
+			}
+			path := strings.ReplaceAll(f.Path, "\n", " ")
+			line := fmt.Sprintf("%s%s %-18s %s", marker, inspectionText(path), diffAttributionLabel(f), diffFileNotice(f))
+			b.WriteString(ansi.Truncate(line, max(1, m.width), "…") + "\n")
+		}
+	}
+	b.WriteString(footer)
 	return b.String()
+}
+
+func (m *conversationTUI) inspectionLayout(height int, header, notices, hint string) (string, string, int) {
+	if m.errorText != "" {
+		notices += errStyle.Render(terminalText(m.errorText)) + "\n"
+	}
+	controls := wrapTranscriptLines(uiMutedStyle.Render(hint), m.width)
+	if len(controls) > height {
+		controls = wrapTranscriptLines(uiMutedStyle.Render("Esc close"), m.width)
+	}
+	controls = controls[:min(len(controls), max(0, height))]
+	headerRows := wrapTranscriptLines(strings.TrimSuffix(header, "\n"), m.width)
+	headerRows = headerRows[:min(len(headerRows), max(0, height-len(controls)))]
+	noticeRows := wrapTranscriptLines(notices, m.width)
+	noticeRows = noticeRows[:min(len(noticeRows), max(0, height-len(controls)-len(headerRows)))]
+	rows := max(0, height-len(headerRows)-len(noticeRows)-len(controls))
+	return strings.Join(append(headerRows, ""), "\n"), strings.Join(append(noticeRows, controls...), "\n"), rows
+}
+
+func (m *conversationTUI) writeInspectionLines(b *strings.Builder, lines []string, offset, rows int) {
+	start := min(offset, max(0, len(lines)-1))
+	for _, line := range lines[start:min(len(lines), start+rows)] {
+		b.WriteString(m.inspectionLine(line) + "\n")
+	}
 }
 
 func inspectionText(line string) string {
