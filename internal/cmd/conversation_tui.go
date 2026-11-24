@@ -1546,28 +1546,10 @@ func (m *conversationTUI) View() tea.View {
 }
 
 func (m *conversationTUI) headerLines(standard bool) []string {
-	workspace := terminalText(m.workspace)
-	if workspace == "" {
-		workspace = "workspace"
-	}
-	title := uiTitleStyle.Render("Buddy Agent")
-	if !standard {
-		state := m.state
-		if state == "" {
-			state = "idle"
-		}
-		prefix := title + uiMutedStyle.Render(" · "+state+" · ")
-		pathWidth := max(1, m.width-lipgloss.Width(prefix))
-		return []string{prefix + uiMutedStyle.Render(ansi.Truncate(workspace, pathWidth, "…"))}
-	}
-	metadata := []string{workspace}
-	if model := strings.TrimSpace(m.startParams.Model); model != "" {
-		metadata = append([]string{model}, metadata...)
-	}
-	if m.gitBranch != "" {
-		metadata = append(metadata, m.gitBranch)
-	}
-	return []string{title, uiMutedStyle.Render(ansi.Truncate(strings.Join(metadata, " · "), max(1, m.width), "…"))}
+	return tui.RenderHeader(tui.Header{
+		Width: m.width, Model: terminalText(m.startParams.Model), Workspace: terminalText(m.workspace),
+		GitBranch: terminalText(m.gitBranch), State: terminalText(m.state), Standard: standard,
+	})
 }
 
 func (m *conversationTUI) renderChooser(height int) []string {
