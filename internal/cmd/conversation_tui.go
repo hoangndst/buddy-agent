@@ -1364,25 +1364,20 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			if text == "/clear" {
+				var retained []TranscriptBlock
 				if m.activeBlockID != "" {
-					var activeBlock *TranscriptBlock
 					for _, block := range m.transcript.Blocks {
 						if block.ID == m.activeBlockID {
-							activeBlock = &block
+							retained = append(retained, block)
 							break
 						}
 					}
-					m.transcript.Blocks = nil
-					if activeBlock != nil {
-						m.transcript.Blocks = append(m.transcript.Blocks, *activeBlock)
-					} else {
+					if len(retained) == 0 {
 						m.activeBlockID = ""
 					}
-				} else {
-					m.transcript.Blocks = nil
 				}
+				m.transcript.Replace(retained)
 				m.transcript.ScrollOffset = 0
-				m.clearCache()
 				return m, nil
 			}
 			if strings.HasPrefix(text, "/steer ") {
@@ -2124,8 +2119,7 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 		m.textarea.Focus()
 	}
 	m.lastSequence = result.EventWatermark
-	m.transcript.Blocks = m.transcript.Blocks[:0]
-	m.clearCache()
+	restoredBlocks := make([]TranscriptBlock, 0, len(result.Transcript))
 	m.queued, m.steers = nil, nil
 	if result.OutputIncomplete {
 		m.errorText = "Some transient output is unavailable; restored from durable conversation history."
@@ -2137,14 +2131,14 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			lastEntry[entry.TurnID] = i
 		}
 	}
-	// Append durable blocks directly to preserve the reading offset.
+	// Replace the canonical blocks together so recovery keeps the reading offset.
 	for i, entry := range result.Transcript {
 		last, hasActivities := lastEntry[entry.TurnID]
 		if hasActivities && last == i && entry.Role == "assistant" {
-			m.transcript.Blocks = append(m.transcript.Blocks, activitiesByTurn[entry.TurnID]...)
+			restoredBlocks = append(restoredBlocks, activitiesByTurn[entry.TurnID]...)
 		}
 		if entry.Role == "user" {
-			m.transcript.Blocks = append(m.transcript.Blocks, TranscriptBlock{
+			restoredBlocks = append(restoredBlocks, TranscriptBlock{
 				ID:        newConversationID("block"),
 				TurnID:    entry.TurnID,
 				Kind:      BlockUserMessage,
@@ -2164,7 +2158,7 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			if strings.TrimSpace(entry.Content) == "" {
 				continue
 			}
-			m.transcript.Blocks = append(m.transcript.Blocks, TranscriptBlock{
+			restoredBlocks = append(restoredBlocks, TranscriptBlock{
 				ID:        newConversationID("block"),
 				TurnID:    entry.TurnID,
 				Kind:      BlockAssistantMessage,
@@ -2175,14 +2169,15 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			})
 		}
 		if hasActivities && last == i && entry.Role != "assistant" {
-			m.transcript.Blocks = append(m.transcript.Blocks, activitiesByTurn[entry.TurnID]...)
+			restoredBlocks = append(restoredBlocks, activitiesByTurn[entry.TurnID]...)
 		}
 	}
 	for _, turnID := range activityTurns {
 		if _, found := lastEntry[turnID]; !found {
-			m.transcript.Blocks = append(m.transcript.Blocks, activitiesByTurn[turnID]...)
+			restoredBlocks = append(restoredBlocks, activitiesByTurn[turnID]...)
 		}
 	}
+	m.transcript.Replace(restoredBlocks)
 }
 
 func (m *conversationTUI) renderTextarea() string {

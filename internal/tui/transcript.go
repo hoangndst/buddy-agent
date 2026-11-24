@@ -31,6 +31,12 @@ func (t *Transcript) ClearCache() {
 	t.wrapCache = make(map[string][]string)
 }
 
+// Replace installs a recovered or cleared transcript without moving the reading offset.
+func (t *Transcript) Replace(blocks []TranscriptBlock) {
+	t.Blocks = append(t.Blocks[:0], blocks...)
+	t.ClearCache()
+}
+
 // Invalidate removes cached output for a block and all measured widths.
 func (t *Transcript) Invalidate(blockID string) {
 	for key := range t.lineCountCache {

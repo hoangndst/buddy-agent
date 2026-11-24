@@ -19,6 +19,9 @@ func TestTranscriptVisibleWindowCachesAndAnchors(t *testing.T) {
 	if len(transcript.wrapCache) >= len(transcript.Blocks) {
 		t.Fatalf("cached %d wrapped blocks for %d transcript blocks", len(transcript.wrapCache), len(transcript.Blocks))
 	}
+	if len(transcript.lineCountCache) > 8 {
+		t.Fatalf("measured %d blocks for an 8-row viewport", len(transcript.lineCountCache))
+	}
 
 	transcript.ScrollOffset = 5
 	before = strings.Join(transcript.VisibleLines(8, 80), "\n")
@@ -26,5 +29,11 @@ func TestTranscriptVisibleWindowCachesAndAnchors(t *testing.T) {
 	after := strings.Join(transcript.VisibleLines(8, 80), "\n")
 	if before != after {
 		t.Fatalf("appending moved the inspected history\nbefore: %q\nafter: %q", before, after)
+	}
+
+	transcript.ScrollOffset = 7
+	transcript.Replace([]TranscriptBlock{{ID: "recovered", Kind: BlockAssistantMessage, Body: "Recovered response"}})
+	if transcript.ScrollOffset != 7 || len(transcript.Blocks) != 1 || transcript.Blocks[0].ID != "recovered" {
+		t.Fatalf("replace changed reading position or failed to install blocks: offset=%d blocks=%+v", transcript.ScrollOffset, transcript.Blocks)
 	}
 }
