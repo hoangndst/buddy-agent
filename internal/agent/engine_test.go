@@ -1310,6 +1310,7 @@ func TestEngine_SessionIDOverride(t *testing.T) {
 	lastRes := eng.LastExecutionResult()
 	if lastRes == nil {
 		t.Fatal("expected LastExecutionResult to be non-nil")
+		return
 	}
 	if lastRes.SessionID != "sess_override_1234" {
 		t.Errorf("expected session ID 'sess_override_1234', got %q", lastRes.SessionID)
