@@ -32,7 +32,17 @@ func TestRenderActivityGolden(t *testing.T) {
 func TestRenderBlockCleansTerminalControls(t *testing.T) {
 	block := TranscriptBlock{Kind: BlockAssistantMessage, Body: "safe\x1b[2J text"}
 	got, _ := RenderBlock(block, nil, 80, "", "", false)
-	if strings.Contains(ansi.Strip(got), "\x1b[2J") {
+	if strings.Contains(got, "\x1b[2J") {
 		t.Fatalf("transcript retained terminal control sequence: %q", got)
+	}
+}
+
+func TestRenderBlockCleansMarkdownFallback(t *testing.T) {
+	t.Setenv("GLAMOUR_STYLE", "invalid-style")
+	block := TranscriptBlock{Kind: BlockAssistantMessage, Body: "safe\x1b[2J text\x07\n\tnext\x00 line"}
+	got, _ := RenderBlock(block, nil, 80, "", "", false)
+	_, body, _ := strings.Cut(got, "\n")
+	if want := "safe text\n\tnext line"; body != want {
+		t.Fatalf("fallback body = %q, want %q", body, want)
 	}
 }

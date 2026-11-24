@@ -41,7 +41,8 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 			}
 			content = buddyStyle.Render(cleanText(header)) + "\n" + mutedStyle.Render("Working…")
 		} else {
-			if rendered, err := RenderMarkdown(cleanText(body), max(1, width-4)); err == nil {
+			body = cleanText(body)
+			if rendered, err := RenderMarkdown(body, max(1, width-4)); err == nil {
 				body = rendered
 			}
 			content = buddyStyle.Render(cleanText(header)) + "\n" + body
