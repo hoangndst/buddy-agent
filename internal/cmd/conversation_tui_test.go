@@ -608,6 +608,7 @@ func TestConversationTUIMarkdownTableRenderingKeepsSource(t *testing.T) {
 	}
 
 	rendered, _ := model.renderBlock(block, 80)
+	rendered = ansi.Strip(rendered)
 	if !strings.Contains(rendered, "Row 1") || !strings.Contains(rendered, "Row 250") {
 		t.Fatalf("rendered Markdown table should retain all rows: %s", rendered)
 	}
@@ -1150,7 +1151,7 @@ func TestConversationTUILongBlockClipping(t *testing.T) {
 	if len(linesBottom) >= 100 {
 		t.Fatalf("visible lines should be clipped to viewport height, got %d", len(linesBottom))
 	}
-	bottomText := strings.Join(linesBottom, "\n")
+	bottomText := ansi.Strip(strings.Join(linesBottom, "\n"))
 	if !strings.Contains(bottomText, "Response line 100") {
 		t.Fatalf("bottom view missing last response line: %s", bottomText)
 	}
@@ -1161,7 +1162,7 @@ func TestConversationTUILongBlockClipping(t *testing.T) {
 	// Scroll up
 	model.scrollOffset = 1000 // clamped to top
 	linesTop := model.computeVisibleLines()
-	topText := strings.Join(linesTop, "\n")
+	topText := ansi.Strip(strings.Join(linesTop, "\n"))
 	if !strings.Contains(topText, "Response line 1") {
 		t.Fatalf("top view missing first response line: %s", topText)
 	}
@@ -1182,7 +1183,7 @@ func TestConversationTUIClippedTranscriptSkipsNestedChildRows(t *testing.T) {
 	if len(lines) > m.viewportHeight() {
 		t.Fatalf("clipped transcript has %d rows, viewport allows %d", len(lines), m.viewportHeight())
 	}
-	view := strings.Join(lines, "\n")
+	view := ansi.Strip(strings.Join(lines, "\n"))
 	if !strings.Contains(view, "subagent (10 steps completed)") || !strings.Contains(view, "latest response") {
 		t.Fatalf("clipped transcript lost visible activity: %q", view)
 	}
@@ -1461,7 +1462,7 @@ func TestConversationTUILoadSyncSkipsEmptyAssistantToolSteps(t *testing.T) {
 	if len(model.blocks) != 2 {
 		t.Fatalf("restored visible block count = %d, want 2: %+v", len(model.blocks), model.blocks)
 	}
-	lines := strings.Join(model.computeVisibleLines(), "\n")
+	lines := ansi.Strip(strings.Join(model.computeVisibleLines(), "\n"))
 	if strings.Count(lines, "Buddy") != 1 || !strings.Contains(lines, "Found one file.") {
 		t.Fatalf("restored transcript contains empty assistant rows: %q", lines)
 	}

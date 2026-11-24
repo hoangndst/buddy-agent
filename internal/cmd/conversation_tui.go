@@ -1557,19 +1557,7 @@ func (m *conversationTUI) renderChooser(height int) []string {
 	if m.choosing == "conversation" {
 		label = "Choose a conversation"
 	}
-	lines := []string{uiTitleStyle.Render(label)}
-	if height <= 1 {
-		return lines
-	}
-	start := max(0, min(m.cursor-height+2, len(m.choices)-height+1))
-	for i := start; i < min(len(m.choices), start+height-1); i++ {
-		marker := "  "
-		if i == m.cursor {
-			marker = "› "
-		}
-		lines = append(lines, marker+terminalText(m.choices[i]))
-	}
-	return lines
+	return tui.RenderChoiceList(tui.ChoiceList{Label: label, Items: m.choices, Cursor: m.cursor, Height: height})
 }
 
 func (m *conversationTUI) conversationLines(available int) []string {
@@ -1680,26 +1668,10 @@ func (m *conversationTUI) approvalActions(request protocol.PermissionRequestNoti
 }
 
 func (m *conversationTUI) completionLines() []string {
-	var rows []string
-	start, end := m.completionWindowStart(), m.completionWindowStart()+m.completionRows()
-	if m.completionKind == "command" {
-		for i := start; i < min(end, len(m.commandMatches)); i++ {
-			marker := "  "
-			if i == m.completionCursor {
-				marker = "› "
-			}
-			rows = append(rows, marker+m.commandMatches[i].Name+"  "+uiMutedStyle.Render(m.commandMatches[i].Description+" "+m.commandMatches[i].ArgsHint))
-		}
-	} else {
-		for i := start; i < min(end, len(m.fileMatches)); i++ {
-			marker := "  "
-			if i == m.completionCursor {
-				marker = "› "
-			}
-			rows = append(rows, marker+m.fileMatches[i])
-		}
-	}
-	return rows
+	return tui.RenderCompletion(tui.CompletionView{
+		Kind: m.completionKind, Commands: m.commandMatches, Files: m.fileMatches,
+		Cursor: m.completionCursor, Start: m.completionWindowStart(), Rows: m.completionRows(),
+	})
 }
 
 func fitTerminalRows(rows []string, height int) []string {

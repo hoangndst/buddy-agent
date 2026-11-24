@@ -11,6 +11,7 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 - `TranscriptBlock` and `Activity` are UI-owned transcript values; `RenderMarkdown` converts source Markdown to terminal output.
 - `Screen` and `RenderScreen` allocate a fullscreen frame to header, body, and footer regions and apply terminal width clipping.
 - `Header` and `RenderHeader` format the compact and standard workspace/model/branch header.
+- `RenderChoiceList` and `RenderCompletion` draw picker and composer completion rows.
 - `FormatWorkspaceFileHyperlink` formats a workspace path for terminal display.
 - `StripHyperlinks` removes OSC 8 links from terminal text.
 
