@@ -42,6 +42,7 @@ type conversationTUI struct {
 	databasePath           string
 	standalone             bool
 	state                  string
+	workerEpoch            string
 	lastSequence           uint64
 	scrollOffset           int
 	transcript             []string
@@ -184,8 +185,9 @@ type conversationResumedMsg struct {
 	err             error
 }
 type conversationSyncMsg struct {
-	result *protocol.ConversationSyncResult
-	err    error
+	result          *protocol.ConversationSyncResult
+	fromWorkerEpoch string
+	err             error
 }
 type outputPageMsg struct {
 	ref    string
@@ -671,7 +673,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.syncConversation()
 	case conversationEventMsg:
-		if msg.ConversationID != m.conversation {
+		if msg.ConversationID != m.conversation || (msg.WorkerEpoch != "" && m.workerEpoch != "" && msg.WorkerEpoch != m.workerEpoch) {
 			return m, m.watchEvent()
 		}
 		if msg.Sequence > 0 && msg.Sequence <= m.lastSequence {
@@ -995,26 +997,34 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadSync(msg.result)
 		return m, tea.Batch(m.watchEvent(), m.watchPermission())
 	case conversationSyncMsg:
+		if msg.fromWorkerEpoch != "" && msg.fromWorkerEpoch != m.workerEpoch {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
 		} else {
+			if msg.result != nil && msg.result.ConversationID != m.conversation {
+				return m, nil
+			}
 			m.loadSync(msg.result)
 			return m, m.watchEvent()
 		}
 	case outputPageMsg:
+		if m.outputRef == "" || msg.ref != m.outputRef {
+			return m, nil
+		}
 		m.outputLoading = false
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
 			return m, nil
 		}
-		if msg.ref == m.outputRef {
-			if indexInt64(m.outputPageStarts, msg.start) != m.outputPageIndex {
-				m.outputLineScroll = 0
-				m.inspectionColumn = 0
-			}
-			m.outputPage = msg.result
-			m.outputPageIndex = indexInt64(m.outputPageStarts, msg.start)
+		pageIndex := indexInt64(m.outputPageStarts, msg.start)
+		if pageIndex != m.outputPageIndex {
+			m.outputLineScroll = 0
+			m.inspectionColumn = 0
 		}
+		m.outputPage = msg.result
+		m.outputPageIndex = pageIndex
 		return m, nil
 	case diffInspectMsg:
 		if msg.generation != m.diffRequestGeneration {
@@ -1995,10 +2005,10 @@ func (m *conversationTUI) respondPermission(params protocol.PermissionRespondPar
 }
 
 func (m *conversationTUI) syncConversation() tea.Cmd {
-	id := m.conversation
+	id, epoch := m.conversation, m.workerEpoch
 	return func() tea.Msg {
 		result, err := readConversationSnapshot(m.client, id)
-		return conversationSyncMsg{result: result, err: err}
+		return conversationSyncMsg{result: result, fromWorkerEpoch: epoch, err: err}
 	}
 }
 
@@ -2012,7 +2022,23 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	if result == nil {
 		return
 	}
+	activitiesByTurn := make(map[string][]TranscriptBlock)
+	var activityTurns []string
+	if m.conversation == result.ConversationID && m.workerEpoch == result.WorkerEpoch {
+		for _, block := range m.blocks {
+			if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity {
+				continue
+			}
+			if len(activitiesByTurn[block.TurnID]) == 0 {
+				activityTurns = append(activityTurns, block.TurnID)
+			}
+			activitiesByTurn[block.TurnID] = append(activitiesByTurn[block.TurnID], block)
+		}
+	} else {
+		m.selectedActivity, m.outputRef, m.outputPage, m.outputLoading = "", "", nil, false
+	}
 	m.conversation, m.state = result.ConversationID, result.State
+	m.workerEpoch = result.WorkerEpoch
 	if result.ExecutionBlocked != "" {
 		m.errorText = "Execution is paused: " + result.ExecutionBlocked
 	} else if strings.HasPrefix(m.errorText, "Execution is paused: ") {
@@ -2031,7 +2057,18 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	if result.OutputIncomplete {
 		m.errorText = "Some transient output is unavailable; restored from durable conversation history."
 	}
-	for _, entry := range result.Transcript {
+	// Keep transient activity groups next to their turn's last durable entry.
+	lastEntry := make(map[string]int, len(activitiesByTurn))
+	for i, entry := range result.Transcript {
+		if entry.TurnID != "" && len(activitiesByTurn[entry.TurnID]) > 0 {
+			lastEntry[entry.TurnID] = i
+		}
+	}
+	for i, entry := range result.Transcript {
+		last, hasActivities := lastEntry[entry.TurnID]
+		if hasActivities && last == i && entry.Role == "assistant" {
+			m.blocks = append(m.blocks, activitiesByTurn[entry.TurnID]...)
+		}
 		if entry.Role == "user" {
 			m.appendBlock(TranscriptBlock{
 				ID:        newConversationID("block"),
@@ -2064,6 +2101,14 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 				CreatedAt: time.Now(),
 			})
 			m.transcript = append(m.transcript, uiBuddyStyle.Render("Buddy")+"\n"+entry.Content)
+		}
+		if hasActivities && last == i && entry.Role != "assistant" {
+			m.blocks = append(m.blocks, activitiesByTurn[entry.TurnID]...)
+		}
+	}
+	for _, turnID := range activityTurns {
+		if _, found := lastEntry[turnID]; !found {
+			m.blocks = append(m.blocks, activitiesByTurn[turnID]...)
 		}
 	}
 }

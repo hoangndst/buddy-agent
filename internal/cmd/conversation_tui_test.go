@@ -28,6 +28,7 @@ type conversationAPITestDouble struct {
 	events      chan protocol.SessionEventNotification
 	outputReads []protocol.OutputReadParams
 	diffResult  *protocol.DiffInspectResult
+	syncResult  *protocol.ConversationSyncResult
 }
 
 func (f *conversationAPITestDouble) Capabilities() (*protocol.DaemonCapabilitiesResult, error) {
@@ -44,6 +45,9 @@ func (f *conversationAPITestDouble) ResumeConversation(protocol.ConversationResu
 	return nil, errors.New("unexpected resume")
 }
 func (f *conversationAPITestDouble) SyncConversation(protocol.ConversationSyncParams) (*protocol.ConversationSyncResult, error) {
+	if f.syncResult != nil {
+		return f.syncResult, nil
+	}
 	return &protocol.ConversationSyncResult{}, nil
 }
 func (f *conversationAPITestDouble) ListConversationWorkspaces(int) (*protocol.ConversationListWorkspacesResult, error) {
@@ -711,6 +715,70 @@ func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
 	model = updated.(*conversationTUI)
 	if model.textarea.Value() != " " {
 		t.Fatalf("Space did not remain composer input: %q", model.textarea.Value())
+	}
+}
+
+func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
+	firstPrompt := protocol.ConversationTranscriptEntry{Role: "user", TurnID: "turn-1", Content: "first prompt"}
+	answer := protocol.ConversationTranscriptEntry{Role: "assistant", TurnID: "turn-1", Content: "first answer"}
+	api := &conversationAPITestDouble{submissions: make(chan protocol.ConversationSubmitParams, 1)}
+	m := &conversationTUI{client: api, textarea: textarea.New(), width: 80, height: 24}
+	m.loadSync(&protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", Transcript: []protocol.ConversationTranscriptEntry{firstPrompt}})
+	activity := map[string]any{"turn_id": "turn-1", "step": float64(1), "tool_call_id": "call-1"}
+	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 1, Type: string(agent.EventToolCall),
+		Data: map[string]any{"tool_name": "bash", "activity_id": activity}})
+	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 2, Type: string(agent.EventToolResult), Content: "preview",
+		Data: map[string]any{"tool_name": "bash", "activity_id": activity, "output_ref": "out-1"}})
+	activityID := m.blocks[1].ID
+	openOutput := func(stage string, wantBlocks int) {
+		t.Helper()
+		if len(m.blocks) != wantBlocks || m.blocks[1].ID != activityID || !m.blocks[1].Completed || m.blocks[2].Body != "first answer" {
+			t.Fatalf("%s sync did not reconcile the activity with its originating turn: %+v", stage, m.blocks)
+		}
+		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+		_, open := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+		if m.selectedActivity != activityID || open == nil {
+			t.Fatalf("%s sync lost the selectable output activity", stage)
+		}
+		m.Update(open())
+		if m.outputRef != "out-1" || m.outputPage == nil || m.outputPage.Data != "page" {
+			t.Fatalf("%s sync did not preserve the output pager: ref=%q page=%+v", stage, m.outputRef, m.outputPage)
+		}
+		m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	}
+	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 3,
+		Transcript: []protocol.ConversationTranscriptEntry{firstPrompt, answer}}
+	_, sync := m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 3, Type: string(agent.EventFinished)})
+	m.Update(sync())
+	openOutput("completion", 3)
+
+	nextPrompt := protocol.ConversationTranscriptEntry{Role: "user", TurnID: "turn-2", Content: "second prompt"}
+	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 4,
+		Transcript: []protocol.ConversationTranscriptEntry{firstPrompt, answer, nextPrompt}}
+	_, sync = m.Update(m.submit(nextPrompt.Content, persistence.SubmissionQueue)())
+	m.Update(sync())
+	openOutput("next prompt", 4)
+}
+
+func TestConversationTUIDropsOutputWhenConversationOrWorkerChanges(t *testing.T) {
+	for _, next := range []protocol.ConversationSyncResult{
+		{ConversationID: "conv-1", WorkerEpoch: "worker-2"},
+		{ConversationID: "conv-2", WorkerEpoch: "worker-1"},
+	} {
+		old := &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1"}
+		m := &conversationTUI{client: &conversationAPITestDouble{syncResult: old}}
+		m.loadSync(old)
+		m.appendBlock(TranscriptBlock{ID: "activity", Kind: BlockToolActivity, Data: map[string]any{"output_ref": "old-ref"}})
+		m.selectedActivity, m.outputRef, m.outputLoading = "activity", "old-ref", true
+		lateSync := m.syncConversation()
+		m.loadSync(&next)
+		m.Update(lateSync())
+		m.Update(outputPageMsg{ref: "old-ref", err: errors.New("stale output error")})
+		if m.conversation != next.ConversationID || m.workerEpoch != next.WorkerEpoch || len(m.blocks) != 0 ||
+			m.selectedActivity != "" || m.outputRef != "" || m.outputLoading || m.errorText != "" {
+			t.Fatalf("old output state leaked after switching to %s/%s", next.ConversationID, next.WorkerEpoch)
+		}
 	}
 }
 
