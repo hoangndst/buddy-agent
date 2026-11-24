@@ -1510,50 +1510,39 @@ func (m *conversationTUI) View() tea.View {
 	width, height := max(1, m.width), max(1, m.height)
 	emergency := width < 40 || height < 12
 	standard := width >= 80 && height >= 24
-	var rows []string
+	var header, body, footer []string
 	if !emergency {
-		rows = append(rows, m.headerLines(standard)...)
+		header = m.headerLines(standard)
 	}
 	if m.choosing != "" && m.pendingApproval == nil {
 		footerRows := 0
 		if !emergency {
 			footerRows = 1
 		}
-		rows = append(rows, m.renderChooser(height-len(rows)-footerRows)...)
+		body = m.renderChooser(height - len(header) - footerRows)
 		if footerRows == 1 {
-			rows = append(rows, uiMutedStyle.Render("↑/↓ select · Enter choose · Esc back"))
+			footer = []string{uiMutedStyle.Render("↑/↓ select · Enter choose · Esc back")}
 		}
 	} else if m.pendingApproval == nil && (m.diffView != nil || m.diffLoading || m.outputRef != "") {
-		available := max(0, height-len(rows))
+		available := max(0, height-len(header))
 		inspection := m.renderDiffView(available)
 		if m.diffView == nil && !m.diffLoading {
 			inspection = m.renderOutputView(available)
 		}
-		rows = append(rows, strings.Split(strings.TrimSuffix(inspection, "\n"), "\n")...)
+		body = strings.Split(strings.TrimSuffix(inspection, "\n"), "\n")
 	} else {
-		bottom := m.renderBottom(emergency, standard)
-		available := max(0, height-len(rows)-len(bottom))
+		footer = m.renderBottom(emergency, standard)
+		available := max(0, height-len(header)-len(footer))
 		transcript := m.conversationLines(available)
 		if len(transcript) > available {
 			transcript = transcript[len(transcript)-available:]
 		}
-		leadingRows := 0
-		if len(m.blocks) == 0 && m.streamingText == "" && available > len(transcript) {
-			leadingRows = (available - len(transcript)) / 2
-			rows = append(rows, make([]string, leadingRows)...)
-		}
-		rows = append(rows, transcript...)
-		rows = append(rows, make([]string, max(0, available-leadingRows-len(transcript)))...)
-		rows = append(rows, bottom...)
+		body = transcript
 	}
-	rows = fitTerminalRows(rows, height)
-	for i := range rows {
-		rows[i] = ansi.Truncate(rows[i], width, "…")
-	}
-	view := tea.NewView(strings.Join(rows, "\n"))
-	view.AltScreen = true
-	view.MouseMode = tea.MouseModeCellMotion
-	return view
+	return tui.RenderScreen(tui.Screen{
+		Width: width, Height: height, Header: header, Body: body, Footer: footer,
+		CenterBody: m.choosing == "" && m.pendingApproval == nil && m.diffView == nil && m.outputRef == "" && len(m.blocks) == 0 && m.streamingText == "",
+	})
 }
 
 func (m *conversationTUI) headerLines(standard bool) []string {

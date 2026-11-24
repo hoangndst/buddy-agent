@@ -9,6 +9,7 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 - `InputHistoryRing` loads and stores prompt history at a caller-supplied path.
 - `SlashCommandRegistry` stores and matches composer commands.
 - `TranscriptBlock` and `Activity` are UI-owned transcript values; `RenderMarkdown` converts source Markdown to terminal output.
+- `Screen` and `RenderScreen` allocate a fullscreen frame to header, body, and footer regions and apply terminal width clipping.
 - `FormatWorkspaceFileHyperlink` formats a workspace path for terminal display.
 - `StripHyperlinks` removes OSC 8 links from terminal text.
 
@@ -17,6 +18,7 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 - This package does not import `internal/cmd`, agent, client, daemon, persistence, or MCP packages.
 - The history file remains JSONL, uses the existing cross-platform lock and 0600 permissions, and retains at most 500 entries.
 - OSC 8 links are only presentation; displayed paths remain readable when links are unavailable.
+- Screen layout receives rendered strings and dimensions only; it has no workspace, daemon, or runtime dependencies.
 - Transcript bodies retain source Markdown; activity values contain only allowlisted display metadata.
 
 ## Side Effects
