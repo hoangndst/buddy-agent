@@ -79,7 +79,7 @@ func TestConversationTUIUsesAndRestoresRealPTY(t *testing.T) {
 	readAvailable := func() error {
 		buf := make([]byte, 4096)
 		for {
-			n, readErr := master.Read(buf)
+			n, readErr := unix.Read(int(master.Fd()), buf)
 			if n > 0 {
 				output.Write(buf[:n])
 			}
