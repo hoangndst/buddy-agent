@@ -1,14 +1,14 @@
 # Terminal User Interface (TUI)
 
-Buddy Agent includes an interactive, full-screen terminal interface built with Charm's Bubble Tea and Lip Gloss. It manages multi-turn conversations, live text streaming, multiline prompt composition, and tool approvals.
+Buddy Agent includes an interactive, full-screen terminal interface built with Bubble Tea and Lip Gloss. It manages multi-turn conversations, live text streaming, prompt composition, grouped tool activity, and tool approvals. Completed assistant responses render Markdown and fenced code in the terminal. The interface uses a Buddy orange accent with colors adjusted for light and dark terminals.
 
 ## User Interface Layout
 
-At standard terminal sizes (80×24 or larger), Buddy uses a two-line header, a scrollable conversation, a composer at the bottom, and one contextual help row:
+At standard terminal sizes (80×24 or larger), Buddy uses a compact identity header, a scrollable conversation, a one-line composer that grows with multiline input, and a status footer:
 
 ```
-Buddy  /path/to/project
-Conversation conv_…  ·  idle
+Buddy Agent
+GPT-5.4 · /path/to/project · main
 
 You
 Please inspect the failing test.
@@ -16,17 +16,15 @@ Please inspect the failing test.
 Buddy
 The failure comes from the updated renderer.
 
-Running bash: go test ./...
+✓ bash · 4.2s · Enter to expand
 
-╭────────────────────────────────────────────────────────────╮
-│ Ask Buddy anything…                                        │
-╰────────────────────────────────────────────────────────────╯
-Enter send · Shift+Enter newline · F6 transcript · Ctrl+C detach
+› Ask Buddy anything…
+● Connected · ? shortcuts · / commands
 ```
 
-At compact sizes (40–79 columns or 12–23 rows), Buddy shortens the header, reduces the composer, and trims secondary hints. Below 40 columns or 12 rows, it removes decorative borders and hides header/footer details before the active interaction. If the terminal is only one row high, Buddy shows the composer or the pending approval keys. Approval remains pending if the terminal is too narrow to show every available decision key; resize before responding.
+At compact sizes (40–79 columns or 12–23 rows), Buddy shortens the header and trims secondary hints. Below 40 columns or 12 rows, it hides optional metadata before the active interaction. If the terminal is only one row high, Buddy shows the composer or pending approval keys. Approval remains pending if the terminal is too narrow to show every available decision key; resize before responding.
 
-Workspace and conversation names may be shortened to fit. The transcript keeps its message order and scrolls independently from the composer. Empty assistant messages do not create blank role labels. The selected activity uses a marker as well as color, so state remains understandable without color.
+Workspace and conversation names may be shortened to fit. The transcript keeps its message order and scrolls independently from the composer; use the mouse wheel or PageUp/PageDown to inspect history. Tool calls and results appear in a single expandable activity row. Empty assistant messages do not create blank role labels. Activity status uses text and symbols as well as color, so state remains understandable without color. Context usage is shown only when the runtime provides it.
 
 Workspace and conversation pickers, `/diff`, and output inspection use the same header and contextual controls. They temporarily replace the conversation and composer while keeping the prompt draft in memory. Non-TTY execution continues to use the existing line-oriented or standalone path without alternate-screen controls.
 

@@ -1,8 +1,9 @@
-package cmd
+package tui
 
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,11 +29,7 @@ type InputHistoryRing struct {
 // NewInputHistoryRing loads prompt history from path.
 func NewInputHistoryRing(path string) (*InputHistoryRing, error) {
 	if path == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		path = filepath.Join(home, ".buddy", "history.jsonl")
+		return nil, errors.New("prompt history path is required")
 	}
 	h := &InputHistoryRing{path: path}
 	entries, err := readHistory(path)
@@ -193,4 +190,9 @@ func (h *InputHistoryRing) Next() (string, bool) {
 func (h *InputHistoryRing) Reset() {
 	h.index = len(h.entries)
 	h.draft = ""
+}
+
+// AtEnd reports whether navigation is positioned after the newest entry.
+func (h *InputHistoryRing) AtEnd() bool {
+	return h.index == len(h.entries)
 }

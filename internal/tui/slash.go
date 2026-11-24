@@ -1,4 +1,4 @@
-package cmd
+package tui
 
 import (
 	"sort"
@@ -38,4 +38,9 @@ func (r *SlashCommandRegistry) Match(prefix string) []SlashCommand {
 		}
 	}
 	return matches
+}
+
+// Commands returns registered commands in name order.
+func (r *SlashCommandRegistry) Commands() []SlashCommand {
+	return append([]SlashCommand(nil), r.commands...)
 }
