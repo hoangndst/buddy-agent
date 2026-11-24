@@ -1286,6 +1286,21 @@ func TestConversationTUILoadSyncSkipsEmptyAssistantToolSteps(t *testing.T) {
 	}
 }
 
+func TestConversationTUIEmptyAssistantRendering(t *testing.T) {
+	model := &conversationTUI{width: 80, height: 24}
+	if got, _ := model.renderBlock(TranscriptBlock{Kind: BlockAssistantMessage, Role: "assistant"}, 80); got != "" {
+		t.Fatalf("empty completed assistant rendered %q", got)
+	}
+	got, _ := model.renderBlock(TranscriptBlock{Kind: BlockAssistantMessage, Role: "assistant", Streaming: true}, 80)
+	if !strings.Contains(got, "Working…") {
+		t.Fatalf("empty streaming assistant rendered %q", got)
+	}
+	model.state = "running"
+	if got := strings.Join(model.conversationLines(10), "\n"); !strings.Contains(got, "Working…") {
+		t.Fatalf("empty running conversation rendered %q", got)
+	}
+}
+
 func TestConversationTUIKeepsStreamingWhileApprovalCardIsOpen(t *testing.T) {
 	model := &conversationTUI{
 		conversation: "conversation-1", state: "running", width: 80, height: 24,
@@ -1494,8 +1509,8 @@ func TestConversationTUICompletionReservesViewportRows(t *testing.T) {
 		updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		model = updated.(*conversationTUI)
 	}
-	if got := model.completionRows(); got != 4 {
-		t.Fatalf("completion rows = %d, want 4", got)
+	if got := model.completionRows(); got != 7 {
+		t.Fatalf("completion rows = %d, want 7", got)
 	}
 	if got := model.viewportHeight(); got != 4 {
 		t.Fatalf("transcript viewport height = %d, want 4 after reserving completion rows", got)
@@ -1506,10 +1521,56 @@ func TestConversationTUICompletionReservesViewportRows(t *testing.T) {
 			visible++
 		}
 	}
-	if visible != 4 {
-		t.Fatalf("rendered %d completion rows, want 4", visible)
+	if visible != 7 {
+		t.Fatalf("rendered %d completion rows, want 7", visible)
 	}
 	if !strings.Contains(model.View().Content, "› "+model.fileMatches[model.completionCursor]) {
 		t.Fatal("selected completion is not visible in the constrained popup")
+	}
+}
+
+func TestConversationTUIResponsiveLayoutsStayWithinTerminal(t *testing.T) {
+	for _, size := range []struct{ width, height int }{{120, 40}, {80, 24}, {58, 18}, {40, 12}, {40, 1}} {
+		t.Run(fmt.Sprintf("%dx%d", size.width, size.height), func(t *testing.T) {
+			input := textarea.New()
+			input.ShowLineNumbers = false
+			model := &conversationTUI{textarea: input, workspace: "/workspace/buddy-agent", conversation: "conversation-12345678901234567890", state: "idle", width: size.width, height: size.height}
+			updated, _ := model.Update(tea.WindowSizeMsg{Width: size.width, Height: size.height})
+			view := updated.(*conversationTUI).View()
+			if !view.AltScreen {
+				t.Fatal("interactive view did not enable alternate screen")
+			}
+			if size.width == 80 && size.height == 24 && !strings.Contains(ansi.Strip(view.Content), "Ready when you are.") {
+				t.Fatal("empty conversation did not show its ready state")
+			}
+			lines := strings.Split(view.Content, "\n")
+			if len(lines) > size.height {
+				t.Fatalf("rendered %d rows into %d-row terminal", len(lines), size.height)
+			}
+			for _, line := range lines {
+				if width := ansi.StringWidth(line); width > size.width {
+					t.Fatalf("rendered %d columns into %d-column terminal: %q", width, size.width, line)
+				}
+			}
+		})
+	}
+}
+
+func TestConversationTUIOneRowPrioritizesComposerOrApproval(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 40, height: 1}
+	model.textarea.SetValue("keep this draft")
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 40, Height: 1})
+	view := updated.(*conversationTUI).View()
+	if got := ansi.Strip(view.Content); !strings.Contains(got, "┃") || strings.Contains(got, "Buddy") || strings.Contains(got, "workspace") {
+		t.Fatalf("one-row conversation did not prioritize only the composer: %q", got)
+	}
+	model.pendingApproval = &protocol.PermissionRequestNotification{Tool: "bash", Arguments: map[string]any{"command": "go test ./..."}}
+	model.approvalModal = newApprovalModalState(model.pendingApproval.Arguments, 40, 1)
+	view = model.View()
+	if strings.TrimSpace(view.Content) != "1 2 3 4" {
+		t.Fatalf("one-row approval view = %q, want only actionable keys", view.Content)
+	}
+	if model.textarea.Value() != "keep this draft" {
+		t.Fatalf("approval layout changed the composer draft: %q", model.textarea.Value())
 	}
 }

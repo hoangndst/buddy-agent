@@ -204,10 +204,10 @@ type conversationGapMsg struct{}
 type conversationEvictedMsg string
 
 var (
-	uiTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
-	uiMutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	uiUserStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))
-	uiBuddyStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
+	uiTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#D97757"))
+	uiMutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#8A8A8A"))
+	uiUserStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#6CA8D9"))
+	uiBuddyStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#D97757"))
 )
 
 func runConversationTUI(ctx context.Context, f *cmdutil.Factory, socketPath string, continueLatest, standalone bool) error {
@@ -235,6 +235,7 @@ func runConversationTUI(ctx context.Context, f *cmdutil.Factory, socketPath stri
 		return fmt.Errorf("this daemon does not support M9 conversations; restart it when its current work is safe to stop, then retry")
 	}
 	input := textarea.New()
+	input.ShowLineNumbers = false
 	input.Placeholder = "Ask Buddy anything…"
 	input.Prompt = "▌ "
 	input.SetVirtualCursor(false)
@@ -585,8 +586,15 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		func() {
 			defer func() { _ = recover() }()
-			m.textarea.SetWidth(max(20, msg.Width-6))
-			m.textarea.SetHeight(min(5, max(3, msg.Height/5)))
+			m.textarea.SetWidth(max(1, msg.Width-4))
+			maxInputRows := 5
+			if msg.Width < 80 || msg.Height < 24 {
+				maxInputRows = 3
+			}
+			if msg.Width < 40 || msg.Height < 12 {
+				maxInputRows = 1
+			}
+			m.textarea.SetHeight(max(1, min(maxInputRows, msg.Height/8)))
 		}()
 		if m.approvalModal != nil {
 			m.approvalModal.resize(msg.Width, msg.Height)
@@ -802,9 +810,9 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					exitCode, _ := msg.Data["exit_code"].(float64)
 					durationMs, _ := msg.Data["duration_ms"].(float64)
 					if name != "" {
-						mark := "✓"
+						mark := "Done"
 						if exitCode != 0 {
-							mark = "✗"
+							mark = "Failed"
 						}
 						duration := ""
 						if durationMs > 0 {
@@ -925,6 +933,9 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			request := protocol.PermissionRequestNotification(msg)
 			m.pendingApproval = &request
 			m.approvalModal = newApprovalModalState(request.Arguments, m.width, m.height)
+			if !m.transcriptFocused {
+				m.textarea.Blur()
+			}
 			m.state = "awaiting_approval"
 		}
 		return m, m.watchPermission()
@@ -934,6 +945,9 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if m.pendingApproval != nil && m.pendingApproval.RequestID == msg.requestID {
 			m.pendingApproval = nil
 			m.approvalModal = nil
+			if !m.transcriptFocused {
+				m.textarea.Focus()
+			}
 			return m, m.syncConversation()
 		}
 		return m, nil
@@ -1509,117 +1523,238 @@ func (m *conversationTUI) updateCompletion() {
 }
 
 func (m *conversationTUI) View() tea.View {
-	var b strings.Builder
-	b.WriteString(uiTitleStyle.Render("buddy") + uiMutedStyle.Render("  ·  "+m.workspace) + "\n")
-	if m.conversation != "" {
-		b.WriteString(uiMutedStyle.Render("Conversation "+m.conversation+"  ·  "+m.state) + "\n")
+	width, height := max(1, m.width), max(1, m.height)
+	emergency := width < 40 || height < 12
+	standard := width >= 80 && height >= 24
+	var rows []string
+	if !emergency {
+		rows = append(rows, m.headerLines(standard)...)
 	}
-	b.WriteString(strings.Repeat("─", max(1, m.width)) + "\n")
 	if m.choosing != "" && m.pendingApproval == nil {
-		label := "Choose a project"
-		if m.choosing == "conversation" {
-			label = "Choose a conversation"
+		footerRows := 0
+		if !emergency {
+			footerRows = 1
 		}
-		b.WriteString(label + "\n\n")
-		for i, choice := range m.choices {
-			marker := "  "
-			if i == m.cursor {
-				marker = "› "
-			}
-			b.WriteString(marker + choice + "\n")
+		rows = append(rows, m.renderChooser(height-len(rows)-footerRows)...)
+		if footerRows == 1 {
+			rows = append(rows, uiMutedStyle.Render("↑/↓ select · Enter choose · Esc back"))
 		}
 	} else if m.pendingApproval == nil && (m.diffView != nil || m.diffLoading || m.outputRef != "") {
-		header := wrapTranscriptLines(strings.TrimSuffix(b.String(), "\n"), m.width)
-		// Keep room for the inspection controls when the terminal is short.
-		header = header[:min(len(header), max(0, m.height-1))]
-		rows := m.height - len(header)
-		var inspection string
-		if m.diffView != nil || m.diffLoading {
-			inspection = m.renderDiffView(rows)
-		} else {
-			inspection = m.renderOutputView(rows)
+		available := max(0, height-len(rows))
+		inspection := m.renderDiffView(available)
+		if m.diffView == nil && !m.diffLoading {
+			inspection = m.renderOutputView(available)
 		}
-		return tea.NewView(strings.Join(append(header, inspection), "\n"))
+		rows = append(rows, strings.Split(strings.TrimSuffix(inspection, "\n"), "\n")...)
 	} else {
-		if len(m.blocks) > 0 {
-			lines := m.computeVisibleLines()
-			for _, line := range lines {
-				b.WriteString(line + "\n")
-			}
+		bottom := m.renderBottom(emergency, standard)
+		available := max(0, height-len(rows)-len(bottom))
+		transcript := m.conversationLines(available)
+		if len(transcript) > available {
+			transcript = transcript[len(transcript)-available:]
+		}
+		leadingRows := 0
+		if len(m.blocks) == 0 && len(m.transcript) == 0 && m.streamingText == "" && available > len(transcript) {
+			leadingRows = (available - len(transcript)) / 2
+			rows = append(rows, make([]string, leadingRows)...)
+		}
+		rows = append(rows, transcript...)
+		rows = append(rows, make([]string, max(0, available-leadingRows-len(transcript)))...)
+		rows = append(rows, bottom...)
+	}
+	rows = fitTerminalRows(rows, height)
+	for i := range rows {
+		rows[i] = ansi.Truncate(rows[i], width, "…")
+	}
+	view := tea.NewView(strings.Join(rows, "\n"))
+	view.AltScreen = true
+	return view
+}
+
+func (m *conversationTUI) headerLines(standard bool) []string {
+	workspace := terminalText(m.workspace)
+	if workspace == "" {
+		workspace = "workspace"
+	}
+	line := uiTitleStyle.Render("Buddy") + "  " + uiMutedStyle.Render(ansi.Truncate(workspace, max(1, m.width-10), "…"))
+	if !standard {
+		state := m.state
+		if state == "" {
+			state = "idle"
+		}
+		prefix := uiTitleStyle.Render("Buddy") + uiMutedStyle.Render(" · "+state+" · ")
+		pathWidth := max(1, m.width-lipgloss.Width(prefix))
+		return []string{prefix + uiMutedStyle.Render(ansi.Truncate(workspace, pathWidth, "…"))}
+	}
+	if m.conversation == "" {
+		return []string{line, uiMutedStyle.Render(m.state)}
+	}
+	return []string{line, uiMutedStyle.Render("Conversation " + shortConversationID(m.conversation) + "  ·  " + m.state)}
+}
+
+func (m *conversationTUI) renderChooser(height int) []string {
+	label := "Choose a project"
+	if m.choosing == "conversation" {
+		label = "Choose a conversation"
+	}
+	lines := []string{uiTitleStyle.Render(label)}
+	if height <= 1 {
+		return lines
+	}
+	start := max(0, min(m.cursor-height+2, len(m.choices)-height+1))
+	for i := start; i < min(len(m.choices), start+height-1); i++ {
+		marker := "  "
+		if i == m.cursor {
+			marker = "› "
+		}
+		lines = append(lines, marker+terminalText(m.choices[i]))
+	}
+	return lines
+}
+
+func (m *conversationTUI) conversationLines(available int) []string {
+	if available <= 0 {
+		return nil
+	}
+	var lines []string
+	if len(m.blocks) > 0 {
+		lines = m.computeVisibleLines()
+	} else {
+		end := max(0, len(m.transcript)-m.scrollOffset)
+		start := max(0, end-available)
+		for _, line := range m.transcript[start:end] {
+			lines = append(lines, strings.Split(strings.TrimSuffix(line, "\n"), "\n")...)
+		}
+	}
+	if len(lines) == 0 && len(m.blocks) == 0 && len(m.transcript) == 0 && m.streamingText == "" {
+		if m.state == "running" {
+			lines = []string{uiMutedStyle.Render("Working…")}
 		} else {
-			visible := max(4, m.height-12)
-			end := max(0, len(m.transcript)-m.scrollOffset)
-			start := max(0, end-visible)
-			for _, line := range m.transcript[start:end] {
-				b.WriteString(line + "\n\n")
+			lines = []string{uiMutedStyle.Render("Ready when you are."), uiMutedStyle.Render("Describe a task or type /help for commands.")}
+		}
+	}
+	if m.streamingText != "" && m.activeBlockID == "" {
+		lines = append(lines, uiBuddyStyle.Render("Buddy"))
+		lines = append(lines, strings.Split(ProcessMarkdownTables(m.streamingText, max(1, m.width), 0), "\n")...)
+	}
+	return lines
+}
+
+func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
+	var rows []string
+	if m.pendingApproval != nil {
+		if emergency {
+			if m.height <= 1 {
+				return []string{m.approvalActions(*m.pendingApproval)}
 			}
-		}
-		if m.streamingText != "" && m.activeBlockID == "" {
-			b.WriteString(uiBuddyStyle.Render("Buddy") + "\n" + ProcessMarkdownTables(m.streamingText, m.width, 0) + "\n\n")
-		}
-		for _, prompt := range m.queued {
-			b.WriteString(uiMutedStyle.Render("Queued · "+prompt) + "\n")
-		}
-		for _, prompt := range m.steers {
-			b.WriteString(uiTitleStyle.Render("Steering · "+prompt) + "\n")
-		}
-		for _, submission := range m.pendingStart {
-			label := "Queued · "
-			if submission.mode == persistence.SubmissionSteer {
-				label = "Steering · "
+			modalHeight := min(max(2, m.height/2), max(2, m.height))
+			if m.approvalModal == nil {
+				return []string{"Resize terminal to decide"}
 			}
-			b.WriteString(uiMutedStyle.Render(label+submission.prompt) + "\n")
+			return fitTerminalRows(strings.Split(m.approvalModal.view(*m.pendingApproval, m.width, modalHeight), "\n"), m.height)
 		}
-		if len(m.queued)+len(m.steers)+len(m.pendingStart) > 0 {
-			b.WriteByte('\n')
-		}
-		if m.pendingApproval != nil {
-			if m.approvalModal != nil {
-				b.WriteString(m.approvalModal.view(*m.pendingApproval, m.width, m.height) + "\n")
-			} else {
-				b.WriteString(errStyle.Render("Approval required for "+m.pendingApproval.Tool) + "\n")
-			}
-		}
-		switch m.completionKind {
-		case "command":
-			start := m.completionWindowStart()
-			for i := start; i < min(start+m.completionRows(), len(m.commandMatches)); i++ {
-				command := m.commandMatches[i]
-				marker := "  "
-				if i == m.completionCursor {
-					marker = "› "
-				}
-				b.WriteString(marker + command.Name + "  " + uiMutedStyle.Render(command.Description+" "+command.ArgsHint) + "\n")
-			}
-		case "file":
-			start := m.completionWindowStart()
-			for i := start; i < min(start+m.completionRows(), len(m.fileMatches)); i++ {
-				path := m.fileMatches[i]
-				marker := "  "
-				if i == m.completionCursor {
-					marker = "› "
-				}
-				b.WriteString(marker + path + "\n")
-			}
-		}
-		b.WriteString(m.renderTextarea())
-		footer := "Enter send  ·  Shift+Enter newline  ·  /steer <prompt>  ·  /resume  ·  Ctrl+C detach"
-		if m.standalone {
-			footer = "Enter send  ·  Shift+Enter newline  ·  /steer <prompt>  ·  /resume  ·  Ctrl+C stop local run"
-		}
-		if m.pendingApproval != nil {
-			footer = "Approval · 1 allow once  ·  2 allow session  ·  3 deny  ·  4 edit args  ·  Ctrl+C detach"
-		} else if m.transcriptFocused {
-			footer = "Transcript focus · ↑/↓ select · Enter inspect/expand · PgUp/PgDn scroll · F6 composer"
+		modalHeight := min(max(2, m.height/2), max(2, m.height))
+		if m.approvalModal != nil {
+			rows = append(rows, strings.Split(m.approvalModal.view(*m.pendingApproval, m.width, modalHeight), "\n")...)
 		} else {
-			footer += "  ·  F6 transcript"
+			rows = append(rows, "Resize terminal to decide")
 		}
-		b.WriteString("\n" + uiMutedStyle.Render(footer) + "\n")
+	}
+	queued, steering := len(m.queued), len(m.steers)
+	for _, submission := range m.pendingStart {
+		if submission.mode == persistence.SubmissionSteer {
+			steering++
+		} else {
+			queued++
+		}
+	}
+	if queued+steering > 0 {
+		rows = append(rows, uiMutedStyle.Render(fmt.Sprintf("%d queued · %d steering", queued, steering)))
 	}
 	if m.errorText != "" {
-		b.WriteString(errStyle.Render(terminalText(m.errorText)) + "\n")
+		rows = append(rows, errStyle.Render(terminalText(m.errorText)))
 	}
-	return tea.NewView(b.String())
+	if m.completionKind != "" {
+		rows = append(rows, m.completionLines()...)
+	}
+	if m.height <= 0 {
+		return rows
+	}
+	if m.pendingApproval == nil || !emergency {
+		inputContent := m.renderTextarea()
+		if m.pendingApproval != nil {
+			inputContent = uiMutedStyle.Render(inputContent)
+		}
+		if standard && m.width >= 40 {
+			input := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#8A8A8A")).Padding(0, 1).Width(max(1, m.width-4)).Render(inputContent)
+			rows = append(rows, strings.Split(input, "\n")...)
+		} else {
+			rows = append(rows, strings.Split(inputContent, "\n")...)
+		}
+	}
+	if !emergency {
+		footer := "Enter send · Shift+Enter newline"
+		if standard {
+			footer += " · F6 transcript · Ctrl+C detach"
+			if m.standalone {
+				footer = "Enter send · Shift+Enter newline · F6 transcript · Ctrl+C stop"
+			}
+		}
+		if m.pendingApproval != nil {
+			footer = "Approval · " + m.approvalActions(*m.pendingApproval)
+		} else if standard && m.transcriptFocused {
+			footer = "Transcript · ↑/↓ select · Enter inspect · PgUp/PgDn scroll · F6 composer"
+		}
+		rows = append(rows, uiMutedStyle.Render(ansi.Truncate(footer, max(1, m.width), "…")))
+	}
+	return fitTerminalRows(rows, max(1, m.height))
+}
+
+func (m *conversationTUI) approvalActions(request protocol.PermissionRequestNotification) string {
+	if m.approvalModal == nil {
+		return "Resize terminal to decide"
+	}
+	return m.approvalModal.actionRow(request, max(1, m.width))
+}
+
+func (m *conversationTUI) completionLines() []string {
+	var rows []string
+	start, end := m.completionWindowStart(), m.completionWindowStart()+m.completionRows()
+	if m.completionKind == "command" {
+		for i := start; i < min(end, len(m.commandMatches)); i++ {
+			marker := "  "
+			if i == m.completionCursor {
+				marker = "› "
+			}
+			rows = append(rows, marker+m.commandMatches[i].Name+"  "+uiMutedStyle.Render(m.commandMatches[i].Description+" "+m.commandMatches[i].ArgsHint))
+		}
+	} else {
+		for i := start; i < min(end, len(m.fileMatches)); i++ {
+			marker := "  "
+			if i == m.completionCursor {
+				marker = "› "
+			}
+			rows = append(rows, marker+m.fileMatches[i])
+		}
+	}
+	return rows
+}
+
+func fitTerminalRows(rows []string, height int) []string {
+	if height <= 0 {
+		return nil
+	}
+	if len(rows) > height {
+		return rows[len(rows)-height:]
+	}
+	return rows
+}
+
+func shortConversationID(id string) string {
+	if len(id) > 18 {
+		return id[:8] + "…" + id[len(id)-6:]
+	}
+	return id
 }
 
 func (m *conversationTUI) renderOutputView(height int) string {
@@ -2013,6 +2148,7 @@ func (m *conversationTUI) syncConversation() tea.Cmd {
 }
 
 func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
+	hadPendingApproval := m.pendingApproval != nil
 	m.streamingText = ""
 	m.deltaBuffer.Reset()
 	m.tickerActive = false
@@ -2048,6 +2184,11 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 		request := result.PendingApprovals[0]
 		m.pendingApproval = &request
 		m.approvalModal = newApprovalModalState(request.Arguments, m.width, m.height)
+		if !m.transcriptFocused {
+			m.textarea.Blur()
+		}
+	} else if hadPendingApproval && !m.transcriptFocused {
+		m.textarea.Focus()
 	}
 	m.lastSequence = result.EventWatermark
 	m.transcript = m.transcript[:0]
@@ -2121,29 +2262,59 @@ func (m *conversationTUI) renderTextarea() string {
 }
 
 func (m *conversationTUI) viewportHeight() int {
-	h := m.height - m.viewportOverhead() - m.completionRows()
-	if h < 4 {
-		return 4
-	}
-	return h
+	return max(0, m.height-m.viewportOverhead()-m.completionRows())
 }
 
 func (m *conversationTUI) viewportOverhead() int {
-	headerHeight := 3
-	if m.conversation != "" {
-		headerHeight = 4
+	width, height := max(1, m.width), max(1, m.height)
+	emergency := width < 40 || height < 12
+	standard := width >= 80 && height >= 24
+	headerHeight := 0
+	if !emergency {
+		headerHeight = 1
+		if standard {
+			headerHeight = 2
+		}
 	}
-	composerHeight := m.textarea.Height() + 2
-	overhead := headerHeight + composerHeight + len(m.queued) + len(m.steers) + len(m.pendingStart)
-	if m.pendingApproval != nil {
+	composerHeight := max(1, m.textarea.Height())
+	if standard && width >= 40 {
+		composerHeight += 2
+	}
+	footerHeight := 0
+	if !emergency {
+		footerHeight = 1
+	}
+	overhead := headerHeight + footerHeight
+	if m.pendingApproval != nil && emergency {
+		if height <= 1 {
+			return 1
+		}
+		modalHeight := min(max(2, height/2), max(2, height))
 		if m.approvalModal != nil {
-			overhead += lipgloss.Height(m.approvalModal.view(*m.pendingApproval, m.width, m.height))
+			return lipgloss.Height(m.approvalModal.view(*m.pendingApproval, width, modalHeight))
+		}
+		return 1
+	}
+	if m.pendingApproval == nil || !emergency {
+		overhead += composerHeight
+	}
+	if len(m.queued)+len(m.steers)+len(m.pendingStart) > 0 {
+		overhead++
+	}
+	if m.pendingApproval != nil {
+		if height <= 1 {
+			overhead++
 		} else {
-			overhead += 3
+			modalHeight := min(max(2, height/2), max(2, height))
+			if m.approvalModal != nil {
+				overhead += lipgloss.Height(m.approvalModal.view(*m.pendingApproval, width, modalHeight))
+			} else {
+				overhead++
+			}
 		}
 	}
 	if m.errorText != "" {
-		overhead += 2
+		overhead++
 	}
 	return overhead
 }
@@ -2199,6 +2370,9 @@ func (m *conversationTUI) getBlockLineCount(b TranscriptBlock, width int) int {
 	if b.ParentID != "" {
 		return 0
 	}
+	if b.Kind == BlockAssistantMessage && !b.Streaming && strings.TrimSpace(b.Body) == "" {
+		return 0
+	}
 	if width <= 0 {
 		width = 80
 	}
@@ -2223,6 +2397,9 @@ func (m *conversationTUI) getWrappedLines(b TranscriptBlock, width int) []string
 		width = 80
 	}
 	if b.ParentID != "" {
+		return nil
+	}
+	if b.Kind == BlockAssistantMessage && !b.Streaming && strings.TrimSpace(b.Body) == "" {
 		return nil
 	}
 	if m.wrapCache == nil {
@@ -2283,6 +2460,13 @@ func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) (string, int
 		if b.Role == "reasoning" {
 			content = thoughtStyle.Render(terminalText(body))
 		} else {
+			if strings.TrimSpace(body) == "" {
+				if !b.Streaming {
+					return "", -1
+				}
+				content = uiBuddyStyle.Render(terminalText(header)) + "\n" + uiMutedStyle.Render("Working…")
+				break
+			}
 			body = ProcessMarkdownTables(terminalText(body), width, 0)
 			content = uiBuddyStyle.Render(terminalText(header)) + "\n" + body
 		}
@@ -2322,7 +2506,7 @@ func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) (string, int
 					if child.ID == m.selectedActivity {
 						childOffset = len(content)
 						if m.transcriptFocused {
-							childLine = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render(childLine)
+							childLine = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render("› " + strings.TrimSpace(childLine))
 						}
 					}
 					content += "\n" + childLine
@@ -2350,7 +2534,7 @@ func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) (string, int
 		content = b.Body
 	}
 	if m.transcriptFocused && b.ID == m.selectedActivity {
-		content = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render(content)
+		content = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render("› " + content)
 	}
 	return content, childOffset
 }
@@ -2458,8 +2642,11 @@ func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {
 	if totalLines <= vpHeight {
 		m.scrollOffset = 0
 		visible := make([]TranscriptBlock, 0, len(m.blocks))
-		for _, block := range m.blocks {
+		for i, block := range m.blocks {
 			if block.ParentID == "" {
+				if lineCounts[i] == 0 {
+					continue
+				}
 				visible = append(visible, block)
 			}
 		}
@@ -2481,6 +2668,9 @@ func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {
 	curLine := 0
 	for i, block := range m.blocks {
 		if block.ParentID != "" {
+			continue
+		}
+		if lineCounts[i] == 0 {
 			continue
 		}
 		blockStart := curLine
@@ -2516,8 +2706,11 @@ func (m *conversationTUI) computeVisibleLines() []string {
 	if totalLines <= vpHeight {
 		m.scrollOffset = 0
 		var allLines []string
-		for _, b := range m.blocks {
+		for i, b := range m.blocks {
 			if b.ParentID != "" {
+				continue
+			}
+			if lineCounts[i] == 0 {
 				continue
 			}
 			wLines := m.getWrappedLines(b, width)
@@ -2543,6 +2736,9 @@ func (m *conversationTUI) computeVisibleLines() []string {
 	curLine := 0
 	for i, b := range m.blocks {
 		if b.ParentID != "" {
+			continue
+		}
+		if lineCounts[i] == 0 {
 			continue
 		}
 		blockStart := curLine

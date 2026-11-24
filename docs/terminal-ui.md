@@ -4,27 +4,31 @@ Buddy Agent includes an interactive, full-screen terminal interface built with C
 
 ## User Interface Layout
 
+At standard terminal sizes (80×24 or larger), Buddy uses a two-line header, a scrollable conversation, a composer at the bottom, and one contextual help row:
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ buddy  ·  /path/to/project                                  │
-│ Conversation conv_…  ·  idle                                 │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│ > User prompt text...                                       │
-│                                                             │
-│ Assistant response formatted in width-aware Markdown.       │
-│ Syntax-highlighted code blocks, tables, and task lists.     │
-│                                                             │
-│ ⚙ bash: npm test  ·  18.4 KiB  ·  Enter to inspect         │
-│                                                             │
-├─────────────────────────────────────────────────────────────┤
-│ ┌─────────────────────────────────────────────────────────┐ │
-│ │ Type prompt, / for commands, @ for files                 │ │
-│ └─────────────────────────────────────────────────────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│ Enter send · Shift+Enter newline · /resume · Ctrl+C detach  │
-└─────────────────────────────────────────────────────────────┘
+Buddy  /path/to/project
+Conversation conv_…  ·  idle
+
+You
+Please inspect the failing test.
+
+Buddy
+The failure comes from the updated renderer.
+
+Running bash: go test ./...
+
+╭────────────────────────────────────────────────────────────╮
+│ Ask Buddy anything…                                        │
+╰────────────────────────────────────────────────────────────╯
+Enter send · Shift+Enter newline · F6 transcript · Ctrl+C detach
 ```
+
+At compact sizes (40–79 columns or 12–23 rows), Buddy shortens the header, reduces the composer, and trims secondary hints. Below 40 columns or 12 rows, it removes decorative borders and hides header/footer details before the active interaction. If the terminal is only one row high, Buddy shows the composer or the pending approval keys. Approval remains pending if the terminal is too narrow to show every available decision key; resize before responding.
+
+Workspace and conversation names may be shortened to fit. The transcript keeps its message order and scrolls independently from the composer. Empty assistant messages do not create blank role labels. The selected activity uses a marker as well as color, so state remains understandable without color.
+
+Workspace and conversation pickers, `/diff`, and output inspection use the same header and contextual controls. They temporarily replace the conversation and composer while keeping the prompt draft in memory. Non-TTY execution continues to use the existing line-oriented or standalone path without alternate-screen controls.
 
 ## Core Interaction Patterns
 
