@@ -2,6 +2,10 @@
 
 Buddy Agent includes an interactive, full-screen terminal interface built with Bubble Tea and Lip Gloss. It manages multi-turn conversations, live text streaming, prompt composition, grouped tool activity, and tool approvals. Completed assistant responses render Markdown and fenced code in the terminal. The interface uses a Buddy orange accent with colors adjusted for light and dark terminals.
 
+## Welcome Screen
+
+Before the first prompt, Buddy shows a framed welcome panel with its corgi mascot, model, workspace, build version, runtime status, starter guidance, and useful commands. The mascot is rendered from the checked-in Buddy SVG as Unicode half-block pixel art, so it works in SSH, tmux, Warp, and standard terminals without image protocols. Wide terminals use the larger artwork; compact terminals use a smaller variant, and narrow terminals omit the mascot to preserve room for the composer. `NO_COLOR` and monochrome terminals use shaded Unicode blocks instead of ANSI colors. The mascot appears only while the conversation has no transcript content.
+
 ## User Interface Layout
 
 At standard terminal sizes (80×24 or larger), Buddy uses a compact identity header, a scrollable conversation, a one-line composer that grows with multiline input, and a status footer:

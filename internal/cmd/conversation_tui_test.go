@@ -473,6 +473,46 @@ func TestConversationTUIRowVirtualization(t *testing.T) {
 	}
 }
 
+func TestConversationTUIWelcomeResizesToNarrowFallback(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	standard := &conversationTUI{textarea: textarea.New(), width: 80, height: 24, workspace: "/workspace/buddy", state: "ready"}
+	updated, _ := standard.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	standard = updated.(*conversationTUI)
+	standardView := ansi.Strip(standard.View().Content)
+	if !strings.Contains(standardView, "╭─ Buddy Agent") || !strings.Contains(standardView, "Tips for getting started") || !strings.Contains(standardView, "╰") {
+		t.Fatalf("standard welcome panel was clipped: %q", standardView)
+	}
+	if rows := strings.Split(standardView, "\n"); len(rows) > 24 {
+		t.Fatalf("standard welcome has %d rows for a 24-row terminal", len(rows))
+	}
+	standard.appendBlock(TranscriptBlock{ID: "user-prompt", Kind: BlockUserMessage, Body: "Start a conversation"})
+	transcriptView := ansi.Strip(standard.View().Content)
+	if strings.Contains(transcriptView, "Welcome back!") || strings.Contains(transcriptView, "Tips for getting started") {
+		t.Fatalf("welcome panel remained after transcript content appeared: %q", transcriptView)
+	}
+
+	model := &conversationTUI{textarea: textarea.New(), width: 160, height: 40, workspace: "/workspace/buddy", state: "ready", startParams: protocol.ConversationStartParams{Model: "GPT-5.4"}}
+	wide := ansi.Strip(model.View().Content)
+	if !strings.Contains(wide, "▀") || !strings.Contains(wide, "GPT-5.4") {
+		t.Fatalf("wide welcome missing mascot or model metadata: %q", wide)
+	}
+
+	updated, _ = model.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
+	model = updated.(*conversationTUI)
+	narrow := ansi.Strip(model.View().Content)
+	if strings.Contains(narrow, "▀") {
+		t.Fatalf("narrow welcome should hide the mascot: %q", narrow)
+	}
+	if lines := strings.Split(narrow, "\n"); len(lines) > 12 {
+		t.Fatalf("narrow welcome has %d rows for a 12-row terminal", len(lines))
+	}
+	for _, line := range strings.Split(narrow, "\n") {
+		if width := ansi.StringWidth(line); width > 40 {
+			t.Fatalf("narrow welcome line has width %d: %q", width, line)
+		}
+	}
+}
+
 func TestConversationTUIResizeReflowsTranscript(t *testing.T) {
 	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
 	model.appendBlock(TranscriptBlock{ID: "test-block-1", Kind: BlockAssistantMessage, Body: "Short content for testing transcript resize and reflow."})
@@ -1679,7 +1719,7 @@ func TestConversationTUIResponsiveLayoutsStayWithinTerminal(t *testing.T) {
 			if !view.AltScreen {
 				t.Fatal("interactive view did not enable alternate screen")
 			}
-			if size.width == 80 && size.height == 24 && !strings.Contains(ansi.Strip(view.Content), "Ready when you are.") {
+			if size.width == 80 && size.height == 24 && !strings.Contains(ansi.Strip(view.Content), "Tips for getting started") {
 				t.Fatal("empty conversation did not show its ready state")
 			}
 			lines := strings.Split(view.Content, "\n")

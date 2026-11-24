@@ -10,6 +10,7 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 - `SlashCommandRegistry` stores and matches composer commands.
 - `Transcript` owns canonical blocks, reading offset, rendered-row caching, reflow, and visible-window selection; `TranscriptBlock` and `Activity` are UI-owned values.
 - `RenderMarkdown` converts source Markdown to terminal output, and `WrapLines` wraps rendered terminal text by display-cell width.
+- `RenderMascot` draws compact or large Unicode half-block pixel art from the checked-in SVG palette; `RenderWelcome` adapts the welcome panel to terminal dimensions and color settings.
 - `Screen` and `RenderScreen` allocate a fullscreen frame to header, body, and footer regions and apply terminal width clipping.
 - `Header` and `RenderHeader` format the compact and standard workspace/model/branch header.
 - `RenderChoiceList` and `RenderCompletion` draw picker and composer completion rows.

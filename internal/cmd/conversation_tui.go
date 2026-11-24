@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -1555,7 +1556,17 @@ func (m *conversationTUI) conversationLines(available int) []string {
 		if m.state == "running" {
 			lines = []string{uiMutedStyle.Render("Working…")}
 		} else {
-			lines = []string{uiMutedStyle.Render("Ready when you are."), uiMutedStyle.Render("Describe a task or type /help for commands.")}
+			status := "Connected"
+			if m.standalone {
+				status = "Standalone"
+			}
+			if m.errorText != "" {
+				status = "Needs attention"
+			}
+			lines = tui.RenderWelcome(tui.Welcome{
+				Width: m.width, Height: available, Model: m.startParams.Model,
+				Workspace: m.workspace, Version: conversationBuildVersion(), Status: status,
+			})
 		}
 	}
 	if m.streamingText != "" && m.activeBlockID == "" {
@@ -1567,6 +1578,14 @@ func (m *conversationTUI) conversationLines(available int) []string {
 		}
 	}
 	return lines
+}
+
+func conversationBuildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return "dev"
+	}
+	return info.Main.Version
 }
 
 func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
