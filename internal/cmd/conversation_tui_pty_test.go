@@ -51,7 +51,8 @@ func TestConversationTUIUsesAndRestoresRealPTY(t *testing.T) {
 	if err := pty.Setsize(master, &pty.Winsize{Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.SetNonblock(int(master.Fd()), true); err != nil {
+	masterFD := int(master.Fd())
+	if err := unix.SetNonblock(masterFD, true); err != nil {
 		t.Fatal(err)
 	}
 	original, err := term.GetState(int(slave.Fd()))
@@ -71,40 +72,56 @@ func TestConversationTUIUsesAndRestoresRealPTY(t *testing.T) {
 
 	var output bytes.Buffer
 	var outputMu sync.Mutex
+	readDone := make(chan struct{})
+	stopReader := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		buf := make([]byte, 4096)
+		for {
+			fds := []unix.PollFd{{Fd: int32(masterFD), Events: unix.POLLIN}}
+			if _, pollErr := unix.Poll(fds, 100); pollErr != nil {
+				if errors.Is(pollErr, unix.EINTR) {
+					continue
+				}
+				return
+			}
+			select {
+			case <-stopReader:
+				return
+			default:
+			}
+			if fds[0].Revents&unix.POLLIN == 0 {
+				continue
+			}
+			for {
+				n, readErr := unix.Read(masterFD, buf)
+				if n > 0 {
+					outputMu.Lock()
+					output.Write(buf[:n])
+					outputMu.Unlock()
+				}
+				if readErr != nil {
+					if errors.Is(readErr, unix.EAGAIN) || errors.Is(readErr, unix.EWOULDBLOCK) {
+						break
+					}
+					return
+				}
+				if n == 0 {
+					return
+				}
+			}
+		}
+	}()
 	outputText := func() string {
 		outputMu.Lock()
 		defer outputMu.Unlock()
 		return output.String()
 	}
-	readAvailable := func() error {
-		buf := make([]byte, 4096)
-		for {
-			n, readErr := unix.Read(int(master.Fd()), buf)
-			if n > 0 {
-				outputMu.Lock()
-				output.Write(buf[:n])
-				outputMu.Unlock()
-			}
-			if readErr != nil {
-				if errors.Is(readErr, unix.EAGAIN) || errors.Is(readErr, unix.EWOULDBLOCK) {
-					return nil
-				}
-				return readErr
-			}
-			if n == 0 {
-				return nil
-			}
-		}
-	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for !strings.Contains(outputText(), "\x1b[?1049h") && time.Now().Before(deadline) {
-		if err := readAvailable(); err != nil {
-			t.Fatal(err)
-		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	_ = readAvailable()
 	if !strings.Contains(outputText(), "\x1b[?1049h") {
 		t.Fatalf("TUI did not enter alternate screen; output starts %q", outputText())
 	}
@@ -126,12 +143,8 @@ func TestConversationTUIUsesAndRestoresRealPTY(t *testing.T) {
 	}
 	deadline = time.Now().Add(2 * time.Second)
 	for !strings.Contains(outputText(), "Buddy Agent · idle · /") && time.Now().Before(deadline) {
-		if err := readAvailable(); err != nil {
-			t.Fatal(err)
-		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	_ = readAvailable()
 	if !strings.Contains(outputText(), "Buddy Agent · idle · /") {
 		t.Fatalf("resize did not render the compact layout: %q", outputText())
 	}
@@ -146,8 +159,16 @@ func TestConversationTUIUsesAndRestoresRealPTY(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("TUI did not exit after Ctrl+C")
 	}
-	_ = readAvailable()
-	_ = master.Close()
+	deadline = time.Now().Add(time.Second)
+	for !strings.Contains(outputText(), "\x1b[?1049l") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(stopReader)
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("PTY output reader did not stop")
+	}
 
 	final, err := term.GetState(int(slave.Fd()))
 	if err != nil {
