@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -654,36 +655,68 @@ func TestConversationTUIToolEventHyperlink(t *testing.T) {
 	}
 }
 
-func TestConversationTUICopyCommand(t *testing.T) {
+type terminalOutputFunc func([]byte) (int, error)
+
+func (f terminalOutputFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestConversationTUICopyCommandInAlternateScreen(t *testing.T) {
 	model := &conversationTUI{
-		textarea:       textarea.New(),
-		width:          80,
-		height:         24,
-		lineCountCache: make(map[string]int),
-		wrapCache:      make(map[string][]string),
+		textarea: textarea.New(),
+		width:    80,
+		height:   24,
 	}
-	model.appendBlock(TranscriptBlock{
-		ID:        "msg-1",
-		Kind:      BlockAssistantMessage,
-		Role:      "assistant",
-		Header:    "Buddy",
-		Body:      "Secret transcript content for clipboard copy",
-		CreatedAt: time.Now(),
-	})
-
+	model.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: "Hello"})
+	model.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "Hi there 👋"})
 	model.textarea.SetValue("/copy")
-	updated, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	model = updated.(*conversationTUI)
 
-	if cmd == nil {
-		t.Fatal("expected OSC 52 command returned on /copy")
+	altScreen, clipboard := make(chan struct{}), make(chan struct{})
+	enteredAltScreen := sync.OnceFunc(func() { close(altScreen) })
+	var clipboardOnce sync.Once
+	var clipboardOutput string
+	expected := ansi.SetClipboard(ansi.SystemClipboard, "Hello\n\nHi there 👋")
+	output := terminalOutputFunc(func(p []byte) (int, error) {
+		data := string(p)
+		if strings.Contains(data, ansi.SetModeAltScreenSaveCursor) {
+			enteredAltScreen()
+		}
+		if strings.Contains(data, expected) {
+			clipboardOnce.Do(func() {
+				clipboardOutput = data
+				close(clipboard)
+			})
+		}
+		return len(p), nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	program := tea.NewProgram(model, tea.WithContext(ctx), tea.WithInput(nil), tea.WithOutput(output),
+		tea.WithWindowSize(80, 24), tea.WithoutSignalHandler())
+	go func() {
+		select {
+		case <-altScreen:
+			program.Send(tea.KeyPressMsg{Code: tea.KeyEnter})
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-clipboard:
+			program.Quit()
+		case <-ctx.Done():
+		}
+	}()
+	if _, err := program.Run(); err != nil {
+		t.Fatalf("expected /copy to write OSC 52 while the alternate screen was active: %v", err)
 	}
-	if len(model.blocks) < 2 {
-		t.Fatal("expected notification block appended after /copy")
+	<-clipboard
+	if strings.Contains(clipboardOutput, ansi.InsertLine(1)) {
+		t.Fatalf("clipboard write inserted a terminal line: %q", clipboardOutput)
+	}
+	if len(model.blocks) != 3 {
+		t.Fatalf("expected copy status block, got %d transcript blocks", len(model.blocks))
 	}
 	lastBlock := model.blocks[len(model.blocks)-1]
-	if !strings.Contains(lastBlock.Body, "Copied full transcript to clipboard") {
-		t.Fatalf("expected copy confirmation, got: %s", lastBlock.Body)
+	if lastBlock.Body != "Requested clipboard copy of full transcript." {
+		t.Fatalf("unexpected clipboard status: %q", lastBlock.Body)
 	}
 }
 

@@ -43,7 +43,7 @@ Type `/` commands in the composer:
 * `/interrupt`: Cancel the currently executing turn immediately.
 * `/resume`: Open the project and conversation picker to switch sessions.
 * `/help`: Show available commands.
-* `/copy`: Copy the transcript text currently loaded in the client via OSC 52. Large transient tool results copy their bounded preview.
+* `/copy`: Request an OSC 52 clipboard copy of the transcript text currently loaded in the client. Large transient tool results copy their bounded preview; terminals may ignore clipboard requests.
 * `/diff`: Review changed files in the active conversation workspace, with labels for pre-existing changes and successful Buddy file-tool edits.
 * `/clear`: Clear the visible transcript viewport.
 * `/quit` or `/exit`: Detach from the session and leave background daemon tasks running.

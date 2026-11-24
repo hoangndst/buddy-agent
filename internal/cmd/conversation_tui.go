@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -1374,18 +1373,17 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					full.WriteString(block.Body)
 				}
-				encoded := base64.StdEncoding.EncodeToString([]byte(full.String()))
-				osc52 := fmt.Sprintf("\x1b]52;c;%s\x07", encoded)
-				m.transcript = append(m.transcript, uiBuddyStyle.Render("Buddy")+"\nCopied full transcript to clipboard.")
+				const status = "Requested clipboard copy of full transcript."
+				m.transcript = append(m.transcript, uiBuddyStyle.Render("Buddy")+"\n"+status)
 				m.appendBlock(TranscriptBlock{
 					ID:        newConversationID("block"),
 					Kind:      BlockAssistantMessage,
 					Role:      "assistant",
 					Header:    "Buddy",
-					Body:      "Copied full transcript to clipboard.",
+					Body:      status,
 					CreatedAt: time.Now(),
 				})
-				return m, tea.Printf("%s", osc52)
+				return m, tea.SetClipboard(full.String())
 			}
 			if text == "/quit" || text == "/exit" {
 				return m, tea.Quit
