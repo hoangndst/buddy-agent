@@ -412,6 +412,9 @@ func diffChange(ctx context.Context, workspace, base string, change gitChange) (
 		}
 		text := strings.ToValidUTF8(string(b), "�")
 		lines := strings.Split(text, "\n")
+		if text == "" || strings.HasSuffix(text, "\n") {
+			lines = lines[:len(lines)-1]
+		}
 		truncated := len(lines) > 500 || byteTruncated
 		if len(lines) > 500 {
 			lines = lines[:500]

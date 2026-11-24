@@ -218,6 +218,42 @@ func TestInspectWorkspaceDiffBeforeFirstCommit(t *testing.T) {
 	}
 }
 
+func TestInspectWorkspaceDiffUntrackedLineCounts(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	for _, tc := range []struct {
+		name      string
+		content   string
+		patch     string
+		additions int
+	}{
+		{name: "newline terminated", content: "hello\n", patch: "+hello", additions: 1},
+		{name: "blank line at end", content: "hello\n\n", patch: "+hello\n+", additions: 2},
+		{name: "empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			if out, err := exec.Command("git", "-C", workspace, "init", "-q").CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v: %s", err, out)
+			}
+			if err := os.WriteFile(filepath.Join(workspace, "new.txt"), []byte(tc.content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			result, err := inspectWorkspaceDiff(context.Background(), workspace, history.StateTrackerData{})
+			if err != nil || len(result.Files) != 1 || result.Warning != "" {
+				t.Fatalf("untracked diff=%+v err=%v", result, err)
+			}
+			if diff := result.Files[0].Diff; diff != "--- /dev/null\n+++ b/new.txt\n"+tc.patch {
+				t.Errorf("unexpected untracked patch: %q", diff)
+			}
+			if result.Stats != (protocol.DiffStats{FilesChanged: 1, Additions: tc.additions}) {
+				t.Errorf("untracked diff stats=%+v, want %d additions", result.Stats, tc.additions)
+			}
+		})
+	}
+}
+
 func TestInspectWorkspaceDiffBoundsNonGitFallback(t *testing.T) {
 	workspace := t.TempDir()
 	tracker := history.NewStateTracker("task", nil)
