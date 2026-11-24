@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1187,6 +1188,38 @@ func TestConversationTUIClippedTranscriptSkipsNestedChildRows(t *testing.T) {
 	}
 }
 
+func TestConversationTUIScrollsRenderedMarkdownRows(t *testing.T) {
+	for _, width := range []int{48, 80} {
+		t.Run(fmt.Sprint(width), func(t *testing.T) {
+			m := &conversationTUI{textarea: textarea.New(), width: width, height: 16}
+			m.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: "Explain the result"})
+			m.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "# First heading\n\n" +
+				strings.Repeat("This paragraph wraps across several terminal lines. ", 4) + "\n\n## Code\n\n" +
+				"```go\nfunc example() {\n\tfmt.Println(\"hello\")\n}\n```"})
+			m.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "## Results\n\n" +
+				"| Name | Result |\n| --- | --- |\n| First | Passed |\n| Second | Skipped |\n\nA closing paragraph."})
+			m.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: "What comes next?"})
+
+			var transcript []string
+			for _, block := range m.blocks {
+				rendered, _ := m.renderBlock(block, width)
+				transcript = append(transcript, wrapTranscriptLines(rendered, width)...)
+				transcript = append(transcript, "")
+			}
+			height := m.viewportHeight()
+			maxScroll := len(transcript) - height
+			for offset := 0; offset <= maxScroll+1; offset++ {
+				m.scrollOffset = offset
+				bottom := len(transcript) - min(offset, maxScroll)
+				want := transcript[bottom-height : bottom]
+				if got := m.computeVisibleLines(); !slices.Equal(got, want) {
+					t.Fatalf("offset %d\n got: %q\nwant: %q", offset, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestConversationTUIMouseWheelScrollsTranscript(t *testing.T) {
 	model := &conversationTUI{width: 80, height: 24}
 	updated, _ := model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
@@ -1213,19 +1246,44 @@ func TestConversationTUIKeepsHistoryAnchorWhileAppending(t *testing.T) {
 	if after != before {
 		t.Fatalf("new transcript content moved the inspected history (offset %d)\nbefore: %q\nafter:  %q", model.scrollOffset, before, after)
 	}
-	if model.scrollOffset != 11 {
-		t.Fatalf("scroll offset after a three-row append = %d, want 11", model.scrollOffset)
+	added := len(model.getWrappedLines(model.blocks[len(model.blocks)-1], model.width)) + 1
+	if model.scrollOffset != 8+added {
+		t.Fatalf("scroll offset after adding %d rows = %d, want %d", added, model.scrollOffset, 8+added)
+	}
+}
+
+func TestConversationTUIKeepsHistoryAnchorDuringSync(t *testing.T) {
+	m := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	snapshot := &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1"}
+	for i := range 10 {
+		turnID := fmt.Sprintf("turn-%d", i)
+		snapshot.Transcript = append(snapshot.Transcript,
+			protocol.ConversationTranscriptEntry{TurnID: turnID, Role: "user", Content: fmt.Sprintf("Prompt %d", i)},
+			protocol.ConversationTranscriptEntry{TurnID: turnID, Role: "assistant", Content: fmt.Sprintf("## Response %d\n\nAn explanation.", i)},
+		)
+	}
+	m.loadSync(snapshot)
+	m.scrollOffset = 8
+	before := m.computeVisibleLines()
+	m.loadSync(snapshot)
+	after := m.computeVisibleLines()
+	if m.scrollOffset != 8 || !slices.Equal(after, before) {
+		t.Fatalf("snapshot moved the viewport (offset %d, want 8)\nbefore: %q\n after: %q", m.scrollOffset, before, after)
 	}
 }
 
 func TestConversationTUIKeepsHistoryAnchorWhileStreaming(t *testing.T) {
 	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
 	for i := range 20 {
-		model.appendBlock(TranscriptBlock{ID: fmt.Sprintf("message-%d", i), Kind: BlockAssistantMessage, Body: fmt.Sprintf("Message %d", i)})
+		model.appendBlock(TranscriptBlock{ID: fmt.Sprintf("message-%d", i), Kind: BlockAssistantMessage, Body: fmt.Sprintf("Message %d", i), Streaming: i == 19})
 	}
+	model.activeBlockID = "message-19"
+	model.streamingText = "Message 19"
 	model.scrollOffset = 8
 	before := strings.Join(model.computeVisibleLines(), "\n")
-	model.updateBlock(len(model.blocks)-1, func(block *TranscriptBlock) { block.Body = strings.Repeat("streaming content ", 30) })
+	model.clearCache()
+	model.deltaBuffer.WriteString(strings.Repeat(" streaming content", 30))
+	model.Update(renderTickMsg{})
 	after := strings.Join(model.computeVisibleLines(), "\n")
 	if after != before {
 		t.Fatalf("stream growth moved the inspected history (offset %d)\nbefore: %q\nafter:  %q", model.scrollOffset, before, after)
@@ -1240,6 +1298,9 @@ func TestConversationTUIFormatsOnlyVisibleBlocks(t *testing.T) {
 	_ = model.computeVisibleLines()
 	if len(model.wrapCache) >= len(model.blocks) {
 		t.Fatalf("rendered cache contains %d of %d transcript blocks", len(model.wrapCache), len(model.blocks))
+	}
+	if len(model.lineCountCache) > model.viewportHeight() {
+		t.Fatalf("initial viewport measured %d blocks for %d visible rows", len(model.lineCountCache), model.viewportHeight())
 	}
 }
 

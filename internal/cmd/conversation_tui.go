@@ -626,7 +626,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.deltaBuffer.Len() > 0 {
 			flushed := m.deltaBuffer.String()
 			m.deltaBuffer.Reset()
-			m.streamingText += flushed
+			// Measure the active block before publishing the new streaming fallback.
 			if m.activeBlockID != "" {
 				for i := range m.blocks {
 					if m.blocks[i].ID == m.activeBlockID {
@@ -635,6 +635,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			m.streamingText += flushed
 		}
 		if m.tickerActive && (m.state == "running" || m.activeBlockID != "" || m.deltaBuffer.Len() > 0) {
 			return m, tea.Tick(33*time.Millisecond, func(t time.Time) tea.Msg {
@@ -1148,8 +1149,8 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectActivity(0)
 			} else {
 				m.textarea.Focus()
+				m.invalidateActivityCache(m.selectedActivity)
 			}
-			m.clearCache()
 			return m, nil
 		}
 		if m.transcriptFocused {
@@ -1980,22 +1981,22 @@ func (m *conversationTUI) selectActivity(delta int) {
 		}
 	}
 	index = max(0, min(len(activities)-1, index+delta))
+	previous := m.selectedActivity
 	m.selectedActivity = activities[index]
-	m.clearCache()
-	var before, total int
-	selectedParent := ""
-	for _, block := range m.blocks {
-		if block.ID == m.selectedActivity {
-			selectedParent = block.ParentID
-			break
-		}
+	if previous != m.selectedActivity {
+		m.invalidateActivityCache(previous)
 	}
-	for _, block := range m.blocks {
-		total += m.getBlockLineCount(block, m.width)
+	m.invalidateActivityCache(m.selectedActivity)
+	selectedParent := m.blocks[m.blockIndex(m.selectedActivity)].ParentID
+	selectedBlock := m.selectedActivity
+	if selectedParent != "" {
+		selectedBlock = selectedParent
 	}
-	for _, block := range m.blocks {
+	rowsAfter := 0
+	for i := len(m.blocks) - 1; i >= 0; i-- {
+		block := m.blocks[i]
 		count := m.getBlockLineCount(block, m.width)
-		if block.ID == m.selectedActivity || (selectedParent != "" && block.ID == selectedParent) {
+		if block.ID == selectedBlock {
 			row := count / 2
 			if selectedParent != "" {
 				rendered, childOffset := m.renderBlock(block, m.width)
@@ -2003,10 +2004,10 @@ func (m *conversationTUI) selectActivity(delta int) {
 					row = len(wrapTranscriptLines(rendered[:childOffset], m.width))
 				}
 			}
-			m.scrollOffset = max(0, total-(before+row+m.viewportHeight()/2))
+			m.scrollOffset = max(0, rowsAfter+count-row-m.viewportHeight()/2)
 			break
 		}
-		before += count
+		rowsAfter += count
 	}
 }
 
@@ -2204,13 +2205,14 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			lastEntry[entry.TurnID] = i
 		}
 	}
+	// Append durable blocks directly to preserve the reading offset.
 	for i, entry := range result.Transcript {
 		last, hasActivities := lastEntry[entry.TurnID]
 		if hasActivities && last == i && entry.Role == "assistant" {
 			m.blocks = append(m.blocks, activitiesByTurn[entry.TurnID]...)
 		}
 		if entry.Role == "user" {
-			m.appendBlock(TranscriptBlock{
+			m.blocks = append(m.blocks, TranscriptBlock{
 				ID:        newConversationID("block"),
 				TurnID:    entry.TurnID,
 				Kind:      BlockUserMessage,
@@ -2230,7 +2232,7 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			if strings.TrimSpace(entry.Content) == "" {
 				continue
 			}
-			m.appendBlock(TranscriptBlock{
+			m.blocks = append(m.blocks, TranscriptBlock{
 				ID:        newConversationID("block"),
 				TurnID:    entry.TurnID,
 				Kind:      BlockAssistantMessage,
@@ -2370,6 +2372,15 @@ func (m *conversationTUI) invalidateBlockCache(blockID string) {
 	}
 }
 
+func (m *conversationTUI) invalidateActivityCache(blockID string) {
+	if index := m.blockIndex(blockID); index >= 0 {
+		m.invalidateBlockCache(blockID)
+		if parentID := m.blocks[index].ParentID; parentID != "" {
+			m.invalidateBlockCache(parentID)
+		}
+	}
+}
+
 func (m *conversationTUI) appendBlock(block TranscriptBlock) {
 	if block.ID == "" {
 		block.ID = newConversationID("block")
@@ -2377,18 +2388,20 @@ func (m *conversationTUI) appendBlock(block TranscriptBlock) {
 	if block.CreatedAt.IsZero() {
 		block.CreatedAt = time.Now()
 	}
-	m.blocks = append(m.blocks, block)
+	parentIndex, before := -1, 0
 	if block.ParentID != "" {
-		parentIndex := m.blockIndex(block.ParentID)
-		if parentIndex >= 0 {
-			parent := m.blocks[parentIndex]
-			before := m.getBlockLineCount(parent, m.width)
-			m.invalidateBlockCache(block.ParentID)
-			if m.scrollOffset > 0 {
-				m.scrollOffset += m.getBlockLineCount(parent, m.width) - before
-			}
+		parentIndex = m.blockIndex(block.ParentID)
+		if parentIndex >= 0 && m.scrollOffset > 0 {
+			before = m.getBlockLineCount(m.blocks[parentIndex], m.width)
 		}
-	} else if m.scrollOffset > 0 {
+	}
+	m.blocks = append(m.blocks, block)
+	if parentIndex >= 0 {
+		m.invalidateBlockCache(block.ParentID)
+		if m.scrollOffset > 0 {
+			m.scrollOffset += m.getBlockLineCount(m.blocks[parentIndex], m.width) - before
+		}
+	} else if block.ParentID == "" && m.scrollOffset > 0 {
 		m.scrollOffset += m.getBlockLineCount(block, m.width)
 	}
 }
@@ -2404,11 +2417,13 @@ func (m *conversationTUI) blockIndex(id string) int {
 
 func (m *conversationTUI) updateBlock(index int, update func(*TranscriptBlock)) {
 	block := m.blocks[index]
-	before := m.getBlockLineCount(block, m.width)
 	parentIndex := m.blockIndex(block.ParentID)
-	parentBefore := 0
-	if parentIndex >= 0 {
-		parentBefore = m.getBlockLineCount(m.blocks[parentIndex], m.width)
+	before, parentBefore := 0, 0
+	if m.scrollOffset > 0 {
+		before = m.getBlockLineCount(block, m.width)
+		if parentIndex >= 0 {
+			parentBefore = m.getBlockLineCount(m.blocks[parentIndex], m.width)
+		}
 	}
 	update(&m.blocks[index])
 	m.invalidateBlockCache(block.ID)
@@ -2434,46 +2449,22 @@ func (m *conversationTUI) getBlockLineCount(b TranscriptBlock, width int) int {
 	if width <= 0 {
 		width = 80
 	}
+	// Running tools can change elapsed time when a viewport entry is rendered again.
+	if b.Kind == BlockToolActivity && !b.Completed {
+		return len(m.getWrappedLines(b, width)) + 1
+	}
 	key := fmt.Sprintf("%s:%d", b.ID, width)
 	if m.lineCountCache != nil {
 		if count, ok := m.lineCountCache[key]; ok {
 			return count
 		}
 	}
-	count := m.estimateBlockLines(b, width) + 1
-	if b.Kind == BlockToolActivity {
-		count = len(m.getWrappedLines(b, width)) + 1
-	}
+	count := len(m.getWrappedLines(b, width)) + 1
 	if m.lineCountCache == nil {
 		m.lineCountCache = make(map[string]int)
 	}
 	m.lineCountCache[key] = count
 	return count
-}
-
-func (m *conversationTUI) estimateBlockLines(block TranscriptBlock, width int) int {
-	text := block.Body
-	lines := 0
-	if block.Kind == BlockUserMessage || block.Kind == BlockAssistantMessage || block.Kind == BlockSubagentActivity {
-		lines++
-	}
-	if block.Kind == BlockToolActivity {
-		lines = 1
-		if !block.Collapsed {
-			for _, child := range m.blocks {
-				if child.ParentID == block.ID {
-					lines += m.estimateBlockLines(child, width)
-				}
-			}
-		}
-	} else if block.Kind == BlockSubagentActivity && block.Collapsed {
-		text = ""
-	}
-	for _, line := range strings.Split(terminalText(text), "\n") {
-		w := ansi.StringWidth(line)
-		lines += max(1, (w+width-1)/width)
-	}
-	return lines
 }
 
 func (m *conversationTUI) getWrappedLines(b TranscriptBlock, width int) []string {
@@ -2610,63 +2601,39 @@ func activityIdentityKey(id map[string]any) string {
 	return turn + "\x00" + strconv.Itoa(int(step)) + "\x00" + call
 }
 
+func (m *conversationTUI) visibleTranscriptWindow() ([]TranscriptBlock, int, int) {
+	height := m.viewportHeight()
+	if len(m.blocks) == 0 || height == 0 {
+		return nil, 0, 0
+	}
+	m.scrollOffset = max(0, m.scrollOffset)
+
+	// Walk back from the tail so opening a transcript only measures the rows it needs.
+	first, last := len(m.blocks), len(m.blocks)
+	rows := 0
+	for first > 0 && rows-height < m.scrollOffset {
+		first--
+		rows += m.getBlockLineCount(m.blocks[first], m.width)
+	}
+	m.scrollOffset = min(m.scrollOffset, max(0, rows-height))
+	bottom := rows - m.scrollOffset
+	top := max(0, bottom-height)
+	for last > first {
+		count := m.getBlockLineCount(m.blocks[last-1], m.width)
+		if rows-count < bottom {
+			break
+		}
+		rows -= count
+		last--
+	}
+	return m.blocks[first:last], top, bottom
+}
+
 func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {
-	if len(m.blocks) == 0 {
-		return nil
-	}
-	width := m.width
-	if width <= 0 {
-		width = 80
-	}
-	vpHeight := m.viewportHeight()
-
-	totalLines := 0
-	lineCounts := make([]int, len(m.blocks))
-	for i, block := range m.blocks {
-		lc := m.getBlockLineCount(block, width)
-		lineCounts[i] = lc
-		totalLines += lc
-	}
-
-	if totalLines <= vpHeight {
-		m.scrollOffset = 0
-		visible := make([]TranscriptBlock, 0, len(m.blocks))
-		for i, block := range m.blocks {
-			if block.ParentID == "" {
-				if lineCounts[i] == 0 {
-					continue
-				}
-				visible = append(visible, block)
-			}
-		}
-		return visible
-	}
-
-	maxScroll := max(0, totalLines-vpHeight)
-	if m.scrollOffset > maxScroll {
-		m.scrollOffset = maxScroll
-	}
-	if m.scrollOffset < 0 {
-		m.scrollOffset = 0
-	}
-
-	windowBottom := totalLines - m.scrollOffset
-	windowTop := max(0, windowBottom-vpHeight)
-
+	blocks, _, _ := m.visibleTranscriptWindow()
 	var visible []TranscriptBlock
-	curLine := 0
-	for i, block := range m.blocks {
-		if block.ParentID != "" {
-			continue
-		}
-		if lineCounts[i] == 0 {
-			continue
-		}
-		blockStart := curLine
-		blockEnd := curLine + lineCounts[i]
-		curLine = blockEnd
-
-		if blockEnd > windowTop && blockStart < windowBottom {
+	for _, block := range blocks {
+		if m.getBlockLineCount(block, m.width) > 0 {
 			visible = append(visible, block)
 		}
 	}
@@ -2674,93 +2641,23 @@ func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {
 }
 
 func (m *conversationTUI) computeVisibleLines() []string {
-	if len(m.blocks) == 0 {
-		return nil
-	}
-	width := m.width
-	if width <= 0 {
-		width = 80
-	}
-	vpHeight := m.viewportHeight()
-
-	// 1. Calculate total lines using cached line counts without allocating wrapped lines for off-screen blocks
-	totalLines := 0
-	lineCounts := make([]int, len(m.blocks))
-	for i, b := range m.blocks {
-		lc := m.getBlockLineCount(b, width)
-		lineCounts[i] = lc
-		totalLines += lc
-	}
-
-	if totalLines <= vpHeight {
-		m.scrollOffset = 0
-		var allLines []string
-		for i, b := range m.blocks {
-			if b.ParentID != "" {
-				continue
-			}
-			if lineCounts[i] == 0 {
-				continue
-			}
-			wLines := m.getWrappedLines(b, width)
-			allLines = append(allLines, wLines...)
-			allLines = append(allLines, "")
-		}
-		return allLines
-	}
-
-	maxScroll := max(0, totalLines-vpHeight)
-	if m.scrollOffset > maxScroll {
-		m.scrollOffset = maxScroll
-	}
-	if m.scrollOffset < 0 {
-		m.scrollOffset = 0
-	}
-
-	windowBottom := totalLines - m.scrollOffset
-	windowTop := max(0, windowBottom-vpHeight)
-
-	// 2. Assemble lines ONLY from intersecting blocks
-	var visibleLines []string
+	blocks, top, bottom := m.visibleTranscriptWindow()
+	lines := make([]string, 0, bottom-top)
 	visibleIDs := make(map[string]bool)
-	curLine := 0
-	for i, b := range m.blocks {
-		if b.ParentID != "" {
+	row := 0
+	for _, block := range blocks {
+		count := m.getBlockLineCount(block, m.width)
+		if count == 0 {
 			continue
 		}
-		if lineCounts[i] == 0 {
-			continue
+		visibleIDs[block.ID] = true
+		wrapped := m.getWrappedLines(block, m.width)
+		start, end := max(0, top-row), min(count, bottom-row)
+		lines = append(lines, wrapped[start:min(len(wrapped), end)]...)
+		if end == count {
+			lines = append(lines, "")
 		}
-		blockStart := curLine
-		blockEnd := curLine + lineCounts[i]
-		curLine = blockEnd
-
-		// Skip blocks entirely before or after the visible window
-		if blockEnd <= windowTop {
-			continue
-		}
-		if blockStart >= windowBottom {
-			break
-		}
-		visibleIDs[b.ID] = true
-		for _, child := range m.blocks {
-			if child.ParentID == b.ID {
-				visibleIDs[child.ID] = true
-			}
-		}
-
-		wLines := m.getWrappedLines(b, width)
-		linesWithSep := make([]string, len(wLines)+1)
-		copy(linesWithSep, wLines)
-		linesWithSep[len(wLines)] = ""
-
-		sliceStart := max(0, windowTop-blockStart)
-		sliceEnd := min(len(linesWithSep), windowBottom-blockStart)
-		if m.scrollOffset == 0 {
-			visibleLines = append(visibleLines, linesWithSep...)
-		} else if sliceStart < sliceEnd {
-			visibleLines = append(visibleLines, linesWithSep[sliceStart:sliceEnd]...)
-		}
+		row += count
 	}
 	for key := range m.wrapCache {
 		id, _, _ := strings.Cut(key, ":")
@@ -2768,13 +2665,7 @@ func (m *conversationTUI) computeVisibleLines() []string {
 			delete(m.wrapCache, key)
 		}
 	}
-	if m.scrollOffset == 0 && len(visibleLines) > vpHeight {
-		visibleLines = visibleLines[len(visibleLines)-vpHeight:]
-	}
-	if len(visibleLines) < vpHeight {
-		visibleLines = append(make([]string, vpHeight-len(visibleLines)), visibleLines...)
-	}
-	return visibleLines
+	return lines
 }
 
 func (m *conversationTUI) listWorkspaces() tea.Cmd {
