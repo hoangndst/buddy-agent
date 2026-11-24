@@ -46,6 +46,7 @@ func TestStdioTransport_BaseEnvironment(t *testing.T) {
 		cmd := transport.Cmd()
 		if cmd == nil {
 			t.Fatal("expected non-nil cmd")
+			return
 		}
 
 		envMap := make(map[string]string)
