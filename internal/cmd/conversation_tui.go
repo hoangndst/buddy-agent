@@ -1797,6 +1797,7 @@ func (m *conversationTUI) selectActivity(delta int) {
 	}
 	index = max(0, min(len(activities)-1, index+delta))
 	m.selectedActivity = activities[index]
+	m.clearCache()
 	var before, total int
 	selectedParent := ""
 	for _, block := range m.blocks {
@@ -1811,12 +1812,18 @@ func (m *conversationTUI) selectActivity(delta int) {
 	for _, block := range m.blocks {
 		count := m.getBlockLineCount(block, m.width)
 		if block.ID == m.selectedActivity || (selectedParent != "" && block.ID == selectedParent) {
-			m.scrollOffset = max(0, total-(before+count/2+m.viewportHeight()/2))
+			row := count / 2
+			if selectedParent != "" {
+				rendered, childOffset := m.renderBlock(block, m.width)
+				if childOffset >= 0 {
+					row = len(wrapTranscriptLines(rendered[:childOffset], m.width))
+				}
+			}
+			m.scrollOffset = max(0, total-(before+row+m.viewportHeight()/2))
 			break
 		}
 		before += count
 	}
-	m.clearCache()
 }
 
 func (m *conversationTUI) readOutputPage(ref string, offset int64) tea.Cmd {
@@ -2141,17 +2148,8 @@ func (m *conversationTUI) getWrappedLines(b TranscriptBlock, width int) []string
 	if lines, ok := m.wrapCache[key]; ok {
 		return lines
 	}
-	rendered := m.renderBlock(b, width)
-	lines := strings.Split(rendered, "\n")
-	var wrapped []string
-	for _, l := range lines {
-		if lipgloss.Width(l) <= width {
-			wrapped = append(wrapped, l)
-		} else {
-			renderedLine := lipgloss.NewStyle().Width(width).Render(l)
-			wrapped = append(wrapped, strings.Split(renderedLine, "\n")...)
-		}
-	}
+	rendered, _ := m.renderBlock(b, width)
+	wrapped := wrapTranscriptLines(rendered, width)
 	m.wrapCache[key] = wrapped
 	if m.lineCountCache == nil {
 		m.lineCountCache = make(map[string]int)
@@ -2160,11 +2158,28 @@ func (m *conversationTUI) getWrappedLines(b TranscriptBlock, width int) []string
 	return wrapped
 }
 
-func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) string {
+func wrapTranscriptLines(rendered string, width int) []string {
+	if width <= 0 {
+		width = 80
+	}
+	var wrapped []string
+	for l := range strings.SplitSeq(rendered, "\n") {
+		if lipgloss.Width(l) <= width {
+			wrapped = append(wrapped, l)
+		} else {
+			renderedLine := lipgloss.NewStyle().Width(width).Render(l)
+			wrapped = append(wrapped, strings.Split(renderedLine, "\n")...)
+		}
+	}
+	return wrapped
+}
+
+func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) (string, int) {
 	if width <= 0 {
 		width = 80
 	}
 	var content string
+	childOffset := -1
 	switch b.Kind {
 	case BlockUserMessage:
 		header := b.Header
@@ -2220,8 +2235,11 @@ func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) string {
 					if ref, ok := child.Data["output_ref"].(string); ok && ref != "" {
 						childLine += "  ·  Enter to inspect"
 					}
-					if m.transcriptFocused && child.ID == m.selectedActivity {
-						childLine = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render(childLine)
+					if child.ID == m.selectedActivity {
+						childOffset = len(content)
+						if m.transcriptFocused {
+							childLine = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render(childLine)
+						}
 					}
 					content += "\n" + childLine
 					if child.Body != "" && !child.Collapsed {
@@ -2250,7 +2268,7 @@ func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) string {
 	if m.transcriptFocused && b.ID == m.selectedActivity {
 		content = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render(content)
 	}
-	return content
+	return content, childOffset
 }
 
 func childActivities(parentID string, blocks []TranscriptBlock) []TranscriptBlock {

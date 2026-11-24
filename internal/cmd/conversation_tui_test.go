@@ -599,7 +599,7 @@ func TestConversationTUIMarkdownTableTruncation(t *testing.T) {
 		CreatedAt: time.Now(),
 	}
 
-	rendered := model.renderBlock(block, 80)
+	rendered, _ := model.renderBlock(block, 80)
 	if !strings.Contains(rendered, "[... 50 rows omitted; use /copy to export full table]") {
 		t.Fatalf("rendered block should contain 200-row truncation badge: %s", rendered)
 	}
@@ -861,12 +861,12 @@ func TestConversationTUIGroupsSubagentActivities(t *testing.T) {
 	parent := TranscriptBlock{ID: "parent", Kind: BlockToolActivity, Header: "✓ invoke_subagent", Collapsed: true, Data: map[string]any{"tool_name": "invoke_subagent", "agent_name": "worker"}}
 	child := TranscriptBlock{ID: "child", ParentID: "parent", Kind: BlockSubagentActivity, Header: "✓ read_file", Body: "file contents", Collapsed: true, Completed: true, Data: map[string]any{"output_ref": "child-output"}}
 	model.blocks = []TranscriptBlock{parent, child}
-	collapsed := model.renderBlock(parent, 80)
+	collapsed, _ := model.renderBlock(parent, 80)
 	if !strings.Contains(collapsed, "[Subagent: worker (1 step completed)]") || strings.Contains(collapsed, "read_file") {
 		t.Fatalf("collapsed parent did not summarize child activity: %q", collapsed)
 	}
 	parent.Collapsed = false
-	expanded := model.renderBlock(parent, 80)
+	expanded, _ := model.renderBlock(parent, 80)
 	if !strings.Contains(expanded, "read_file") || strings.Contains(strings.Join(model.computeVisibleLines(), "\n"), "file contents") {
 		t.Fatalf("expanded grouping did not nest child activity: %q", expanded)
 	}
@@ -881,6 +881,34 @@ func TestConversationTUIGroupsSubagentActivities(t *testing.T) {
 	model = updated.(*conversationTUI)
 	if cmd == nil || model.outputRef != "child-output" {
 		t.Fatal("selected child output did not open its pager")
+	}
+}
+
+func TestConversationTUISelectionKeepsExpandedChildVisible(t *testing.T) {
+	m := &conversationTUI{textarea: textarea.New(), width: 40, height: 21, transcriptFocused: true, selectedActivity: "parent"}
+	m.appendBlock(TranscriptBlock{ID: "parent", Kind: BlockToolActivity, Header: "subagent"})
+	for i := 1; i <= 20; i++ {
+		name := fmt.Sprintf("child-%02d", i)
+		m.appendBlock(TranscriptBlock{
+			ID: name, ParentID: "parent", Kind: BlockSubagentActivity, Header: name,
+			Body: strings.Repeat("wrapped output ", 10) + "\nsecond body line",
+		})
+	}
+	assertVisible := func(step int) {
+		t.Helper()
+		want := fmt.Sprintf("child-%02d", step)
+		view := strings.Join(m.computeVisibleLines(), "\n")
+		if m.selectedActivity != want || !strings.Contains(view, "↳ "+want) {
+			t.Fatalf("selected child %q should be visible after navigation, selected=%q view=%q", want, m.selectedActivity, view)
+		}
+	}
+	for i := 1; i <= 20; i++ {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		assertVisible(i)
+	}
+	for i := 19; i >= 1; i-- {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+		assertVisible(i)
 	}
 }
 

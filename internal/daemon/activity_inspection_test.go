@@ -218,6 +218,43 @@ func TestInspectWorkspaceDiffBeforeFirstCommit(t *testing.T) {
 	}
 }
 
+func TestInspectWorkspaceDiffShowsStagedDeletionAndUntrackedReplacement(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	workspace := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	path := filepath.Join(workspace, "file.txt")
+	if err := os.WriteFile(path, []byte("tracked content\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "file.txt")
+	git("commit", "-qm", "base")
+	git("rm", "--cached", "file.txt")
+	if err := os.WriteFile(path, []byte("untracked replacement\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := inspectWorkspaceDiff(context.Background(), workspace, history.StateTrackerData{})
+	if err != nil || len(result.Files) != 2 || result.Warning != "" {
+		t.Fatalf("staged deletion and untracked replacement diff=%+v err=%v", result, err)
+	}
+	if !strings.Contains(result.Files[0].Diff, "-tracked content\n") || !strings.Contains(result.Files[1].Diff, "+untracked replacement") {
+		t.Fatalf("expected one deletion and one addition: %+v", result.Files)
+	}
+	if result.Stats.Deletions != 1 || result.Stats.Additions != 1 {
+		t.Fatalf("expected one deleted and one added line: %+v", result.Stats)
+	}
+}
+
 func TestInspectWorkspaceDiffUntrackedLineCounts(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
@@ -340,22 +377,22 @@ func TestGitChangedPathsAndSafeDiffPath(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workspace, "new.txt"), []byte("untracked\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	paths, omitted, err := gitChangedPaths(context.Background(), workspace)
+	changes, omitted, err := gitChanges(context.Background(), workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if omitted != 0 || len(paths) != 2 {
-		t.Fatalf("paths=%q omitted=%d", paths, omitted)
+	if omitted != 0 || len(changes) != 2 {
+		t.Fatalf("changes=%+v omitted=%d", changes, omitted)
 	}
-	for _, path := range paths {
-		diff, binary, _, err := diffChange(context.Background(), workspace, "HEAD", gitChange{path: path})
+	for _, change := range changes {
+		diff, binary, _, err := diffChange(context.Background(), workspace, "HEAD", change)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if binary || !strings.Contains(diff, path) {
-			t.Fatalf("unexpected diff for %s: binary=%v diff=%q", path, binary, diff)
+		if binary || !strings.Contains(diff, change.path) {
+			t.Fatalf("unexpected diff for %s: binary=%v diff=%q", change.path, binary, diff)
 		}
-		if path == "tracked.txt" && !strings.Contains(diff, "+Binary files a and b differ\n") {
+		if change.path == "tracked.txt" && !strings.Contains(diff, "+Binary files a and b differ\n") {
 			t.Fatalf("tracked text did not appear in its diff: %q", diff)
 		}
 	}

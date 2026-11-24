@@ -282,6 +282,7 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 
 type gitChange struct {
 	path       string
+	status     string
 	renameFrom string
 }
 
@@ -331,10 +332,10 @@ func gitChanges(ctx context.Context, workspace string) ([]gitChange, int, error)
 		if len(item) < 4 {
 			continue
 		}
-		change := gitChange{path: workspacePath(item[3:])}
-		if strings.ContainsAny(item[:2], "RC") && i+1 < len(parts) {
+		change := gitChange{path: workspacePath(item[3:]), status: item[:2]}
+		if strings.ContainsAny(change.status, "RC") && i+1 < len(parts) {
 			i++
-			if strings.Contains(item[:2], "R") {
+			if strings.Contains(change.status, "R") {
 				change.renameFrom = workspacePath(parts[i])
 			}
 		}
@@ -389,7 +390,10 @@ func diffChange(ctx context.Context, workspace, base string, change gitChange) (
 	if info != nil && info.Mode()&os.ModeSymlink != 0 {
 		return "[Symlink omitted]\n", false, false, nil
 	}
-	if change.renameFrom == "" && info != nil && info.Mode().IsRegular() && !isTracked(ctx, workspace, path) {
+	if change.status == "??" {
+		if info == nil || !info.Mode().IsRegular() {
+			return "", false, false, errors.New("untracked file is no longer regular")
+		}
 		f, err := os.Open(full)
 		if err != nil {
 			return "", false, false, err
@@ -460,9 +464,6 @@ func diffChange(ctx context.Context, workspace, base string, change gitChange) (
 	return strings.Join(lines, "\n") + truncationSuffix(truncated), false, truncated, nil
 }
 
-func isTracked(ctx context.Context, workspace, path string) bool {
-	return exec.CommandContext(ctx, "git", "-C", workspace, "ls-files", "--error-unmatch", "--", ":(literal)"+path).Run() == nil
-}
 func prefixLines(lines []string, prefix string) string {
 	for i := range lines {
 		lines[i] = prefix + lines[i]
