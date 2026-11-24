@@ -192,11 +192,10 @@ type gitBranchMsg struct {
 }
 
 var (
-	uiTitleStyle     = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#A94721", "#EFA276"))
-	uiMutedStyle     = lipgloss.NewStyle().Foreground(tui.ThemeColor("#62656D", "#9297A3"))
-	uiUserStyle      = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#27609B", "#78B9EF"))
-	uiBuddyStyle     = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#A94721", "#EFA276"))
-	uiConnectedStyle = lipgloss.NewStyle().Foreground(tui.ThemeColor("#387E61", "#78B99A"))
+	uiTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#A94721", "#EFA276"))
+	uiMutedStyle = lipgloss.NewStyle().Foreground(tui.ThemeColor("#62656D", "#9297A3"))
+	uiUserStyle  = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#27609B", "#78B9EF"))
+	uiBuddyStyle = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#A94721", "#EFA276"))
 )
 
 func runConversationTUI(ctx context.Context, f *cmdutil.Factory, socketPath string, continueLatest, standalone bool) error {
@@ -1571,25 +1570,6 @@ func (m *conversationTUI) conversationLines(available int) []string {
 }
 
 func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
-	var rows []string
-	if m.pendingApproval != nil {
-		if emergency {
-			if m.height <= 1 {
-				return []string{m.approvalActions(*m.pendingApproval)}
-			}
-			modalHeight := min(max(2, m.height/2), max(2, m.height))
-			if m.approvalModal == nil {
-				return []string{"Resize terminal to decide"}
-			}
-			return fitTerminalRows(strings.Split(m.approvalModal.view(*m.pendingApproval, m.width, modalHeight), "\n"), m.height)
-		}
-		modalHeight := min(max(2, m.height/2), max(2, m.height))
-		if m.approvalModal != nil {
-			rows = append(rows, strings.Split(m.approvalModal.view(*m.pendingApproval, m.width, modalHeight), "\n")...)
-		} else {
-			rows = append(rows, "Resize terminal to decide")
-		}
-	}
 	queued, steering := len(m.queued), len(m.steers)
 	for _, submission := range m.pendingStart {
 		if submission.mode == persistence.SubmissionSteer {
@@ -1598,50 +1578,28 @@ func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
 			queued++
 		}
 	}
-	if queued+steering > 0 {
-		rows = append(rows, uiMutedStyle.Render(fmt.Sprintf("%d queued · %d steering", queued, steering)))
+	var approvalView, approvalKeys string
+	if request := m.pendingApproval; request != nil {
+		approvalKeys = m.approvalActions(*request)
+		modalHeight := min(max(2, m.height/2), max(2, m.height))
+		if m.approvalModal != nil {
+			approvalView = m.approvalModal.view(*request, m.width, modalHeight)
+		} else {
+			approvalView = "Resize terminal to decide"
+		}
 	}
+	composer := m.renderTextarea()
+	var renderedError string
 	if m.errorText != "" {
-		rows = append(rows, errStyle.Render(terminalText(m.errorText)))
+		renderedError = errStyle.Render(terminalText(m.errorText))
 	}
-	if m.completionKind != "" {
-		rows = append(rows, m.completionLines()...)
-	}
-	if m.height <= 0 {
-		return rows
-	}
-	if m.pendingApproval == nil || !emergency {
-		inputContent := m.renderTextarea()
-		if m.pendingApproval != nil {
-			inputContent = uiMutedStyle.Render(inputContent)
-		}
-		if standard {
-			rows = append(rows, uiMutedStyle.Render(strings.Repeat("─", max(1, m.width))))
-		}
-		rows = append(rows, strings.Split(inputContent, "\n")...)
-	}
-	if !emergency {
-		connection := "Connected"
-		if m.errorText != "" {
-			connection = "Needs attention"
-		}
-		footer := uiConnectedStyle.Render("● "+connection) + "  " + uiMutedStyle.Render("? shortcuts · / commands")
-		if m.state == "running" {
-			footer = uiConnectedStyle.Render("● Connected") + "  " + uiBuddyStyle.Render("Working…") + "  " + uiMutedStyle.Render("/interrupt · Ctrl+C detach")
-		} else if standard {
-			footer += uiMutedStyle.Render("  Enter send · Shift+Enter newline · Ctrl+C detach")
-			if m.standalone {
-				footer = strings.ReplaceAll(footer, "Ctrl+C detach", "Ctrl+C stop")
-			}
-		}
-		if m.pendingApproval != nil {
-			footer = "Approval · " + m.approvalActions(*m.pendingApproval)
-		} else if standard && m.transcriptFocused {
-			footer = "Transcript · ↑/↓ select · Enter inspect · PgUp/PgDn scroll · F6 composer"
-		}
-		rows = append(rows, uiMutedStyle.Render(ansi.Truncate(footer, max(1, m.width), "…")))
-	}
-	return fitTerminalRows(rows, max(1, m.height))
+	return tui.RenderFooter(tui.Footer{
+		Width: m.width, Height: m.height, Emergency: emergency, Standard: standard,
+		PendingApproval: m.pendingApproval != nil, ApprovalView: approvalView, ApprovalKeys: approvalKeys,
+		Queued: queued, Steering: steering, Error: renderedError,
+		HasError: m.errorText != "", Completion: m.completionLines(), Composer: composer,
+		State: m.state, Standalone: m.standalone, TranscriptFocused: m.transcriptFocused,
+	})
 }
 
 func (m *conversationTUI) approvalActions(request protocol.PermissionRequestNotification) string {
