@@ -724,6 +724,45 @@ func TestConversationTUIOutputPagerShowsExactByteRange(t *testing.T) {
 	}
 }
 
+func TestConversationTUIInspectionPansLongLines(t *testing.T) {
+	start := strings.Repeat("界", 5)
+	line := strings.Repeat("界", 12) + "TAIL"
+	for _, tc := range []struct {
+		name string
+		open func(*conversationTUI) string
+	}{
+		{"output", func(m *conversationTUI) string {
+			m.outputRef = "output-1"
+			m.outputPage = &protocol.OutputReadResult{Data: line, TotalBytes: int64(len(line))}
+			return m.renderOutputView()
+		}},
+		{"diff", func(m *conversationTUI) string {
+			m.diffView = &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: "file.go", Diff: line}}}
+			m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+			return m.renderDiffView()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &conversationTUI{width: 10, height: 24, textarea: textarea.New()}
+			if view := tc.open(m); strings.Contains(view, "TAIL") || !strings.Contains(view, "\n"+start+"\n") {
+				t.Fatalf("initial viewport did not clip the long line: %q", view)
+			}
+			for range 6 {
+				m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+			}
+			if view := m.View().Content; !strings.Contains(view, "\n界界界TAIL\n") {
+				t.Fatalf("right pan did not reveal the line ending: %q", view)
+			}
+			for range 6 {
+				m.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
+			}
+			if view := m.View().Content; !strings.Contains(view, "\n"+start+"\n") {
+				t.Fatalf("left pan did not return to the line beginning: %q", view)
+			}
+		})
+	}
+}
+
 func TestConversationTUIDiffNavigationAndDismissal(t *testing.T) {
 	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24, diffView: &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: "one.go"}, {Path: "two.go", Diff: "header\n@@ -1 +1 @@\n-a\n+b\n@@ -5 +5 @@\n-c\n+d"}}}}
 	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
@@ -861,6 +900,37 @@ func TestConversationTUIResultOnlyChildIsDetached(t *testing.T) {
 	model = updated.(*conversationTUI)
 	if len(model.blocks) != 1 || model.blocks[0].Kind != BlockSubagentActivity || !strings.HasPrefix(model.blocks[0].Header, "Detached child · ") {
 		t.Fatalf("result-only child was not rendered as detached: %+v", model.blocks)
+	}
+}
+
+func TestConversationTUINestedActivityRefreshesCachedParent(t *testing.T) {
+	m := &conversationTUI{conversation: "conv-1", width: 80, height: 24, textarea: textarea.New()}
+	identity := func(call string) map[string]any {
+		return map[string]any{"turn_id": "turn-1", "step": float64(1), "tool_call_id": call}
+	}
+	emit := func(eventType agent.EventType, tool, call, content string, parent map[string]any) {
+		t.Helper()
+		data := map[string]any{"tool_name": tool, "activity_id": identity(call)}
+		if parent != nil {
+			data["parent_activity_id"] = parent
+		}
+		m.Update(conversationEventMsg(protocol.SessionEventNotification{
+			ConversationID: "conv-1", TurnID: "turn-1", Type: string(eventType), Content: content, Data: data,
+		}))
+	}
+	emit(agent.EventToolCall, "invoke_subagent", "parent", "", nil)
+	_ = m.View()
+	emit(agent.EventToolCall, "read_file", "child", "", identity("parent"))
+	if view := m.View().Content; !strings.Contains(view, "worker (1 step)") {
+		t.Fatalf("cached parent did not show the new child: %q", view)
+	}
+	emit(agent.EventToolResult, "read_file", "child", "read complete", identity("parent"))
+	if view := m.View().Content; !strings.Contains(view, "worker (1 step completed)") {
+		t.Fatalf("cached parent did not show child completion: %q", view)
+	}
+	emit(agent.EventToolResult, "read_file", "result-only", "second read", identity("parent"))
+	if view := m.View().Content; !strings.Contains(view, "worker (2 steps completed)") {
+		t.Fatalf("cached parent did not show the result-only child: %q", view)
 	}
 }
 
@@ -1063,6 +1133,40 @@ func TestConversationTUIKeepsStreamingWhileApprovalCardIsOpen(t *testing.T) {
 	model = updated.(*conversationTUI)
 	if model.pendingApproval == nil || model.approvalModal == nil || model.activeBlockID == "" {
 		t.Fatalf("approval card blocked streaming: approval=%+v activeBlock=%q", model.pendingApproval, model.activeBlockID)
+	}
+}
+
+func TestConversationTUIApprovalTakesPrecedenceOverInspection(t *testing.T) {
+	request := protocol.PermissionRequestNotification{
+		ConversationID: "conversation-1", TurnID: "turn-1", RequestID: "request-1", Tool: "bash",
+		Arguments: map[string]any{"command": "echo approval details"},
+	}
+	for _, overlay := range []string{"diff", "loading diff", "output"} {
+		t.Run(overlay, func(t *testing.T) {
+			m := &conversationTUI{conversation: request.ConversationID, textarea: textarea.New(), width: 80, height: 24}
+			switch overlay {
+			case "diff":
+				m.diffView = &protocol.DiffInspectResult{}
+			case "loading diff":
+				m.diffLoading = true
+			case "output":
+				m.outputRef = "output-1"
+			}
+			if view := m.View().Content; !strings.Contains(view, "Working tree diff") && !strings.Contains(view, "Tool output") {
+				t.Fatalf("expected inspection before approval: %q", view)
+			}
+			m.Update(permissionRequestMsg(request))
+			if overlay == "loading diff" {
+				m.Update(diffInspectMsg{result: &protocol.DiffInspectResult{}})
+			}
+			if view := m.View().Content; !strings.Contains(view, "bash · turn-1") || !strings.Contains(view, "echo approval details") ||
+				strings.Contains(view, "Working tree diff") || strings.Contains(view, "Tool output") {
+				t.Fatalf("approval request did not take precedence: %q", view)
+			}
+			if _, cmd := m.Update(tea.KeyPressMsg{Code: '1', Text: "1"}); cmd == nil {
+				t.Fatal("visible approval did not receive the allow shortcut")
+			}
+		})
 	}
 }
 

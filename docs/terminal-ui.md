@@ -65,6 +65,7 @@ When a tool call requires confirmation, the TUI shows its arguments in an approv
 | `Up` / `Down` | `/diff` | Select a changed file; scroll within the open diff. |
 | `Enter` | `/diff` | Open the selected file diff. |
 | `PageUp` / `PageDown` | `/diff` file view | Move between diff hunks. |
+| `Left` / `Right` | Output pager / `/diff` file view | Scroll long lines horizontally. |
 | `Esc` | Pager / `/diff` | Return to the activity or file list, then close the view. |
 
 Use `/interrupt` to stop the active turn. Use `/quit`, `/exit`, or `Ctrl+C` to leave the client; daemon execution continues after the client exits.

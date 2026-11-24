@@ -164,7 +164,7 @@ func (w *ConversationWorker) InspectDiff(ctx context.Context) (result *protocol.
 }
 
 func inspectWorkspaceDiff(ctx context.Context, workspace string, state history.StateTrackerData) (*protocol.DiffInspectResult, error) {
-	paths, omitted, err := gitChangedPaths(ctx, workspace)
+	changes, omitted, err := gitChanges(ctx, workspace)
 	result := &protocol.DiffInspectResult{Files: make([]protocol.DiffFileEntry, 0), OmittedPaths: omitted}
 	if err != nil {
 		if len(state.ModifiedFiles) == 0 {
@@ -173,7 +173,7 @@ func inspectWorkspaceDiff(ctx context.Context, workspace string, state history.S
 			return result, nil
 		}
 		result.Warning = "Git diff is unavailable; showing Buddy tool activity only"
-		result.OmittedPaths += len(paths)
+		result.OmittedPaths += len(changes)
 		for path := range state.ModifiedFiles {
 			if !utf8.ValidString(path) {
 				result.OmittedPaths++
@@ -185,22 +185,24 @@ func inspectWorkspaceDiff(ctx context.Context, workspace string, state history.S
 		boundDiffResult(result)
 		return result, nil
 	}
-	for _, path := range paths {
+	for _, change := range changes {
 		if err := ctx.Err(); err != nil {
 			result.Warning = "Git inspection timed out; showing partial results"
 			result.Truncated = true
 			break
 		}
-		buddy := false
-		if record, ok := state.ModifiedFiles[path]; ok && record.Action == "modified" {
-			buddy = true
+		buddy := state.ModifiedFiles[change.path].Action == "modified"
+		_, dirtyAtStart := state.InitialDirtyPaths[change.path]
+		if change.renameFrom != "" {
+			_, sourceDirty := state.InitialDirtyPaths[change.renameFrom]
+			dirtyAtStart = dirtyAtStart || sourceDirty
+			buddy = buddy || state.ModifiedFiles[change.renameFrom].Action == "modified"
 		}
-		_, dirtyAtStart := state.InitialDirtyPaths[path]
-		entry := protocol.DiffFileEntry{Path: path, WasDirtyAtStart: dirtyAtStart, IsBuddyEdit: buddy, AttributionUnknown: !state.BaselineKnown || (!dirtyAtStart && !buddy)}
+		entry := protocol.DiffFileEntry{Path: change.path, WasDirtyAtStart: dirtyAtStart, IsBuddyEdit: buddy, AttributionUnknown: !state.BaselineKnown || (!dirtyAtStart && !buddy)}
 		if !state.BaselineKnown {
 			entry.WasDirtyAtStart = false
 		}
-		data, binary, truncated, diffErr := diffPath(ctx, workspace, path)
+		data, binary, truncated, diffErr := diffChange(ctx, workspace, change)
 		if diffErr != nil {
 			entry.AttributionUnknown = true
 			result.Warning = "Some Git changes could not be read safely"
@@ -268,7 +270,24 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+type gitChange struct {
+	path       string
+	renameFrom string
+}
+
 func gitChangedPaths(ctx context.Context, workspace string) ([]string, int, error) {
+	changes, omitted, err := gitChanges(ctx, workspace)
+	paths := make([]string, 0, len(changes))
+	for _, change := range changes {
+		paths = append(paths, change.path)
+		if change.renameFrom != "" {
+			paths = append(paths, change.renameFrom)
+		}
+	}
+	return paths, omitted, err
+}
+
+func gitChanges(ctx context.Context, workspace string) ([]gitChange, int, error) {
 	prefixOutput, err := exec.CommandContext(ctx, "git", "-C", workspace, "rev-parse", "--show-prefix").Output()
 	if err != nil {
 		return nil, 0, err
@@ -284,53 +303,74 @@ func gitChangedPaths(ctx context.Context, workspace string) ([]string, int, erro
 		return nil, 1, errors.New("git status output exceeded the inspection limit")
 	}
 	parts := strings.Split(string(buf.b), "\x00")
-	paths := make([]string, 0, len(parts))
+	changes := make([]gitChange, 0, len(parts))
 	omitted := 0
+	workspacePath := func(path string) string {
+		relative, inside := strings.CutPrefix(path, prefix)
+		if !inside {
+			return ""
+		}
+		if !utf8.ValidString(relative) {
+			omitted++
+			return ""
+		}
+		return relative
+	}
 	for i := 0; i < len(parts); i++ {
 		item := parts[i]
-		if item == "" {
-			continue
-		}
 		if len(item) < 4 {
 			continue
 		}
+		change := gitChange{path: workspacePath(item[3:])}
 		if strings.ContainsAny(item[:2], "RC") && i+1 < len(parts) {
 			i++
+			if strings.Contains(item[:2], "R") {
+				change.renameFrom = workspacePath(parts[i])
+			}
 		}
-		path, inWorkspace := strings.CutPrefix(item[3:], prefix)
-		if !inWorkspace {
-			continue
+		if change.path == "" {
+			change.path, change.renameFrom = change.renameFrom, ""
 		}
-		if !utf8.ValidString(path) {
-			omitted++
-		} else {
-			paths = append(paths, path)
+		if change.path != "" {
+			changes = append(changes, change)
 		}
 	}
-	return paths, omitted, nil
+	return changes, omitted, nil
 }
 
-func diffPath(ctx context.Context, workspace, path string) (string, bool, bool, error) {
+func safeDiffFile(workspace, path string) (string, os.FileInfo, error) {
 	if filepath.IsAbs(path) || filepath.Clean(path) == ".." || strings.HasPrefix(filepath.Clean(path), ".."+string(filepath.Separator)) {
-		return "", false, false, errors.New("path escapes workspace")
+		return "", nil, errors.New("path escapes workspace")
 	}
 	full := filepath.Join(workspace, filepath.FromSlash(path))
 	rel, err := filepath.Rel(workspace, full)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", false, false, errors.New("path escapes workspace")
+		return "", nil, errors.New("path escapes workspace")
 	}
-	info, statErr := os.Lstat(full)
-	if statErr == nil && info.Mode()&os.ModeSymlink != 0 {
-		return "[Symlink omitted]\n", false, false, nil
+	info, _ := os.Lstat(full)
+	if info != nil && info.Mode()&os.ModeSymlink != 0 {
+		return full, info, nil
 	}
 	if resolved, err := filepath.EvalSymlinks(full); err == nil {
 		root, rootErr := filepath.EvalSymlinks(workspace)
 		rel, relErr := filepath.Rel(root, resolved)
 		if rootErr != nil || relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return "", false, false, errors.New("path resolves outside workspace")
+			return "", nil, errors.New("path resolves outside workspace")
 		}
 	}
-	if statErr == nil && info.Mode().IsRegular() && !isTracked(ctx, workspace, path) {
+	return full, info, nil
+}
+
+func diffChange(ctx context.Context, workspace string, change gitChange) (string, bool, bool, error) {
+	path := change.path
+	full, info, err := safeDiffFile(workspace, path)
+	if err != nil {
+		return "", false, false, err
+	}
+	if info != nil && info.Mode()&os.ModeSymlink != 0 {
+		return "[Symlink omitted]\n", false, false, nil
+	}
+	if change.renameFrom == "" && info != nil && info.Mode().IsRegular() && !isTracked(ctx, workspace, path) {
 		f, err := os.Open(full)
 		if err != nil {
 			return "", false, false, err
@@ -360,7 +400,18 @@ func diffPath(ctx context.Context, workspace, path string) (string, bool, bool, 
 		return "--- /dev/null\n+++ b/" + path + "\n" + prefixLines(lines, "+") + truncationSuffix(truncated), false, truncated, nil
 	}
 	buf := &cappedBuffer{limit: 256 << 10}
-	cmd := exec.CommandContext(ctx, "git", "-C", workspace, "diff", "--no-ext-diff", "--unified=3", "HEAD", "--", ":(literal)"+path)
+	args := []string{"-C", workspace, "diff", "--no-ext-diff", "--unified=3", "--find-renames", "HEAD", "--", ":(literal)" + path}
+	if change.renameFrom != "" {
+		_, source, err := safeDiffFile(workspace, change.renameFrom)
+		if err != nil {
+			return "", false, false, err
+		}
+		if source != nil && source.Mode()&os.ModeSymlink != 0 {
+			return "[Symlink omitted]\n", false, false, nil
+		}
+		args = append(args, ":(literal)"+change.renameFrom)
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Stdout = buf
 	if err := cmd.Run(); err != nil {
 		return "", false, false, err
@@ -371,11 +422,15 @@ func diffPath(ctx context.Context, workspace, path string) (string, bool, bool, 
 			diff = diff[:len(diff)-1]
 		}
 	}
-	binary := strings.IndexByte(diff, 0) >= 0 || strings.Contains(diff, "Binary files ") || !utf8.ValidString(diff)
-	if binary {
+	if strings.IndexByte(diff, 0) >= 0 || !utf8.ValidString(diff) {
 		return "[Binary File Omitted]\n", true, false, nil
 	}
 	lines := strings.Split(diff, "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "Binary files ") && strings.HasSuffix(line, " differ") {
+			return "[Binary File Omitted]\n", true, false, nil
+		}
+	}
 	truncated := buf.truncated || len(lines) > 500
 	if len(lines) > 500 {
 		lines = lines[:500]

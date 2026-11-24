@@ -140,6 +140,53 @@ func TestInspectWorkspaceDiffFromRepositorySubdirectory(t *testing.T) {
 	}
 }
 
+func TestInspectWorkspaceDiffIncludesBothSidesOfStagedRename(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	workspace := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	git("config", "status.renames", "true")
+	common := strings.Repeat("unchanged common text\n", 5)
+	if err := os.WriteFile(filepath.Join(workspace, "source.txt"), []byte("old line\n"+common), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "source.txt")
+	git("commit", "-qm", "base")
+	git("mv", "source.txt", "destination.txt")
+	if err := os.WriteFile(filepath.Join(workspace, "destination.txt"), []byte("new line\n"+common), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tracker := history.NewStateTracker("task", nil)
+	tracker.SetInitialDirtyPaths([]string{"source.txt"}, true)
+	tracker.RecordFileAccess("destination.txt", "modified")
+	result, err := inspectWorkspaceDiff(context.Background(), workspace, tracker.ExportData())
+	if err != nil || len(result.Files) != 1 || result.Warning != "" {
+		t.Fatalf("rename diff=%+v err=%v", result, err)
+	}
+	file := result.Files[0]
+	if file.Path != "destination.txt" || !file.WasDirtyAtStart || !file.IsBuddyEdit || file.AttributionUnknown {
+		t.Fatalf("rename path and attribution=%+v", file)
+	}
+	for _, want := range []string{"rename from source.txt\n", "rename to destination.txt\n", "-old line\n", "+new line\n"} {
+		if !strings.Contains(file.Diff, want) {
+			t.Errorf("rename patch missing %q: %s", want, file.Diff)
+		}
+	}
+	if result.Stats != (protocol.DiffStats{FilesChanged: 1, Deletions: 1, Additions: 1}) {
+		t.Fatalf("rename stats=%+v", result.Stats)
+	}
+}
+
 func TestInspectWorkspaceDiffBoundsNonGitFallback(t *testing.T) {
 	workspace := t.TempDir()
 	tracker := history.NewStateTracker("task", nil)
@@ -183,7 +230,7 @@ func TestDiffPathTruncatesAtUTF8Boundary(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("界", 100000)), 0600); err != nil {
 		t.Fatal(err)
 	}
-	diff, binary, truncated, err := diffPath(context.Background(), workspace, "unicode.txt")
+	diff, binary, truncated, err := diffChange(context.Background(), workspace, gitChange{path: "unicode.txt"})
 	if err != nil || binary || !truncated || !utf8.ValidString(diff) {
 		t.Fatalf("diff=%q binary=%v truncated=%v err=%v", diff[len(diff)-min(20, len(diff)):], binary, truncated, err)
 	}
@@ -209,7 +256,7 @@ func TestGitChangedPathsAndSafeDiffPath(t *testing.T) {
 	}
 	git("add", "tracked.txt")
 	git("commit", "-qm", "initial")
-	if err := os.WriteFile(filepath.Join(workspace, "tracked.txt"), []byte("after\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(workspace, "tracked.txt"), []byte("Binary files a and b differ\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(workspace, "new.txt"), []byte("untracked\n"), 0600); err != nil {
@@ -223,12 +270,15 @@ func TestGitChangedPathsAndSafeDiffPath(t *testing.T) {
 		t.Fatalf("paths=%q omitted=%d", paths, omitted)
 	}
 	for _, path := range paths {
-		diff, binary, _, err := diffPath(context.Background(), workspace, path)
+		diff, binary, _, err := diffChange(context.Background(), workspace, gitChange{path: path})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if binary || !strings.Contains(diff, path) {
 			t.Fatalf("unexpected diff for %s: binary=%v diff=%q", path, binary, diff)
+		}
+		if path == "tracked.txt" && !strings.Contains(diff, "+Binary files a and b differ\n") {
+			t.Fatalf("tracked text did not appear in its diff: %q", diff)
 		}
 	}
 	outside := filepath.Join(t.TempDir(), "outside")
@@ -238,7 +288,7 @@ func TestGitChangedPathsAndSafeDiffPath(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(workspace, "linked")); err != nil {
 		t.Fatal(err)
 	}
-	diff, _, _, err := diffPath(context.Background(), workspace, "linked")
+	diff, _, _, err := diffChange(context.Background(), workspace, gitChange{path: "linked"})
 	if err != nil || !strings.Contains(diff, "Symlink omitted") {
 		t.Fatalf("symlink diff=%q err=%v", diff, err)
 	}

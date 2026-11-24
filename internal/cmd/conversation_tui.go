@@ -89,6 +89,7 @@ type conversationTUI struct {
 	diffSelected           int
 	diffFileOpen           bool
 	diffScroll             int
+	inspectionColumn       int
 }
 
 // BlockKind classifies transcript blocks in the row-virtualized presentation engine.
@@ -576,6 +577,9 @@ func (m *conversationTUI) Init() tea.Cmd {
 func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		if m.width != msg.Width {
+			m.inspectionColumn = 0
+		}
 		m.width, m.height = msg.Width, msg.Height
 		func() {
 			defer func() { _ = recover() }()
@@ -810,6 +814,9 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					_, hasOutputRef := msg.Data["output_ref"].(string)
 					m.blocks[i].Collapsed = hasOutputRef || len(result) > 500 || bytes > 500 || hasChildActivities(m.blocks[i].ID, m.blocks)
 					m.invalidateBlockCache(m.blocks[i].ID)
+					if parentID := m.blocks[i].ParentID; parentID != "" {
+						m.invalidateBlockCache(parentID)
+					}
 					matched = true
 					break
 				}
@@ -1003,6 +1010,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.ref == m.outputRef {
 			if indexInt64(m.outputPageStarts, msg.start) != m.outputPageIndex {
 				m.outputLineScroll = 0
+				m.inspectionColumn = 0
 			}
 			m.outputPage = msg.result
 			m.outputPageIndex = indexInt64(m.outputPageStarts, msg.start)
@@ -1071,6 +1079,12 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				if !m.diffFileOpen && len(m.diffView.Files) > 0 {
 					m.diffFileOpen = true
+					m.inspectionColumn = 0
+				}
+				return m, nil
+			case "left", "right":
+				if m.diffFileOpen {
+					m.panInspection(m.diffView.Files[m.diffSelected].Diff, msg.String() == "right")
 				}
 				return m, nil
 			case "pgup":
@@ -1096,6 +1110,11 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.changeOutputPage(-1)
 			case "pgdown":
 				return m, m.changeOutputPage(1)
+			case "left", "right":
+				if m.outputPage != nil {
+					m.panInspection(m.outputPage.Data, msg.String() == "right")
+				}
+				return m, nil
 			case "up":
 				m.outputLineScroll = max(0, m.outputLineScroll-1)
 				return m, nil
@@ -1135,6 +1154,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if ref, ok := block.Data["output_ref"].(string); ok && ref != "" {
 						m.outputRef, m.outputPageStarts, m.outputPageIndex = ref, []int64{0}, 0
 						m.outputLineScroll = 0
+						m.inspectionColumn = 0
 						m.outputLoading = true
 						m.textarea.Blur()
 						return m, m.readOutputPage(ref, 0)
@@ -1485,7 +1505,7 @@ func (m *conversationTUI) View() tea.View {
 		b.WriteString(uiMutedStyle.Render("Conversation "+m.conversation+"  ·  "+m.state) + "\n")
 	}
 	b.WriteString(strings.Repeat("─", max(1, m.width)) + "\n")
-	if m.choosing != "" {
+	if m.choosing != "" && m.pendingApproval == nil {
 		label := "Choose a project"
 		if m.choosing == "conversation" {
 			label = "Choose a conversation"
@@ -1498,9 +1518,9 @@ func (m *conversationTUI) View() tea.View {
 			}
 			b.WriteString(marker + choice + "\n")
 		}
-	} else if m.diffView != nil || m.diffLoading {
+	} else if m.pendingApproval == nil && (m.diffView != nil || m.diffLoading) {
 		b.WriteString(m.renderDiffView())
-	} else if m.outputRef != "" {
+	} else if m.pendingApproval == nil && m.outputRef != "" {
 		b.WriteString(m.renderOutputView())
 	} else {
 		if len(m.blocks) > 0 {
@@ -1603,7 +1623,7 @@ func (m *conversationTUI) renderOutputView() string {
 		lines := strings.Split(m.outputPage.Data, "\n")
 		lineStart := min(m.outputLineScroll, max(0, len(lines)-1))
 		for _, line := range lines[lineStart:min(len(lines), lineStart+max(1, m.height-8))] {
-			b.WriteString(terminalText(line) + "\n")
+			b.WriteString(m.inspectionLine(line) + "\n")
 		}
 		if m.outputPage.Truncated {
 			b.WriteString(errStyle.Render("Output capped at 1 MiB; rerun the command with narrower output.") + "\n")
@@ -1612,7 +1632,7 @@ func (m *conversationTUI) renderOutputView() string {
 			b.WriteString(uiMutedStyle.Render("End of available output\n"))
 		}
 	}
-	b.WriteString("\n" + uiMutedStyle.Render("↑/↓ scroll · PageUp/PageDown pages · Esc returns to activity"))
+	b.WriteString("\n" + uiMutedStyle.Render("↑/↓ scroll · ←/→ pan · PageUp/PageDown pages · Esc returns to activity"))
 	return b.String()
 }
 
@@ -1649,7 +1669,7 @@ func (m *conversationTUI) renderDiffView() string {
 		lines := strings.Split(f.Diff, "\n")
 		start := min(m.diffScroll, max(0, len(lines)-1))
 		for _, line := range lines[start:min(len(lines), start+max(1, m.height-8))] {
-			b.WriteString(terminalText(line) + "\n")
+			b.WriteString(m.inspectionLine(line) + "\n")
 		}
 	}
 	if m.diffView != nil && m.diffView.Warning != "" {
@@ -1663,10 +1683,31 @@ func (m *conversationTUI) renderDiffView() string {
 	}
 	hint := "↑/↓ files · Enter open · Esc close"
 	if m.diffFileOpen {
-		hint = "↑/↓ scroll · PageUp/PageDown hunks · Esc file list"
+		hint = "↑/↓ scroll · ←/→ pan · PageUp/PageDown hunks · Esc file list"
 	}
 	b.WriteString("\n" + uiMutedStyle.Render(hint))
 	return b.String()
+}
+
+func inspectionText(line string) string {
+	return strings.ReplaceAll(terminalText(line), "\t", "    ")
+}
+
+func (m *conversationTUI) inspectionLine(line string) string {
+	return ansi.Cut(inspectionText(line), m.inspectionColumn, m.inspectionColumn+max(1, m.width))
+}
+
+func (m *conversationTUI) panInspection(content string, right bool) {
+	step := max(1, m.width/2)
+	if !right {
+		m.inspectionColumn = max(0, m.inspectionColumn-step)
+		return
+	}
+	longest := 0
+	for line := range strings.SplitSeq(content, "\n") {
+		longest = max(longest, ansi.StringWidth(inspectionText(line)))
+	}
+	m.inspectionColumn = min(max(0, longest-max(1, m.width)), m.inspectionColumn+step)
 }
 
 func diffAttributionLabel(f protocol.DiffFileEntry) string {
@@ -2058,6 +2099,9 @@ func (m *conversationTUI) appendBlock(block TranscriptBlock) {
 		block.CreatedAt = time.Now()
 	}
 	m.blocks = append(m.blocks, block)
+	if block.ParentID != "" {
+		m.invalidateBlockCache(block.ParentID)
+	}
 }
 
 func (m *conversationTUI) getBlockLineCount(b TranscriptBlock, width int) int {
