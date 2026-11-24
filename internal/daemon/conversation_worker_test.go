@@ -15,11 +15,102 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/hoangndst/buddy-agent/internal/tools"
+	"github.com/hoangndst/buddy-agent/internal/tools/subprocess"
 )
 
 type permissionTestConn struct {
 	id       string
 	messages chan *protocol.JSONRPCMessage
+}
+
+type approvalBashRunner struct {
+	commands []string
+}
+
+func (r *approvalBashRunner) Run(_ context.Context, opts subprocess.ExecutionOptions) (*subprocess.ExecutionResult, error) {
+	r.commands = append(r.commands, opts.Command)
+	return &subprocess.ExecutionResult{Combined: "ok"}, nil
+}
+
+func TestConversationWorkerBashApprovalParsesAndCachesExactCommand(t *testing.T) {
+	controller := &permissionTestConn{id: "controller", messages: make(chan *protocol.JSONRPCMessage, 4)}
+	worker, cancel := newApprovalLifecycleWorker(controller, time.Second, time.Second)
+	defer cancel()
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"command":"git status","Command":"touch /tmp/unapproved"}`),
+		json.RawMessage(`{"command":"git status","command":"touch /tmp/unapproved"}`),
+	} {
+		if _, _, err := worker.interceptTool(worker.currentTurnCtx, "bash", raw); err == nil {
+			t.Fatalf("ambiguous bash args %s were approved", raw)
+		}
+	}
+	if len(controller.messages) != 0 || len(worker.sessionBashAllow) != 0 {
+		t.Fatalf("ambiguous args reached approval/cache: messages=%d cache=%v", len(controller.messages), worker.sessionBashAllow)
+	}
+
+	command := "git status"
+	raw := json.RawMessage(`{"command":"git status"}`)
+	type result struct {
+		allowed bool
+		args    json.RawMessage
+		err     error
+	}
+	intercept := func() <-chan result {
+		resultCh := make(chan result, 1)
+		go func() {
+			allowed, args, err := worker.interceptTool(worker.currentTurnCtx, "bash", raw)
+			resultCh <- result{allowed: allowed, args: args, err: err}
+		}()
+		return resultCh
+	}
+	resultCh := intercept()
+	var request protocol.PermissionRequestNotification
+	select {
+	case message := <-controller.messages:
+		if err := json.Unmarshal(message.Params, &request); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bash approval was not requested")
+	}
+	if got := request.Arguments["command"]; got != command {
+		t.Fatalf("approval prompt command = %v, want %q", got, command)
+	}
+	if err := worker.RespondPermission(controller, protocol.PermissionRespondParams{
+		RequestID: request.RequestID, TurnID: request.TurnID, Decision: protocol.DecisionAllowSession,
+		SessionWhitelist: true, CommandPattern: command,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first := <-resultCh
+	if first.err != nil || !first.allowed || string(first.args) != `{"command":"git status"}` {
+		t.Fatalf("first approved call = allowed:%t args:%s err:%v", first.allowed, first.args, first.err)
+	}
+	runner := &approvalBashRunner{}
+	bash := tools.NewBashTool(t.TempDir(), time.Second, tools.WithRunner(runner))
+	if _, err := bash.Execute(context.Background(), first.args); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := worker.interceptTool(worker.currentTurnCtx, "bash", json.RawMessage(`{"command":"git status","Command":"touch /tmp/unapproved"}`)); err == nil {
+		t.Fatal("case-variant command bypassed the cached approval")
+	}
+	if len(runner.commands) != 1 || runner.commands[0] != command || len(controller.messages) != 0 {
+		t.Fatalf("ambiguous cached call reached execution or prompted: commands=%v messages=%d", runner.commands, len(controller.messages))
+	}
+
+	second := <-intercept()
+	if second.err != nil || !second.allowed || string(second.args) != string(first.args) {
+		t.Fatalf("cached approved call = allowed:%t args:%s err:%v", second.allowed, second.args, second.err)
+	}
+	if len(controller.messages) != 0 {
+		t.Fatal("identical session-approved command prompted again")
+	}
+	if _, err := bash.Execute(context.Background(), second.args); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.commands) != 2 || runner.commands[0] != command || runner.commands[1] != command {
+		t.Fatalf("approved command execution = %v", runner.commands)
+	}
 }
 
 func (c *permissionTestConn) ID() string { return c.id }

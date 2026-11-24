@@ -18,6 +18,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	"github.com/hoangndst/buddy-agent/internal/history"
 	"github.com/hoangndst/buddy-agent/internal/persistence"
+	"github.com/hoangndst/buddy-agent/internal/tools"
 )
 
 // ConversationWorker keeps a conversation runtime resident and runs its accepted
@@ -811,8 +812,22 @@ func (w *ConversationWorker) currentTurnContext() context.Context {
 }
 
 func (w *ConversationWorker) interceptTool(ctx context.Context, tool string, raw json.RawMessage) (bool, json.RawMessage, error) {
-	args := make(map[string]any)
-	if len(raw) > 0 {
+	var args map[string]any
+	var canonicalArgs json.RawMessage
+	if tool == "bash" {
+		command, err := tools.ParseBashCommand(raw)
+		if err != nil {
+			return false, nil, fmt.Errorf("decode bash tool arguments for approval: %w", err)
+		}
+		args = map[string]any{"command": command}
+		canonicalArgs, err = json.Marshal(args)
+		if err != nil {
+			return false, nil, fmt.Errorf("encode bash tool arguments for approval: %w", err)
+		}
+	} else {
+		args = make(map[string]any)
+	}
+	if tool != "bash" && len(raw) > 0 {
 		if err := json.Unmarshal(raw, &args); err != nil {
 			return false, nil, fmt.Errorf("decode %s arguments for approval: %w", tool, err)
 		}
@@ -825,11 +840,25 @@ func (w *ConversationWorker) interceptTool(ctx context.Context, tool string, raw
 		return false, nil, &agent.ToolDeniedError{Reason: response.DenialReason}
 	}
 	if response.ModifiedArguments == nil {
+		if tool == "bash" {
+			return true, canonicalArgs, nil
+		}
 		return true, nil, nil
 	}
-	modified, err := json.Marshal(response.ModifiedArguments)
+	modified, err := json.Marshal(*response.ModifiedArguments)
 	if err != nil {
 		return false, nil, fmt.Errorf("encode modified %s arguments: %w", tool, err)
+	}
+	if tool == "bash" {
+		command, err := tools.ParseBashCommand(modified)
+		if err != nil {
+			return false, nil, fmt.Errorf("decode modified bash arguments: %w", err)
+		}
+		canonical, err := json.Marshal(map[string]string{"command": command})
+		if err != nil {
+			return false, nil, fmt.Errorf("encode modified bash arguments: %w", err)
+		}
+		return true, canonical, nil
 	}
 	return true, modified, nil
 }
