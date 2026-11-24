@@ -54,6 +54,7 @@ func TestInspectWorkspaceDiffAttribution(t *testing.T) {
 	git("init", "-q")
 	git("config", "user.email", "test@example.invalid")
 	git("config", "user.name", "Test")
+	git("config", "color.diff", "always")
 	for _, path := range []string{"dirty.txt", "buddy.txt", "unknown.txt"} {
 		if err := os.WriteFile(filepath.Join(workspace, path), []byte("base\n"), 0600); err != nil {
 			t.Fatal(err)
@@ -76,7 +77,13 @@ func TestInspectWorkspaceDiffAttribution(t *testing.T) {
 	}
 	byPath := make(map[string]protocol.DiffFileEntry)
 	for _, file := range result.Files {
+		if strings.ContainsRune(file.Diff, '\x1b') || !strings.Contains(file.Diff, "\n@@ ") {
+			t.Fatalf("expected plain diff with a navigable hunk for %s: %q", file.Path, file.Diff)
+		}
 		byPath[file.Path] = file
+	}
+	if result.Stats != (protocol.DiffStats{FilesChanged: 3, Additions: 3, Deletions: 3}) {
+		t.Fatalf("diff stats with forced Git color: %+v", result.Stats)
 	}
 	if !byPath["dirty.txt"].WasDirtyAtStart || !byPath["dirty.txt"].IsBuddyEdit {
 		t.Fatalf("dirty + Buddy attribution = %+v", byPath["dirty.txt"])

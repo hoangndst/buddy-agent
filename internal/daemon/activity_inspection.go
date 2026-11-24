@@ -426,7 +426,7 @@ func diffChange(ctx context.Context, workspace, base string, change gitChange) (
 		return "--- /dev/null\n+++ b/" + path + "\n" + prefixLines(lines, "+") + truncationSuffix(truncated), false, truncated, nil
 	}
 	buf := &cappedBuffer{limit: 256 << 10}
-	args := []string{"-C", workspace, "diff", "--no-ext-diff", "--unified=3", "--find-renames", base, "--", ":(literal)" + path}
+	args := []string{"-C", workspace, "diff", "--no-color", "--no-ext-diff", "--unified=3", "--find-renames", base, "--", ":(literal)" + path}
 	if change.renameFrom != "" {
 		_, source, err := safeDiffFile(workspace, change.renameFrom)
 		if err != nil {
