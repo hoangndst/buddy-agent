@@ -495,10 +495,27 @@ func (sm *SessionManager) StartConversation(ctx context.Context, params protocol
 			cleanupEngine()
 			return nil, nil, historyErr
 		}
+		baselineCtx, baselineCancel := context.WithTimeout(ctx, 3*time.Second)
+		baselinePaths, _, baselineErr := gitChangedPaths(baselineCtx, workspace)
+		baselineCancel()
+		historySession.Tracker().SetInitialDirtyPaths(baselinePaths, baselineErr == nil)
 		runtime, runtimeErr := agent.NewConversationRuntime(ctx, engine, store, conversationID, params.SubmissionID, historySession)
 		if runtimeErr != nil {
 			cleanupEngine()
 			return nil, nil, runtimeErr
+		}
+		narrative, trackerJSON, tokens := historySession.ExtractSnapshot()
+		initialRevision, revisionErr := store.GetHistoryRevision(ctx, conversationID)
+		if revisionErr != nil {
+			cleanupEngine()
+			return nil, nil, revisionErr
+		}
+		if err := store.SaveSnapshot(ctx, &persistence.SnapshotRecord{
+			SessionID: conversationID, StepNumber: 0, DistilledNarrative: narrative,
+			StateTrackerJSON: trackerJSON, CurrentTokens: tokens, HistoryRevision: initialRevision, CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			cleanupEngine()
+			return nil, nil, fmt.Errorf("persist initial conversation baseline: %w", err)
 		}
 		worker, err = NewConversationWorker(ctx, conversationID, engine, runtime, controller, cleanupEngine)
 		if err != nil {

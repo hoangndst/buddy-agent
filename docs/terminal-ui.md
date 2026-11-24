@@ -6,7 +6,8 @@ Buddy Agent includes an interactive, full-screen terminal interface built with C
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ Buddy Agent — gpt-4o | Workspace: /path/to/project          │
+│ buddy  ·  /path/to/project                                  │
+│ Conversation conv_…  ·  idle                                 │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │ > User prompt text...                                       │
@@ -14,15 +15,14 @@ Buddy Agent includes an interactive, full-screen terminal interface built with C
 │ Assistant response formatted in width-aware Markdown.       │
 │ Syntax-highlighted code blocks, tables, and task lists.     │
 │                                                             │
-│ ⚙ bash: npm test                                            │
-│   [Press Space to expand 34 lines of test output]           │
+│ ⚙ bash: npm test  ·  18.4 KiB  ·  Enter to inspect         │
 │                                                             │
 ├─────────────────────────────────────────────────────────────┤
 │ ┌─────────────────────────────────────────────────────────┐ │
 │ │ Type prompt, / for commands, @ for files                 │ │
 │ └─────────────────────────────────────────────────────────┘ │
 ├─────────────────────────────────────────────────────────────┤
-│ [Model: gpt-4o] [Ctx: 42k/128k (32%)] [Turn: 4.2s] [Cost: $]│
+│ Enter send · Shift+Enter newline · /resume · Ctrl+C detach  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -39,7 +39,8 @@ Type `/` commands in the composer:
 * `/interrupt`: Cancel the currently executing turn immediately.
 * `/resume`: Open the project and conversation picker to switch sessions.
 * `/help`: Show available commands.
-* `/copy`: Copy the full un-truncated conversation markdown transcript to the system clipboard via OSC 52 escape sequences.
+* `/copy`: Copy the transcript text currently loaded in the client via OSC 52. Large transient tool results copy their bounded preview.
+* `/diff`: Review changed files in the active conversation workspace, with labels for pre-existing changes and successful Buddy file-tool edits.
 * `/clear`: Clear the visible transcript viewport.
 * `/quit` or `/exit`: Detach from the session and leave background daemon tasks running.
 
@@ -56,7 +57,14 @@ When a tool call requires confirmation, the TUI shows its arguments in an approv
 | `Up` / `Down` | Composer | Navigate prompt history at the first or last line; otherwise move within the draft. |
 | `Ctrl+P` / `Ctrl+N` | Composer | Navigate prompt history. |
 | `Esc` | Picker | Close the workspace, conversation, or composer completion list. |
-| `Ctrl+C` | Any | Immediately exit the client. |
-| `PageUp` / `PageDown` | Viewport | Scroll conversation transcript history. |
+| `Ctrl+C` | Any | Detach from the daemon-backed conversation; stop standalone execution. |
+| `F6` | TUI | Switch keyboard focus between the composer and transcript activity. |
+| `Up` / `Down` | Transcript focus | Select an activity; inside an output pager, scroll the current page. |
+| `Enter` | Transcript focus | Open a selected output pager or expand/collapse activity details. |
+| `PageUp` / `PageDown` | Transcript focus | Scroll transcript history; inside an output pager, move between output pages. |
+| `Up` / `Down` | `/diff` | Select a changed file; scroll within the open diff. |
+| `Enter` | `/diff` | Open the selected file diff. |
+| `PageUp` / `PageDown` | `/diff` file view | Move between diff hunks. |
+| `Esc` | Pager / `/diff` | Return to the activity or file list, then close the view. |
 
 Use `/interrupt` to stop the active turn. Use `/quit`, `/exit`, or `Ctrl+C` to leave the client; daemon execution continues after the client exits.

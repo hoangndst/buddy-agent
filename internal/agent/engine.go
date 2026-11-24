@@ -580,10 +580,12 @@ func (e *Engine) Resume(ctx context.Context, sessionID string, maxStepsOverride 
 	for i, tr := range turnRecords {
 		trailingBlocks[i] = mapTurnRecordToBlock(tr)
 		for _, tc := range tr.ToolCalls {
-			if tc.Name == "write_file" || tc.Name == "edit_file" {
+			if tc.ExitCode == 0 && (tc.Name == "write_file" || tc.Name == "edit_file") {
 				var args struct{ Path string }
 				if json.Unmarshal([]byte(tc.Args), &args) == nil && args.Path != "" {
-					tracker.RecordFileAccess(args.Path, "modified")
+					if path := normalizeWorkspacePath(e.workspaceDir, args.Path); path != "" {
+						tracker.RecordFileAccess(path, "modified")
+					}
 				}
 			}
 			if tc.ExitCode != 0 {
@@ -957,6 +959,11 @@ func (e *Engine) executeLoop(
 					tc.Arguments = string(modifiedArgs)
 				}
 			}
+			activityTurnID := conversationTurnID
+			if activityTurnID == "" {
+				activityTurnID = sessionID
+			}
+			activityID := ActivityID{TurnID: activityTurnID, Step: step, ToolCallID: tc.ID}
 			e.eventHandler(Event{
 				Type:       EventToolCall,
 				Step:       step,
@@ -965,15 +972,8 @@ func (e *Engine) executeLoop(
 				ToolName:   tc.Name,
 				ToolArgs:   string(args),
 				Protocol:   genResp.Protocol,
+				ActivityID: activityID,
 			})
-
-			// Telemetry hook: track file access for StateTracker
-			if denied == nil && (tc.Name == "write_file" || tc.Name == "edit_file") {
-				var args struct{ Path string }
-				if json.Unmarshal([]byte(tc.Arguments), &args) == nil && args.Path != "" {
-					session.RecordFileAccess(args.Path, "modified")
-				}
-			}
 
 			startTool := time.Now()
 			result := ""
@@ -986,10 +986,24 @@ func (e *Engine) executeLoop(
 			} else if e.registry == nil {
 				result = "Tool error: tool registry is not configured"
 			} else {
-				result = e.registry.Dispatch(ctx, tc.Name, args)
+				toolCtx := ctx
+				if tc.Name == "invoke_subagent" {
+					toolCtx = withParentActivity(ctx, activityID)
+				}
+				result = e.registry.Dispatch(toolCtx, tc.Name, args)
 			}
 			toolDuration := time.Since(startTool)
 			exitCode := parseToolExitCode(result)
+			if denied == nil && exitCode == 0 && (tc.Name == "write_file" || tc.Name == "edit_file") {
+				var fileArgs struct {
+					Path string `json:"path"`
+				}
+				if json.Unmarshal(args, &fileArgs) == nil && fileArgs.Path != "" {
+					if path := normalizeWorkspacePath(e.workspaceDir, fileArgs.Path); path != "" {
+						session.RecordFileAccess(path, "modified")
+					}
+				}
+			}
 
 			// Telemetry hook: track execution errors for StateTracker
 			if exitCode != 0 {
@@ -1027,6 +1041,7 @@ func (e *Engine) executeLoop(
 				ToolResult:   result,
 				ToolExitCode: exitCode,
 				Protocol:     genResp.Protocol,
+				ActivityID:   activityID,
 			})
 
 			toolResults = append(toolResults, history.ToolResult{
@@ -1287,4 +1302,19 @@ func parseToolExitCode(output string) int {
 	}
 
 	return 0
+}
+
+func normalizeWorkspacePath(workspace, path string) string {
+	if filepath.IsAbs(path) {
+		rel, err := filepath.Rel(workspace, path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return ""
+		}
+		path = rel
+	}
+	path = filepath.Clean(path)
+	if path == "." || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return filepath.ToSlash(path)
 }

@@ -53,6 +53,7 @@ func (a *localConversationAPI) Capabilities() (*protocol.DaemonCapabilitiesResul
 		protocol.MethodConversationStart, protocol.MethodConversationResume, protocol.MethodConversationSubmit,
 		protocol.MethodConversationSync, protocol.MethodConversationList, protocol.MethodConversationWorkspaces,
 		protocol.MethodTurnInterrupt, protocol.MethodPermissionRespond,
+		protocol.MethodOutputRead, protocol.MethodDiffInspect,
 	}}, nil
 }
 
@@ -138,6 +139,22 @@ func (a *localConversationAPI) InterruptTurn(params protocol.TurnInterruptParams
 		return nil, err
 	}
 	return &protocol.TurnInterruptResult{ConversationID: params.ConversationID, TurnID: params.TurnID, Status: "interrupting"}, nil
+}
+
+func (a *localConversationAPI) ReadOutput(params protocol.OutputReadParams) (*protocol.OutputReadResult, error) {
+	worker, ok := a.manager.GetConversation(params.ConversationID)
+	if !ok {
+		return nil, persistence.ErrSessionNotFound
+	}
+	return worker.ReadOutput(params)
+}
+
+func (a *localConversationAPI) InspectDiff(params protocol.DiffInspectParams) (*protocol.DiffInspectResult, error) {
+	worker, ok := a.manager.GetConversation(params.ConversationID)
+	if !ok {
+		return nil, persistence.ErrSessionNotFound
+	}
+	return worker.InspectDiff(a.ctx)
 }
 
 func (a *localConversationAPI) RespondConversationPermissionParams(params protocol.PermissionRespondParams) error {
