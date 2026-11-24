@@ -46,6 +46,7 @@ func TestStdioTransport_BaseEnvironment(t *testing.T) {
 		cmd := transport.Cmd()
 		if cmd == nil {
 			t.Fatal("expected non-nil cmd")
+			return
 		}
 
 		envMap := make(map[string]string)
@@ -214,6 +215,7 @@ func TestStdioTransport_ResolveBareCommandInCustomPATH(t *testing.T) {
 	cmd := transport.Cmd()
 	if cmd == nil {
 		t.Fatal("expected non-nil cmd")
+		return
 	}
 
 	expectedAbs, err := filepath.Abs(targetPath)
@@ -297,6 +299,7 @@ func TestStdioTransport_CustomPATH_PrecedenceOverHost(t *testing.T) {
 	cmd := transport.Cmd()
 	if cmd == nil {
 		t.Fatal("expected non-nil cmd")
+		return
 	}
 
 	expectedAbs, err := filepath.Abs(targetPath)

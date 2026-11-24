@@ -11,11 +11,13 @@ import (
 // StateTracker maintains concrete project invariants, touched file paths,
 // and recent errors independently of LLM narrative summaries.
 type StateTracker struct {
-	mu            sync.RWMutex
-	RootGoal      string
-	Invariants    []string
-	ModifiedFiles map[string]FileRecord
-	RecentErrors  []string
+	mu                sync.RWMutex
+	RootGoal          string
+	Invariants        []string
+	ModifiedFiles     map[string]FileRecord
+	InitialDirtyPaths map[string]struct{}
+	BaselineKnown     bool
+	RecentErrors      []string
 }
 
 // NewStateTracker initializes a new StateTracker with the root task goal.
@@ -24,11 +26,25 @@ func NewStateTracker(rootGoal string, invariants []string) *StateTracker {
 	copy(invCopy, invariants)
 
 	return &StateTracker{
-		RootGoal:      rootGoal,
-		Invariants:    invCopy,
-		ModifiedFiles: make(map[string]FileRecord),
-		RecentErrors:  make([]string, 0),
+		RootGoal:          rootGoal,
+		Invariants:        invCopy,
+		ModifiedFiles:     make(map[string]FileRecord),
+		InitialDirtyPaths: make(map[string]struct{}),
+		RecentErrors:      make([]string, 0),
 	}
+}
+
+// SetInitialDirtyPaths records the conversation's original Git baseline.
+func (st *StateTracker) SetInitialDirtyPaths(paths []string, known bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.InitialDirtyPaths = make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path != "" {
+			st.InitialDirtyPaths[path] = struct{}{}
+		}
+	}
+	st.BaselineKnown = known
 }
 
 // RecordFileAccess records that a file was created, modified, or inspected.
@@ -163,21 +179,29 @@ func (st *StateTracker) Clone() *StateTracker {
 	for k, v := range st.ModifiedFiles {
 		filesCopy[k] = v
 	}
+	dirtyCopy := make(map[string]struct{}, len(st.InitialDirtyPaths))
+	for k := range st.InitialDirtyPaths {
+		dirtyCopy[k] = struct{}{}
+	}
 
 	return &StateTracker{
-		RootGoal:      st.RootGoal,
-		Invariants:    invCopy,
-		ModifiedFiles: filesCopy,
-		RecentErrors:  errCopy,
+		RootGoal:          st.RootGoal,
+		Invariants:        invCopy,
+		ModifiedFiles:     filesCopy,
+		InitialDirtyPaths: dirtyCopy,
+		BaselineKnown:     st.BaselineKnown,
+		RecentErrors:      errCopy,
 	}
 }
 
 // StateTrackerData holds serializable state for StateTracker.
 type StateTrackerData struct {
-	RootGoal      string                `json:"root_goal"`
-	Invariants    []string              `json:"invariants"`
-	ModifiedFiles map[string]FileRecord `json:"modified_files"`
-	RecentErrors  []string              `json:"recent_errors"`
+	RootGoal          string                `json:"root_goal"`
+	Invariants        []string              `json:"invariants"`
+	ModifiedFiles     map[string]FileRecord `json:"modified_files"`
+	InitialDirtyPaths map[string]struct{}   `json:"initial_dirty_paths,omitempty"`
+	BaselineKnown     bool                  `json:"baseline_known,omitempty"`
+	RecentErrors      []string              `json:"recent_errors"`
 }
 
 // ExportData exports a thread-safe snapshot of the state tracker's contents.
@@ -189,16 +213,22 @@ func (st *StateTracker) ExportData() StateTrackerData {
 	for k, v := range st.ModifiedFiles {
 		modCopy[k] = v
 	}
+	dirtyCopy := make(map[string]struct{}, len(st.InitialDirtyPaths))
+	for k := range st.InitialDirtyPaths {
+		dirtyCopy[k] = struct{}{}
+	}
 	invCopy := make([]string, len(st.Invariants))
 	copy(invCopy, st.Invariants)
 	errCopy := make([]string, len(st.RecentErrors))
 	copy(errCopy, st.RecentErrors)
 
 	return StateTrackerData{
-		RootGoal:      st.RootGoal,
-		Invariants:    invCopy,
-		ModifiedFiles: modCopy,
-		RecentErrors:  errCopy,
+		RootGoal:          st.RootGoal,
+		Invariants:        invCopy,
+		ModifiedFiles:     modCopy,
+		InitialDirtyPaths: dirtyCopy,
+		BaselineKnown:     st.BaselineKnown,
+		RecentErrors:      errCopy,
 	}
 }
 
@@ -208,6 +238,10 @@ func RestoreStateTracker(data StateTrackerData) *StateTracker {
 	for k, v := range data.ModifiedFiles {
 		st.ModifiedFiles[k] = v
 	}
+	for path := range data.InitialDirtyPaths {
+		st.InitialDirtyPaths[path] = struct{}{}
+	}
+	st.BaselineKnown = data.BaselineKnown
 	st.RecentErrors = append(st.RecentErrors, data.RecentErrors...)
 	return st
 }

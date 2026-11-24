@@ -198,12 +198,30 @@ func createEventNotification(sessionID string, eventID uint64, evt agent.Event, 
 			"tool_name":    toolName,
 			"tool_call_id": toolCallID,
 			"exit_code":    evt.ToolExitCode,
+			"duration_ms":  evt.Duration.Milliseconds(),
 			"tool_result":  toolResult,
 			"terminal":     terminal,
+		}
+		if evt.ActivityID.ToolCallID != "" {
+			data["activity_id"] = evt.ActivityID
+		}
+		if evt.ParentActivityID.ToolCallID != "" {
+			data["parent_activity_id"] = evt.ParentActivityID
+			data["depth"] = evt.Depth
+		}
+		if evt.OutputRef != "" {
+			data["output_ref"] = evt.OutputRef
+			data["output_bytes"] = evt.OutputBytes
+			data["output_truncated"] = evt.OutputTruncated
 		}
 		if evt.ToolArgs != "" {
 			var argsMap map[string]any
 			if err := json.Unmarshal([]byte(evt.ToolArgs), &argsMap); err == nil {
+				if evt.ToolName == "invoke_subagent" {
+					if role, ok := argsMap["role"].(string); ok && role != "" {
+						data["agent_name"] = role
+					}
+				}
 				if p, ok := argsMap["path"].(string); ok && p != "" {
 					data["path"] = p
 				} else if p, ok := argsMap["file_path"].(string); ok && p != "" {

@@ -227,6 +227,7 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 	subagentPrompt := t.buildSubagentSystemPrompt(role, task, inheritedInvariants)
 
 	// 7. Scoped event handler for indented terminal output
+	parentActivity := parentActivityFromContext(ctx)
 	wrappedHandler := func(ev Event) {
 		if t.eventHandler == nil {
 			return
@@ -234,24 +235,35 @@ func (t *InvokeSubagentTool) Execute(ctx context.Context, argsJSON json.RawMessa
 		switch ev.Type {
 		case EventToolCall:
 			t.eventHandler(Event{
-				Type:       ev.Type,
-				Step:       ev.Step,
-				Timestamp:  ev.Timestamp,
-				ToolCallID: ev.ToolCallID,
-				ToolName:   ev.ToolName,
-				ToolArgs:   ev.ToolArgs,
-				Content:    fmt.Sprintf("  [subagent:%s] %s", role, ev.Content),
+				Type:             ev.Type,
+				Step:             ev.Step,
+				Timestamp:        ev.Timestamp,
+				ToolCallID:       ev.ToolCallID,
+				ToolName:         ev.ToolName,
+				ToolArgs:         ev.ToolArgs,
+				Content:          fmt.Sprintf("  [subagent:%s] %s", role, ev.Content),
+				Protocol:         ev.Protocol,
+				HistoryRevision:  ev.HistoryRevision,
+				ActivityID:       ev.ActivityID,
+				ParentActivityID: parentActivity,
+				Depth:            1,
 			})
 		case EventToolResult:
 			t.eventHandler(Event{
-				Type:         ev.Type,
-				Step:         ev.Step,
-				Timestamp:    ev.Timestamp,
-				ToolCallID:   ev.ToolCallID,
-				ToolName:     ev.ToolName,
-				ToolResult:   ev.ToolResult,
-				ToolExitCode: ev.ToolExitCode,
-				Content:      fmt.Sprintf("  [subagent:%s] %s", role, ev.Content),
+				Type:             ev.Type,
+				Step:             ev.Step,
+				Timestamp:        ev.Timestamp,
+				ToolCallID:       ev.ToolCallID,
+				ToolName:         ev.ToolName,
+				ToolResult:       ev.ToolResult,
+				ToolExitCode:     ev.ToolExitCode,
+				Duration:         ev.Duration,
+				Content:          fmt.Sprintf("  [subagent:%s] %s", role, ev.Content),
+				Protocol:         ev.Protocol,
+				HistoryRevision:  ev.HistoryRevision,
+				ActivityID:       ev.ActivityID,
+				ParentActivityID: parentActivity,
+				Depth:            1,
 			})
 		case EventError:
 			t.eventHandler(Event{

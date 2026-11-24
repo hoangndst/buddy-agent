@@ -341,6 +341,51 @@ func (c *Client) Capabilities() (*protocol.DaemonCapabilitiesResult, error) {
 	return &result, nil
 }
 
+// ReadOutput fetches one bounded page from a worker-local tool-output reference.
+func (c *Client) ReadOutput(params protocol.OutputReadParams) (*protocol.OutputReadResult, error) {
+	if err := c.requireCapability(protocol.MethodOutputRead); err != nil {
+		return nil, err
+	}
+	resp, err := c.call(protocol.MethodOutputRead, params)
+	if err != nil {
+		return nil, err
+	}
+	var result protocol.OutputReadResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal output.read result: %w", err)
+	}
+	return &result, nil
+}
+
+// InspectDiff returns bounded working-tree changes for an active conversation.
+func (c *Client) InspectDiff(params protocol.DiffInspectParams) (*protocol.DiffInspectResult, error) {
+	if err := c.requireCapability(protocol.MethodDiffInspect); err != nil {
+		return nil, err
+	}
+	resp, err := c.call(protocol.MethodDiffInspect, params)
+	if err != nil {
+		return nil, err
+	}
+	var result protocol.DiffInspectResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal diff.inspect result: %w", err)
+	}
+	return &result, nil
+}
+
+func (c *Client) requireCapability(method string) error {
+	capabilities, err := c.Capabilities()
+	if err != nil {
+		return err
+	}
+	for _, supported := range capabilities.Methods {
+		if supported == method {
+			return nil
+		}
+	}
+	return fmt.Errorf("the connected daemon does not support %s; restart Buddy to update the daemon", method)
+}
+
 // ListConversationWorkspaces returns workspaces with stored conversations.
 func (c *Client) ListConversationWorkspaces(limit int) (*protocol.ConversationListWorkspacesResult, error) {
 	resp, err := c.call(protocol.MethodConversationWorkspaces, protocol.ConversationListWorkspacesParams{Limit: limit})

@@ -11,13 +11,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/client"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
@@ -39,6 +42,7 @@ type conversationTUI struct {
 	databasePath           string
 	standalone             bool
 	state                  string
+	workerEpoch            string
 	lastSequence           uint64
 	scrollOffset           int
 	transcript             []string
@@ -72,6 +76,21 @@ type conversationTUI struct {
 	conversations          []protocol.ConversationSummary
 	selectedWorkspace      string
 	loadWorkspaceMCPConfig func(string) (*mcp.Config, error)
+	transcriptFocused      bool
+	selectedActivity       string
+	outputRef              string
+	outputPage             *protocol.OutputReadResult
+	outputPageStarts       []int64
+	outputPageIndex        int
+	outputLineScroll       int
+	outputLoading          bool
+	diffView               *protocol.DiffInspectResult
+	diffLoading            bool
+	diffRequestGeneration  uint64
+	diffSelected           int
+	diffFileOpen           bool
+	diffScroll             int
+	inspectionColumn       int
 }
 
 // BlockKind classifies transcript blocks in the row-virtualized presentation engine.
@@ -94,12 +113,14 @@ const (
 type TranscriptBlock struct {
 	ID        string
 	TurnID    string
+	ParentID  string
 	Kind      BlockKind
 	Role      string
 	Header    string
 	Body      string
 	Streaming bool
 	Collapsed bool
+	Completed bool
 	Depth     int
 	CreatedAt time.Time
 	Data      map[string]any
@@ -116,6 +137,8 @@ type conversationAPI interface {
 	ListConversations(protocol.ConversationListParams) (*protocol.ConversationListResult, error)
 	SubmitConversation(protocol.ConversationSubmitParams) (*protocol.ConversationSubmitResult, error)
 	InterruptTurn(protocol.TurnInterruptParams) (*protocol.TurnInterruptResult, error)
+	ReadOutput(protocol.OutputReadParams) (*protocol.OutputReadResult, error)
+	InspectDiff(protocol.DiffInspectParams) (*protocol.DiffInspectResult, error)
 	RespondConversationPermissionParams(protocol.PermissionRespondParams) error
 	ConversationEvents() <-chan protocol.SessionEventNotification
 	PermissionRequests() <-chan protocol.PermissionRequestNotification
@@ -162,8 +185,20 @@ type conversationResumedMsg struct {
 	err             error
 }
 type conversationSyncMsg struct {
-	result *protocol.ConversationSyncResult
+	result          *protocol.ConversationSyncResult
+	fromWorkerEpoch string
+	err             error
+}
+type outputPageMsg struct {
+	ref    string
+	start  int64
+	result *protocol.OutputReadResult
 	err    error
+}
+type diffInspectMsg struct {
+	generation uint64
+	result     *protocol.DiffInspectResult
+	err        error
 }
 type conversationGapMsg struct{}
 type conversationEvictedMsg string
@@ -231,6 +266,7 @@ func runConversationTUI(ctx context.Context, f *cmdutil.Factory, socketPath stri
 		{Name: "/interrupt", Description: "Stop the active turn"},
 		{Name: "/queue", Description: "Queue a prompt", ArgsHint: "<prompt>"},
 		{Name: "/copy", Description: "Copy the transcript"},
+		{Name: "/diff", Description: "Review working-tree changes"},
 	} {
 		m.slashCommands.Register(command)
 	}
@@ -543,6 +579,9 @@ func (m *conversationTUI) Init() tea.Cmd {
 func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		if m.width != msg.Width {
+			m.inspectionColumn = 0
+		}
 		m.width, m.height = msg.Width, msg.Height
 		func() {
 			defer func() { _ = recover() }()
@@ -634,7 +673,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.syncConversation()
 	case conversationEventMsg:
-		if msg.ConversationID != m.conversation {
+		if msg.ConversationID != m.conversation || (msg.WorkerEpoch != "" && m.workerEpoch != "" && msg.WorkerEpoch != m.workerEpoch) {
 			return m, m.watchEvent()
 		}
 		if msg.Sequence > 0 && msg.Sequence <= m.lastSequence {
@@ -690,33 +729,57 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.watchEvent()
 		case string(agent.EventToolCall):
 			tool := "tool"
+			kind := BlockToolActivity
 			if msg.Data != nil {
 				if name, ok := msg.Data["tool_name"].(string); ok && name != "" {
-					tool = name
+					tool = terminalText(name)
 				}
 				if path, ok := msg.Data["path"].(string); ok && path != "" {
 					line := 0
 					if l, ok := msg.Data["line"].(float64); ok {
 						line = int(l)
 					}
-					tool += " " + FormatWorkspaceFileHyperlink(m.workspace, path, line)
+					tool += " " + FormatWorkspaceFileHyperlink(m.workspace, terminalText(path), line)
 				} else if path, ok := msg.Data["file_path"].(string); ok && path != "" {
 					line := 0
 					if l, ok := msg.Data["line"].(float64); ok {
 						line = int(l)
 					}
-					tool += " " + FormatWorkspaceFileHyperlink(m.workspace, path, line)
+					tool += " " + FormatWorkspaceFileHyperlink(m.workspace, terminalText(path), line)
+				}
+				if _, nested := msg.Data["parent_activity_id"]; nested {
+					kind = BlockSubagentActivity
 				}
 			}
 			block := TranscriptBlock{
 				ID:        newConversationID("block"),
 				TurnID:    msg.TurnID,
-				Kind:      BlockToolActivity,
+				Kind:      kind,
 				Role:      "tool",
 				Header:    "Running " + tool,
 				Body:      "",
 				CreatedAt: time.Now(),
 				Data:      msg.Data,
+			}
+			if kind == BlockSubagentActivity {
+				block.Collapsed = true
+				parent, _ := msg.Data["parent_activity_id"].(map[string]any)
+				parentKey := activityIdentityKey(parent)
+				for _, candidate := range m.blocks {
+					if activityDataKey(candidate.Data) == parentKey && parentKey != "" {
+						block.ParentID = candidate.ID
+						for i := range m.blocks {
+							if m.blocks[i].ID == candidate.ID {
+								m.blocks[i].Collapsed = true
+								break
+							}
+						}
+						break
+					}
+				}
+				if block.ParentID == "" {
+					block.Header = "Detached child · " + block.Header
+				}
 			}
 			m.appendBlock(block)
 			m.transcript = append(m.transcript, toolStyle.Render("Running "+tool))
@@ -727,23 +790,66 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					result = toolResult
 				}
 			}
-			if result != "" {
-				preview := result
-				if len(preview) > 300 {
-					preview = preview[:300] + "…"
+			key := activityDataKey(msg.Data)
+			matched := false
+			for i := len(m.blocks) - 1; i >= 0; i-- {
+				if m.blocks[i].TurnID == msg.TurnID && activityDataKey(m.blocks[i].Data) == key && key != "" {
+					m.blocks[i].Body = result
+					m.blocks[i].Data = msg.Data
+					m.blocks[i].Completed = true
+					name, _ := msg.Data["tool_name"].(string)
+					name = terminalText(name)
+					exitCode, _ := msg.Data["exit_code"].(float64)
+					durationMs, _ := msg.Data["duration_ms"].(float64)
+					if name != "" {
+						mark := "✓"
+						if exitCode != 0 {
+							mark = "✗"
+						}
+						duration := ""
+						if durationMs > 0 {
+							duration = "  ·  " + (time.Duration(durationMs) * time.Millisecond).Round(100*time.Millisecond).String()
+						}
+						m.blocks[i].Header = mark + " " + name + duration
+					}
+					bytes, _ := msg.Data["output_bytes"].(float64)
+					_, hasOutputRef := msg.Data["output_ref"].(string)
+					m.blocks[i].Collapsed = hasOutputRef || len(result) > 500 || bytes > 500 || hasChildActivities(m.blocks[i].ID, m.blocks)
+					m.invalidateBlockCache(m.blocks[i].ID)
+					if parentID := m.blocks[i].ParentID; parentID != "" {
+						m.invalidateBlockCache(parentID)
+					}
+					matched = true
+					break
 				}
-				block := TranscriptBlock{
-					ID:        newConversationID("block"),
-					TurnID:    msg.TurnID,
-					Kind:      BlockToolActivity,
-					Role:      "tool",
-					Header:    "Result",
-					Body:      result,
-					CreatedAt: time.Now(),
-					Data:      msg.Data,
+			}
+			if result != "" && !matched {
+				block := TranscriptBlock{ID: newConversationID("block"), TurnID: msg.TurnID, Kind: BlockToolActivity, Role: "tool", Header: "Result", Body: result, CreatedAt: time.Now(), Collapsed: len(result) > 500, Completed: true, Data: msg.Data}
+				if msg.Data != nil {
+					if ref, ok := msg.Data["output_ref"].(string); ok && ref != "" {
+						block.Collapsed = true
+					}
+					if parent, ok := msg.Data["parent_activity_id"].(map[string]any); ok {
+						block.Kind = BlockSubagentActivity
+						name, _ := msg.Data["tool_name"].(string)
+						if name == "" {
+							name = "tool"
+						}
+						block.Header = terminalText(name)
+						parentKey := activityIdentityKey(parent)
+						for i := range m.blocks {
+							if activityDataKey(m.blocks[i].Data) == parentKey && parentKey != "" {
+								block.ParentID = m.blocks[i].ID
+								m.blocks[i].Collapsed = true
+								break
+							}
+						}
+						if block.ParentID == "" {
+							block.Header = "Detached child · " + block.Header
+						}
+					}
 				}
 				m.appendBlock(block)
-				m.transcript = append(m.transcript, uiMutedStyle.Render(preview))
 			}
 		case string(agent.EventReasoning):
 			if msg.Content != "" {
@@ -891,12 +997,46 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadSync(msg.result)
 		return m, tea.Batch(m.watchEvent(), m.watchPermission())
 	case conversationSyncMsg:
+		if msg.fromWorkerEpoch != "" && msg.fromWorkerEpoch != m.workerEpoch {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
 		} else {
+			if msg.result != nil && msg.result.ConversationID != m.conversation {
+				return m, nil
+			}
 			m.loadSync(msg.result)
 			return m, m.watchEvent()
 		}
+	case outputPageMsg:
+		if m.outputRef == "" || msg.ref != m.outputRef {
+			return m, nil
+		}
+		m.outputLoading = false
+		if msg.err != nil {
+			m.errorText = msg.err.Error()
+			return m, nil
+		}
+		pageIndex := indexInt64(m.outputPageStarts, msg.start)
+		if pageIndex != m.outputPageIndex {
+			m.outputLineScroll = 0
+			m.inspectionColumn = 0
+		}
+		m.outputPage = msg.result
+		m.outputPageIndex = pageIndex
+		return m, nil
+	case diffInspectMsg:
+		if msg.generation != m.diffRequestGeneration {
+			return m, nil
+		}
+		m.diffLoading = false
+		if msg.err != nil {
+			m.errorText = msg.err.Error()
+			return m, nil
+		}
+		m.diffView, m.diffSelected, m.diffFileOpen, m.diffScroll = msg.result, 0, false, 0
+		return m, nil
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -913,6 +1053,143 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.respondPermission(*response)
 			}
 			return m, cmd
+		}
+		if m.diffLoading && m.diffView == nil {
+			if msg.String() == "esc" {
+				m.diffLoading = false
+				m.diffRequestGeneration++
+			}
+			return m, nil
+		}
+		if m.diffView != nil {
+			switch msg.String() {
+			case "esc":
+				if m.diffFileOpen {
+					m.diffFileOpen = false
+					m.diffScroll = 0
+				} else {
+					m.diffView = nil
+				}
+				return m, nil
+			case "up", "k":
+				if m.diffFileOpen {
+					m.diffScroll = max(0, m.diffScroll-1)
+				} else if m.diffSelected > 0 {
+					m.diffSelected--
+				}
+				return m, nil
+			case "down", "j":
+				if m.diffFileOpen {
+					lastLine := strings.Count(m.diffView.Files[m.diffSelected].Diff, "\n")
+					m.diffScroll = min(lastLine, m.diffScroll+1)
+				} else if m.diffSelected+1 < len(m.diffView.Files) {
+					m.diffSelected++
+				}
+				return m, nil
+			case "enter":
+				if !m.diffFileOpen && len(m.diffView.Files) > 0 {
+					m.diffFileOpen = true
+					m.inspectionColumn = 0
+				}
+				return m, nil
+			case "left", "right":
+				if m.diffFileOpen {
+					m.panInspection(m.diffView.Files[m.diffSelected].Diff, msg.String() == "right")
+				}
+				return m, nil
+			case "pgup":
+				if m.diffFileOpen {
+					m.moveDiffHunk(-1)
+				}
+				return m, nil
+			case "pgdown":
+				if m.diffFileOpen {
+					m.moveDiffHunk(1)
+				}
+				return m, nil
+			}
+			return m, nil
+		}
+		if m.outputRef != "" {
+			switch msg.String() {
+			case "esc":
+				m.outputRef, m.outputPage = "", nil
+				m.clearCache()
+				return m, nil
+			case "pgup":
+				return m, m.changeOutputPage(-1)
+			case "pgdown":
+				return m, m.changeOutputPage(1)
+			case "left", "right":
+				if m.outputPage != nil {
+					m.panInspection(m.outputPage.Data, msg.String() == "right")
+				}
+				return m, nil
+			case "up":
+				m.outputLineScroll = max(0, m.outputLineScroll-1)
+				return m, nil
+			case "down":
+				if m.outputPage != nil {
+					lines := strings.Split(m.outputPage.Data, "\n")
+					m.outputLineScroll = min(max(0, len(lines)-1), m.outputLineScroll+1)
+				}
+				return m, nil
+			}
+			return m, nil
+		}
+		if msg.String() == "f6" && m.choosing == "" {
+			m.transcriptFocused = !m.transcriptFocused
+			if m.transcriptFocused {
+				m.textarea.Blur()
+				m.selectActivity(0)
+			} else {
+				m.textarea.Focus()
+			}
+			m.clearCache()
+			return m, nil
+		}
+		if m.transcriptFocused {
+			switch msg.String() {
+			case "up":
+				m.selectActivity(-1)
+				return m, nil
+			case "down":
+				m.selectActivity(1)
+				return m, nil
+			case "enter":
+				for _, block := range m.blocks {
+					if block.ID != m.selectedActivity {
+						continue
+					}
+					if ref, ok := block.Data["output_ref"].(string); ok && ref != "" {
+						m.outputRef, m.outputPageStarts, m.outputPageIndex = ref, []int64{0}, 0
+						m.outputLineScroll = 0
+						m.inspectionColumn = 0
+						m.outputLoading = true
+						m.textarea.Blur()
+						return m, m.readOutputPage(ref, 0)
+					}
+					for i := range m.blocks {
+						if m.blocks[i].ID == block.ID {
+							m.blocks[i].Collapsed = !m.blocks[i].Collapsed
+							cacheID := block.ID
+							if block.ParentID != "" {
+								cacheID = block.ParentID
+							}
+							m.invalidateBlockCache(cacheID)
+							break
+						}
+					}
+					return m, nil
+				}
+			case "pgup":
+				m.scrollOffset += max(1, m.height/2)
+				return m, nil
+			case "pgdown":
+				m.scrollOffset = max(0, m.scrollOffset-max(1, m.height/2))
+				return m, nil
+			}
+			return m, nil
 		}
 		if m.completionKind != "" {
 			switch msg.String() {
@@ -1050,6 +1327,13 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockSystemStatus, Role: "system", Header: "Help", Body: strings.TrimSpace(help.String()), CreatedAt: time.Now()})
 				return m, nil
+			}
+			if text == "/diff" {
+				if m.conversation == "" {
+					m.errorText = "Start or resume a conversation before opening /diff."
+					return m, nil
+				}
+				return m, m.inspectDiff()
 			}
 			if text == "/interrupt" {
 				if m.conversation == "" {
@@ -1231,7 +1515,7 @@ func (m *conversationTUI) View() tea.View {
 		b.WriteString(uiMutedStyle.Render("Conversation "+m.conversation+"  ·  "+m.state) + "\n")
 	}
 	b.WriteString(strings.Repeat("─", max(1, m.width)) + "\n")
-	if m.choosing != "" {
+	if m.choosing != "" && m.pendingApproval == nil {
 		label := "Choose a project"
 		if m.choosing == "conversation" {
 			label = "Choose a conversation"
@@ -1244,6 +1528,18 @@ func (m *conversationTUI) View() tea.View {
 			}
 			b.WriteString(marker + choice + "\n")
 		}
+	} else if m.pendingApproval == nil && (m.diffView != nil || m.diffLoading || m.outputRef != "") {
+		header := wrapTranscriptLines(strings.TrimSuffix(b.String(), "\n"), m.width)
+		// Keep room for the inspection controls when the terminal is short.
+		header = header[:min(len(header), max(0, m.height-1))]
+		rows := m.height - len(header)
+		var inspection string
+		if m.diffView != nil || m.diffLoading {
+			inspection = m.renderDiffView(rows)
+		} else {
+			inspection = m.renderOutputView(rows)
+		}
+		return tea.NewView(strings.Join(append(header, inspection), "\n"))
 	} else {
 		if len(m.blocks) > 0 {
 			lines := m.computeVisibleLines()
@@ -1313,13 +1609,205 @@ func (m *conversationTUI) View() tea.View {
 		}
 		if m.pendingApproval != nil {
 			footer = "Approval · 1 allow once  ·  2 allow session  ·  3 deny  ·  4 edit args  ·  Ctrl+C detach"
+		} else if m.transcriptFocused {
+			footer = "Transcript focus · ↑/↓ select · Enter inspect/expand · PgUp/PgDn scroll · F6 composer"
+		} else {
+			footer += "  ·  F6 transcript"
 		}
 		b.WriteString("\n" + uiMutedStyle.Render(footer) + "\n")
 	}
 	if m.errorText != "" {
-		b.WriteString(errStyle.Render(m.errorText) + "\n")
+		b.WriteString(errStyle.Render(terminalText(m.errorText)) + "\n")
 	}
 	return tea.NewView(b.String())
+}
+
+func (m *conversationTUI) renderOutputView(height int) string {
+	var header, notices strings.Builder
+	var lines []string
+	header.WriteString(uiTitleStyle.Render("Tool output") + "  ·  " + uiMutedStyle.Render(m.outputRef) + "\n")
+	if m.outputLoading {
+		header.WriteString("Loading output page…\n")
+	} else if m.outputPage != nil {
+		byteStart := int64(0)
+		if m.outputPageIndex < len(m.outputPageStarts) {
+			byteStart = m.outputPageStarts[m.outputPageIndex]
+		}
+		end := byteStart + int64(len(m.outputPage.Data))
+		byteRange := "No output bytes"
+		if end > byteStart {
+			byteRange = fmt.Sprintf("Bytes %d–%d of %d", byteStart+1, end, m.outputPage.TotalBytes)
+		}
+		header.WriteString(uiMutedStyle.Render(byteRange) + "\n\n")
+		lines = strings.Split(m.outputPage.Data, "\n")
+		if m.outputPage.Truncated {
+			notices.WriteString(errStyle.Render("Output capped at 1 MiB; rerun the command with narrower output.") + "\n")
+		}
+		if !m.outputPage.HasMore {
+			notices.WriteString(uiMutedStyle.Render("End of available output") + "\n")
+		}
+	}
+	top, footer, rows := m.inspectionLayout(height, header.String(), notices.String(), "↑/↓ scroll · ←/→ pan · PageUp/PageDown pages · Esc returns to activity")
+	var b strings.Builder
+	b.WriteString(top)
+	m.writeInspectionLines(&b, lines, m.outputLineScroll, rows)
+	b.WriteString(footer)
+	return b.String()
+}
+
+func (m *conversationTUI) renderDiffView(height int) string {
+	var header, notices strings.Builder
+	header.WriteString(uiTitleStyle.Render("Working tree diff") + "  ·  " + uiMutedStyle.Render("/diff") + "\n")
+	var files []protocol.DiffFileEntry
+	if m.diffView != nil && !m.diffLoading {
+		files = m.diffView.Files
+	}
+	if m.diffLoading {
+		header.WriteString("Inspecting Git changes…\n")
+	} else if len(files) == 0 {
+		header.WriteString("No changed files found.\n")
+	} else if !m.diffFileOpen {
+		header.WriteString(fmt.Sprintf("%d files  ·  +%d  −%d\n\n", m.diffView.Stats.FilesChanged, m.diffView.Stats.Additions, m.diffView.Stats.Deletions))
+	} else {
+		f := files[m.diffSelected]
+		header.WriteString(terminalText(f.Path) + "  ·  " + diffAttributionLabel(f) + "\n")
+		if notice := diffFileNotice(f); notice != "" {
+			header.WriteString(uiMutedStyle.Render(notice) + "\n")
+		}
+	}
+	if m.diffView != nil && !m.diffLoading {
+		if m.diffView.Warning != "" {
+			notices.WriteString(errStyle.Render(terminalText(m.diffView.Warning)) + "\n")
+		}
+		if m.diffView.OmittedPaths > 0 {
+			notices.WriteString(uiMutedStyle.Render(fmt.Sprintf("%d paths omitted because they could not be represented or read safely", m.diffView.OmittedPaths)) + "\n")
+		}
+		if m.diffView.Truncated {
+			notices.WriteString(errStyle.Render("Diff output was capped to fit the safe response limit.") + "\n")
+		}
+	}
+	hint := "↑/↓ files · Enter open · Esc close"
+	if m.diffLoading {
+		hint = "Esc close"
+	} else if m.diffFileOpen {
+		hint = "↑/↓ scroll · ←/→ pan · PageUp/PageDown hunks · Esc file list"
+	}
+	top, footer, rows := m.inspectionLayout(height, header.String(), notices.String(), hint)
+	var b strings.Builder
+	b.WriteString(top)
+	if len(files) > 0 && m.diffFileOpen {
+		m.writeInspectionLines(&b, strings.Split(files[m.diffSelected].Diff, "\n"), m.diffScroll, rows)
+	} else if len(files) > 0 {
+		start := max(0, min(m.diffSelected-rows+1, len(files)-rows))
+		for i := start; i < min(len(files), start+rows); i++ {
+			f := files[i]
+			marker := "  "
+			if i == m.diffSelected {
+				marker = "› "
+			}
+			path := strings.ReplaceAll(f.Path, "\n", " ")
+			line := fmt.Sprintf("%s%s %-18s %s", marker, inspectionText(path), diffAttributionLabel(f), diffFileNotice(f))
+			b.WriteString(ansi.Truncate(line, max(1, m.width), "…") + "\n")
+		}
+	}
+	b.WriteString(footer)
+	return b.String()
+}
+
+func (m *conversationTUI) inspectionLayout(height int, header, notices, hint string) (string, string, int) {
+	if m.errorText != "" {
+		notices += errStyle.Render(terminalText(m.errorText)) + "\n"
+	}
+	controls := wrapTranscriptLines(uiMutedStyle.Render(hint), m.width)
+	if len(controls) > height {
+		controls = wrapTranscriptLines(uiMutedStyle.Render("Esc close"), m.width)
+	}
+	controls = controls[:min(len(controls), max(0, height))]
+	headerRows := wrapTranscriptLines(strings.TrimSuffix(header, "\n"), m.width)
+	headerRows = headerRows[:min(len(headerRows), max(0, height-len(controls)))]
+	noticeRows := wrapTranscriptLines(notices, m.width)
+	noticeRows = noticeRows[:min(len(noticeRows), max(0, height-len(controls)-len(headerRows)))]
+	rows := max(0, height-len(headerRows)-len(noticeRows)-len(controls))
+	return strings.Join(append(headerRows, ""), "\n"), strings.Join(append(noticeRows, controls...), "\n"), rows
+}
+
+func (m *conversationTUI) writeInspectionLines(b *strings.Builder, lines []string, offset, rows int) {
+	start := min(offset, max(0, len(lines)-1))
+	for _, line := range lines[start:min(len(lines), start+rows)] {
+		b.WriteString(m.inspectionLine(line) + "\n")
+	}
+}
+
+func inspectionText(line string) string {
+	return strings.ReplaceAll(terminalText(line), "\t", "    ")
+}
+
+func (m *conversationTUI) inspectionLine(line string) string {
+	return ansi.Cut(inspectionText(line), m.inspectionColumn, m.inspectionColumn+max(1, m.width))
+}
+
+func (m *conversationTUI) panInspection(content string, right bool) {
+	step := max(1, m.width/2)
+	if !right {
+		m.inspectionColumn = max(0, m.inspectionColumn-step)
+		return
+	}
+	longest := 0
+	for line := range strings.SplitSeq(content, "\n") {
+		longest = max(longest, ansi.StringWidth(inspectionText(line)))
+	}
+	m.inspectionColumn = min(max(0, longest-max(1, m.width)), m.inspectionColumn+step)
+}
+
+func diffAttributionLabel(f protocol.DiffFileEntry) string {
+	if f.AttributionUnknown {
+		return "Unknown"
+	}
+	if f.IsBuddyEdit && f.WasDirtyAtStart {
+		return "Buddy + pre-existing"
+	}
+	if f.IsBuddyEdit {
+		return "Buddy edit"
+	}
+	if f.WasDirtyAtStart {
+		return "Pre-existing"
+	}
+	return "Unknown"
+}
+
+func diffFileNotice(f protocol.DiffFileEntry) string {
+	var values []string
+	if f.IsBinary {
+		values = append(values, "binary omitted")
+	}
+	if f.Truncated {
+		values = append(values, "truncated")
+	}
+	return strings.Join(values, ", ")
+}
+
+func (m *conversationTUI) moveDiffHunk(direction int) {
+	if m.diffView == nil || m.diffSelected >= len(m.diffView.Files) {
+		return
+	}
+	lines := strings.Split(m.diffView.Files[m.diffSelected].Diff, "\n")
+	if direction > 0 {
+		for i := m.diffScroll + 1; i < len(lines); i++ {
+			if strings.HasPrefix(lines[i], "@@") {
+				m.diffScroll = i
+				return
+			}
+		}
+		m.diffScroll = min(len(lines)-1, m.diffScroll+max(1, m.height/2))
+		return
+	}
+	for i := m.diffScroll - 1; i >= 0; i-- {
+		if strings.HasPrefix(lines[i], "@@") {
+			m.diffScroll = i
+			return
+		}
+	}
+	m.diffScroll = max(0, m.diffScroll-max(1, m.height/2))
 }
 
 func (m *conversationTUI) start(prompt string) tea.Cmd {
@@ -1332,6 +1820,107 @@ func (m *conversationTUI) start(prompt string) tea.Cmd {
 			return conversationStartedMsg{err: err}
 		}
 		return conversationStartedMsg{result: result}
+	}
+}
+
+func (m *conversationTUI) selectActivity(delta int) {
+	activities := make([]string, 0)
+	for _, block := range m.blocks {
+		if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity {
+			continue
+		}
+		if block.ParentID == "" || parentActivityExpanded(block, m.blocks) {
+			activities = append(activities, block.ID)
+		}
+	}
+	if len(activities) == 0 {
+		m.selectedActivity = ""
+		return
+	}
+	index := 0
+	for i, id := range activities {
+		if id == m.selectedActivity {
+			index = i
+			break
+		}
+	}
+	index = max(0, min(len(activities)-1, index+delta))
+	m.selectedActivity = activities[index]
+	m.clearCache()
+	var before, total int
+	selectedParent := ""
+	for _, block := range m.blocks {
+		if block.ID == m.selectedActivity {
+			selectedParent = block.ParentID
+			break
+		}
+	}
+	for _, block := range m.blocks {
+		total += m.getBlockLineCount(block, m.width)
+	}
+	for _, block := range m.blocks {
+		count := m.getBlockLineCount(block, m.width)
+		if block.ID == m.selectedActivity || (selectedParent != "" && block.ID == selectedParent) {
+			row := count / 2
+			if selectedParent != "" {
+				rendered, childOffset := m.renderBlock(block, m.width)
+				if childOffset >= 0 {
+					row = len(wrapTranscriptLines(rendered[:childOffset], m.width))
+				}
+			}
+			m.scrollOffset = max(0, total-(before+row+m.viewportHeight()/2))
+			break
+		}
+		before += count
+	}
+}
+
+func (m *conversationTUI) readOutputPage(ref string, offset int64) tea.Cmd {
+	conversationID := m.conversation
+	return func() tea.Msg {
+		result, err := m.client.ReadOutput(protocol.OutputReadParams{ConversationID: conversationID, OutputRef: ref, Offset: offset})
+		return outputPageMsg{ref: ref, start: offset, result: result, err: err}
+	}
+}
+
+func (m *conversationTUI) changeOutputPage(delta int) tea.Cmd {
+	if m.outputLoading || len(m.outputPageStarts) == 0 {
+		return nil
+	}
+	index := m.outputPageIndex + delta
+	if index < 0 {
+		return nil
+	}
+	if index < len(m.outputPageStarts) {
+		m.outputLoading = true
+		return m.readOutputPage(m.outputRef, m.outputPageStarts[index])
+	}
+	if delta > 0 && m.outputPage != nil && m.outputPage.HasMore {
+		offset := m.outputPage.NextOffset
+		m.outputPageStarts = append(m.outputPageStarts, offset)
+		m.outputLoading = true
+		return m.readOutputPage(m.outputRef, offset)
+	}
+	return nil
+}
+
+func indexInt64(values []int64, value int64) int {
+	for i, v := range values {
+		if v == value {
+			return i
+		}
+	}
+	return 0
+}
+
+func (m *conversationTUI) inspectDiff() tea.Cmd {
+	conversationID := m.conversation
+	m.diffRequestGeneration++
+	generation := m.diffRequestGeneration
+	m.diffLoading = true
+	return func() tea.Msg {
+		result, err := m.client.InspectDiff(protocol.DiffInspectParams{ConversationID: conversationID})
+		return diffInspectMsg{generation: generation, result: result, err: err}
 	}
 }
 
@@ -1416,10 +2005,10 @@ func (m *conversationTUI) respondPermission(params protocol.PermissionRespondPar
 }
 
 func (m *conversationTUI) syncConversation() tea.Cmd {
-	id := m.conversation
+	id, epoch := m.conversation, m.workerEpoch
 	return func() tea.Msg {
 		result, err := readConversationSnapshot(m.client, id)
-		return conversationSyncMsg{result: result, err: err}
+		return conversationSyncMsg{result: result, fromWorkerEpoch: epoch, err: err}
 	}
 }
 
@@ -1433,7 +2022,23 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	if result == nil {
 		return
 	}
+	activitiesByTurn := make(map[string][]TranscriptBlock)
+	var activityTurns []string
+	if m.conversation == result.ConversationID && m.workerEpoch == result.WorkerEpoch {
+		for _, block := range m.blocks {
+			if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity {
+				continue
+			}
+			if len(activitiesByTurn[block.TurnID]) == 0 {
+				activityTurns = append(activityTurns, block.TurnID)
+			}
+			activitiesByTurn[block.TurnID] = append(activitiesByTurn[block.TurnID], block)
+		}
+	} else {
+		m.selectedActivity, m.outputRef, m.outputPage, m.outputLoading = "", "", nil, false
+	}
 	m.conversation, m.state = result.ConversationID, result.State
+	m.workerEpoch = result.WorkerEpoch
 	if result.ExecutionBlocked != "" {
 		m.errorText = "Execution is paused: " + result.ExecutionBlocked
 	} else if strings.HasPrefix(m.errorText, "Execution is paused: ") {
@@ -1452,7 +2057,18 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	if result.OutputIncomplete {
 		m.errorText = "Some transient output is unavailable; restored from durable conversation history."
 	}
-	for _, entry := range result.Transcript {
+	// Keep transient activity groups next to their turn's last durable entry.
+	lastEntry := make(map[string]int, len(activitiesByTurn))
+	for i, entry := range result.Transcript {
+		if entry.TurnID != "" && len(activitiesByTurn[entry.TurnID]) > 0 {
+			lastEntry[entry.TurnID] = i
+		}
+	}
+	for i, entry := range result.Transcript {
+		last, hasActivities := lastEntry[entry.TurnID]
+		if hasActivities && last == i && entry.Role == "assistant" {
+			m.blocks = append(m.blocks, activitiesByTurn[entry.TurnID]...)
+		}
 		if entry.Role == "user" {
 			m.appendBlock(TranscriptBlock{
 				ID:        newConversationID("block"),
@@ -1485,6 +2101,14 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 				CreatedAt: time.Now(),
 			})
 			m.transcript = append(m.transcript, uiBuddyStyle.Render("Buddy")+"\n"+entry.Content)
+		}
+		if hasActivities && last == i && entry.Role != "assistant" {
+			m.blocks = append(m.blocks, activitiesByTurn[entry.TurnID]...)
+		}
+	}
+	for _, turnID := range activityTurns {
+		if _, found := lastEntry[turnID]; !found {
+			m.blocks = append(m.blocks, activitiesByTurn[turnID]...)
 		}
 	}
 }
@@ -1566,9 +2190,15 @@ func (m *conversationTUI) appendBlock(block TranscriptBlock) {
 		block.CreatedAt = time.Now()
 	}
 	m.blocks = append(m.blocks, block)
+	if block.ParentID != "" {
+		m.invalidateBlockCache(block.ParentID)
+	}
 }
 
 func (m *conversationTUI) getBlockLineCount(b TranscriptBlock, width int) int {
+	if b.ParentID != "" {
+		return 0
+	}
 	if width <= 0 {
 		width = 80
 	}
@@ -1592,6 +2222,9 @@ func (m *conversationTUI) getWrappedLines(b TranscriptBlock, width int) []string
 	if width <= 0 {
 		width = 80
 	}
+	if b.ParentID != "" {
+		return nil
+	}
 	if m.wrapCache == nil {
 		m.wrapCache = make(map[string][]string)
 	}
@@ -1599,17 +2232,8 @@ func (m *conversationTUI) getWrappedLines(b TranscriptBlock, width int) []string
 	if lines, ok := m.wrapCache[key]; ok {
 		return lines
 	}
-	rendered := m.renderBlock(b, width)
-	lines := strings.Split(rendered, "\n")
-	var wrapped []string
-	for _, l := range lines {
-		if lipgloss.Width(l) <= width {
-			wrapped = append(wrapped, l)
-		} else {
-			renderedLine := lipgloss.NewStyle().Width(width).Render(l)
-			wrapped = append(wrapped, strings.Split(renderedLine, "\n")...)
-		}
-	}
+	rendered, _ := m.renderBlock(b, width)
+	wrapped := wrapTranscriptLines(rendered, width)
 	m.wrapCache[key] = wrapped
 	if m.lineCountCache == nil {
 		m.lineCountCache = make(map[string]int)
@@ -1618,18 +2242,35 @@ func (m *conversationTUI) getWrappedLines(b TranscriptBlock, width int) []string
 	return wrapped
 }
 
-func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) string {
+func wrapTranscriptLines(rendered string, width int) []string {
+	if width <= 0 {
+		width = 80
+	}
+	var wrapped []string
+	for l := range strings.SplitSeq(rendered, "\n") {
+		if lipgloss.Width(l) <= width {
+			wrapped = append(wrapped, l)
+		} else {
+			renderedLine := lipgloss.NewStyle().Width(width).Render(l)
+			wrapped = append(wrapped, strings.Split(renderedLine, "\n")...)
+		}
+	}
+	return wrapped
+}
+
+func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) (string, int) {
 	if width <= 0 {
 		width = 80
 	}
 	var content string
+	childOffset := -1
 	switch b.Kind {
 	case BlockUserMessage:
 		header := b.Header
 		if header == "" {
 			header = "You"
 		}
-		content = uiUserStyle.Render(header) + "\n" + b.Body
+		content = uiUserStyle.Render(terminalText(header)) + "\n" + terminalText(b.Body)
 	case BlockAssistantMessage:
 		header := b.Header
 		if header == "" {
@@ -1640,33 +2281,160 @@ func (m *conversationTUI) renderBlock(b TranscriptBlock, width int) string {
 			body = m.streamingText
 		}
 		if b.Role == "reasoning" {
-			content = thoughtStyle.Render(body)
+			content = thoughtStyle.Render(terminalText(body))
 		} else {
-			body = ProcessMarkdownTables(body, width, 0)
-			content = uiBuddyStyle.Render(header) + "\n" + body
+			body = ProcessMarkdownTables(terminalText(body), width, 0)
+			content = uiBuddyStyle.Render(terminalText(header)) + "\n" + body
 		}
 	case BlockToolActivity:
-		if b.Body == "" {
+		if b.Collapsed {
+			content = toolStyle.Render(b.Header + "  ·  Enter to inspect")
+			if bytes, ok := b.Data["output_bytes"].(float64); ok && bytes > 0 {
+				content = toolStyle.Render(fmt.Sprintf("%s  ·  %s  ·  Enter to inspect", b.Header, formatOutputBytes(int64(bytes))))
+			}
+		} else if b.Body == "" {
 			content = toolStyle.Render(b.Header)
 		} else {
-			preview := b.Body
-			if len(preview) > 300 {
-				preview = preview[:300] + "…"
+			content = toolStyle.Render(b.Header) + "\n" + uiMutedStyle.Render(terminalText(b.Body))
+		}
+		children := childActivities(b.ID, m.blocks)
+		if len(children) > 0 {
+			completed := 0
+			for _, child := range children {
+				if child.Completed {
+					completed++
+				}
 			}
-			content = uiMutedStyle.Render(preview)
+			count := fmt.Sprintf("%d steps", len(children))
+			if len(children) == 1 {
+				count = "1 step"
+			}
+			if completed == len(children) {
+				count += " completed"
+			}
+			content = toolStyle.Render(fmt.Sprintf("[Subagent: %s (%s)]", subagentName(b), count))
+			if !b.Collapsed {
+				for _, child := range children {
+					childLine := "  ↳ " + terminalText(child.Header)
+					if ref, ok := child.Data["output_ref"].(string); ok && ref != "" {
+						childLine += "  ·  Enter to inspect"
+					}
+					if child.ID == m.selectedActivity {
+						childOffset = len(content)
+						if m.transcriptFocused {
+							childLine = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render(childLine)
+						}
+					}
+					content += "\n" + childLine
+					if child.Body != "" && !child.Collapsed {
+						content += "\n    " + terminalText(child.Body)
+					}
+				}
+				if b.Body != "" {
+					content += "\n" + uiMutedStyle.Render(terminalText(b.Body))
+				}
+			}
 		}
 	case BlockSubagentActivity:
 		header := b.Header
 		if header == "" {
 			header = "Subagent"
 		}
-		content = uiTitleStyle.Render(header) + "\n" + b.Body
+		content = uiTitleStyle.Render("↳ "+terminalText(header)) + "\n"
+		if !b.Collapsed {
+			content += terminalText(b.Body)
+		}
 	case BlockSystemStatus:
-		content = uiMutedStyle.Render(b.Body)
+		content = uiMutedStyle.Render(terminalText(b.Body))
 	default:
 		content = b.Body
 	}
-	return content
+	if m.transcriptFocused && b.ID == m.selectedActivity {
+		content = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render(content)
+	}
+	return content, childOffset
+}
+
+func childActivities(parentID string, blocks []TranscriptBlock) []TranscriptBlock {
+	children := make([]TranscriptBlock, 0)
+	for _, block := range blocks {
+		if block.ParentID == parentID {
+			children = append(children, block)
+		}
+	}
+	return children
+}
+
+func hasChildActivities(parentID string, blocks []TranscriptBlock) bool {
+	for _, block := range blocks {
+		if block.ParentID == parentID {
+			return true
+		}
+	}
+	return false
+}
+
+func parentActivityExpanded(block TranscriptBlock, blocks []TranscriptBlock) bool {
+	for _, parent := range blocks {
+		if parent.ID == block.ParentID {
+			return !parent.Collapsed
+		}
+	}
+	return false
+}
+
+func subagentName(block TranscriptBlock) string {
+	if name, ok := block.Data["tool_name"].(string); ok && name == "invoke_subagent" {
+		if agentName, ok := block.Data["agent_name"].(string); ok && agentName != "" {
+			return terminalText(agentName)
+		}
+		return "worker"
+	}
+	return terminalText(block.Header)
+}
+
+func terminalText(value string) string {
+	value = ansi.Strip(value)
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return -1
+		}
+		return r
+	}, value)
+}
+
+func activityDataKey(data map[string]any) string {
+	if data == nil {
+		return ""
+	}
+	id, ok := data["activity_id"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	return activityIdentityKey(id)
+}
+
+func activityIdentityKey(id map[string]any) string {
+	if id == nil {
+		return ""
+	}
+	turn, _ := id["turn_id"].(string)
+	step, _ := id["step"].(float64)
+	call, _ := id["tool_call_id"].(string)
+	if turn == "" || call == "" {
+		return ""
+	}
+	return turn + "\x00" + strconv.Itoa(int(step)) + "\x00" + call
+}
+
+func formatOutputBytes(size int64) string {
+	if size >= 1<<20 {
+		return fmt.Sprintf("%.1f MiB", float64(size)/(1<<20))
+	}
+	if size >= 1<<10 {
+		return fmt.Sprintf("%.1f KiB", float64(size)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", size)
 }
 
 func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {
@@ -1689,7 +2457,13 @@ func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {
 
 	if totalLines <= vpHeight {
 		m.scrollOffset = 0
-		return m.blocks
+		visible := make([]TranscriptBlock, 0, len(m.blocks))
+		for _, block := range m.blocks {
+			if block.ParentID == "" {
+				visible = append(visible, block)
+			}
+		}
+		return visible
 	}
 
 	maxScroll := max(0, totalLines-vpHeight)
@@ -1706,6 +2480,9 @@ func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {
 	var visible []TranscriptBlock
 	curLine := 0
 	for i, block := range m.blocks {
+		if block.ParentID != "" {
+			continue
+		}
 		blockStart := curLine
 		blockEnd := curLine + lineCounts[i]
 		curLine = blockEnd
@@ -1740,6 +2517,9 @@ func (m *conversationTUI) computeVisibleLines() []string {
 		m.scrollOffset = 0
 		var allLines []string
 		for _, b := range m.blocks {
+			if b.ParentID != "" {
+				continue
+			}
 			wLines := m.getWrappedLines(b, width)
 			allLines = append(allLines, wLines...)
 			allLines = append(allLines, "")
@@ -1762,6 +2542,9 @@ func (m *conversationTUI) computeVisibleLines() []string {
 	var visibleLines []string
 	curLine := 0
 	for i, b := range m.blocks {
+		if b.ParentID != "" {
+			continue
+		}
 		blockStart := curLine
 		blockEnd := curLine + lineCounts[i]
 		curLine = blockEnd

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,6 +141,82 @@ func TestClient_ConversationStartAndSubmit(t *testing.T) {
 	}
 	if resumed.ConversationID != started.ConversationID || resumed.HistoryRevision != firstPage.HistoryRevision {
 		t.Fatalf("resume did not preserve conversation identity/revision: %+v", resumed)
+	}
+}
+
+func TestClient_ActivityInspectionRPCs(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := persistence.NewSQLiteStore(filepath.Join(workspace, "buddy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+	factory := func(sessionID string, _ protocol.SessionStartParams, emit agent.EventHandler) (*agent.Engine, func(), error) {
+		return agent.NewEngine(&mockProvider{}, "test-model", 2, tools.NewRegistry(1000), nil, emit,
+			agent.WithSystemPromptOverride("system"), agent.WithStore(store), agent.WithWorkspaceDir(workspace), agent.WithSessionIDOverride(sessionID)), nil, nil
+	}
+	manager := daemon.NewSessionManager(factory)
+	sockPath := filepath.Join(workspace, "inspect.sock")
+	server := daemon.NewServer(daemon.NewSocketManager(sockPath), manager)
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := server.Stop(); err != nil {
+			t.Errorf("stop server: %v", err)
+		}
+	}()
+	client, err := Connect(sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	}()
+	started, err := client.StartConversation(protocol.ConversationStartParams{StartID: "inspect-start", SubmissionID: "inspect-first", Prompt: "inspect", WorkspaceDir: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities, err := client.Capabilities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(capabilities.Methods, protocol.MethodOutputRead) || !containsString(capabilities.Methods, protocol.MethodDiffInspect) {
+		t.Fatalf("inspection RPCs not advertised: %v", capabilities.Methods)
+	}
+	worker, ok := manager.GetConversation(started.ConversationID)
+	if !ok {
+		t.Fatal("conversation worker missing")
+	}
+	worker.EmitEvent(agent.Event{Type: agent.EventToolResult, ToolCallID: "synthetic", ToolResult: strings.Repeat("x", 300<<10)})
+	var outputRef string
+	deadline := time.After(2 * time.Second)
+	for outputRef == "" {
+		select {
+		case evt := <-client.ConversationEvents():
+			if ref, ok := evt.Data["output_ref"].(string); ok {
+				outputRef = ref
+			}
+		case <-deadline:
+			t.Fatal("output reference notification not received")
+		}
+	}
+	page, err := client.ReadOutput(protocol.OutputReadParams{ConversationID: started.ConversationID, OutputRef: outputRef, Offset: 0, Limit: 1024})
+	if err != nil || len(page.Data) != 1024 || !page.HasMore {
+		t.Fatalf("output.read returned page=%+v err=%v", page, err)
+	}
+	diff, err := client.InspectDiff(protocol.DiffInspectParams{ConversationID: started.ConversationID})
+	if err != nil || diff == nil {
+		t.Fatalf("diff.inspect result=%+v err=%v", diff, err)
 	}
 }
 

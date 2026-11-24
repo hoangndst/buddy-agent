@@ -237,6 +237,7 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 				protocol.MethodDaemonStatus, protocol.MethodConversationStart, protocol.MethodConversationResume,
 				protocol.MethodConversationSubmit, protocol.MethodConversationSync, protocol.MethodConversationWorkspaces,
 				protocol.MethodConversationList, protocol.MethodTurnInterrupt,
+				protocol.MethodOutputRead, protocol.MethodDiffInspect,
 			}})
 			_ = client.Send(res)
 		}
@@ -399,6 +400,50 @@ func (s *Server) dispatchMessage(client *clientConnection, msg *protocol.JSONRPC
 		result, _, err := worker.Sync(s.ctx, params, client)
 		if err != nil {
 			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInternalError, "conversation sync failed", err.Error()))
+			return
+		}
+		res, _ := protocol.NewResponse(*msg.ID, result)
+		_ = client.Send(res)
+
+	case protocol.MethodOutputRead:
+		if msg.ID == nil {
+			return
+		}
+		var params protocol.OutputReadParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil || params.ConversationID == "" || params.OutputRef == "" {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid output.read params", nil))
+			return
+		}
+		worker, ok := s.sessionMgr.GetConversation(params.ConversationID)
+		if !ok {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeSessionNotFound, "conversation worker is not resident; resume the conversation first", nil))
+			return
+		}
+		result, err := worker.ReadOutput(params)
+		if err != nil {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "output read failed", err.Error()))
+			return
+		}
+		res, _ := protocol.NewResponse(*msg.ID, result)
+		_ = client.Send(res)
+
+	case protocol.MethodDiffInspect:
+		if msg.ID == nil {
+			return
+		}
+		var params protocol.DiffInspectParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil || params.ConversationID == "" {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInvalidParams, "invalid diff.inspect params", nil))
+			return
+		}
+		worker, ok := s.sessionMgr.GetConversation(params.ConversationID)
+		if !ok {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeSessionNotFound, "conversation worker is not resident; resume the conversation first", nil))
+			return
+		}
+		result, err := worker.InspectDiff(s.ctx)
+		if err != nil {
+			_ = client.Send(protocol.NewErrorResponse(msg.ID, protocol.ErrCodeInternalError, "diff inspection failed", err.Error()))
 			return
 		}
 		res, _ := protocol.NewResponse(*msg.ID, result)

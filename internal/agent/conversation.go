@@ -269,6 +269,9 @@ func RestoreConversationRuntime(ctx context.Context, engine *Engine, store persi
 		}
 		tracker = history.RestoreStateTracker(state)
 	}
+	if tracker == nil {
+		tracker = history.NewStateTracker(sessionRecord.Task, nil)
+	}
 	steps, err := store.GetTurnsAfterStep(ctx, sessionID, compactedStep)
 	if err != nil {
 		return nil, fmt.Errorf("load conversation steps: %w", err)
@@ -313,6 +316,19 @@ func RestoreConversationRuntime(ctx context.Context, engine *Engine, store persi
 			promptIndex++
 		}
 		trailing = append(trailing, mapTurnRecordToBlock(step))
+		for _, tc := range step.ToolCalls {
+			if tc.ExitCode == 0 && (tc.Name == "write_file" || tc.Name == "edit_file") {
+				var args struct{ Path string }
+				if json.Unmarshal([]byte(tc.Args), &args) == nil && args.Path != "" {
+					if path := normalizeWorkspacePath(sessionRecord.WorkingDir, args.Path); path != "" {
+						tracker.RecordFileAccess(path, "modified")
+					}
+				}
+			}
+			if tc.ExitCode != 0 {
+				tracker.RecordError(fmt.Sprintf("%s: %s", tc.Name, tc.Result))
+			}
+		}
 	}
 	for promptIndex < len(appliedSubmissions) {
 		appendPrompt(appliedSubmissions[promptIndex])

@@ -12,6 +12,7 @@ import (
 
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/cmdutil"
 
@@ -25,6 +26,9 @@ type conversationAPITestDouble struct {
 	startCalls  int
 	submissions chan protocol.ConversationSubmitParams
 	events      chan protocol.SessionEventNotification
+	outputReads []protocol.OutputReadParams
+	diffResult  *protocol.DiffInspectResult
+	syncResult  *protocol.ConversationSyncResult
 }
 
 func (f *conversationAPITestDouble) Capabilities() (*protocol.DaemonCapabilitiesResult, error) {
@@ -41,6 +45,9 @@ func (f *conversationAPITestDouble) ResumeConversation(protocol.ConversationResu
 	return nil, errors.New("unexpected resume")
 }
 func (f *conversationAPITestDouble) SyncConversation(protocol.ConversationSyncParams) (*protocol.ConversationSyncResult, error) {
+	if f.syncResult != nil {
+		return f.syncResult, nil
+	}
 	return &protocol.ConversationSyncResult{}, nil
 }
 func (f *conversationAPITestDouble) ListConversationWorkspaces(int) (*protocol.ConversationListWorkspacesResult, error) {
@@ -55,6 +62,16 @@ func (f *conversationAPITestDouble) SubmitConversation(params protocol.Conversat
 }
 func (f *conversationAPITestDouble) InterruptTurn(protocol.TurnInterruptParams) (*protocol.TurnInterruptResult, error) {
 	return nil, nil
+}
+func (f *conversationAPITestDouble) ReadOutput(params protocol.OutputReadParams) (*protocol.OutputReadResult, error) {
+	f.outputReads = append(f.outputReads, params)
+	return &protocol.OutputReadResult{Data: "page", TotalBytes: 4}, nil
+}
+func (f *conversationAPITestDouble) InspectDiff(protocol.DiffInspectParams) (*protocol.DiffInspectResult, error) {
+	if f.diffResult != nil {
+		return f.diffResult, nil
+	}
+	return &protocol.DiffInspectResult{}, nil
 }
 func (f *conversationAPITestDouble) RespondConversationPermissionParams(protocol.PermissionRespondParams) error {
 	return nil
@@ -587,7 +604,7 @@ func TestConversationTUIMarkdownTableTruncation(t *testing.T) {
 		CreatedAt: time.Now(),
 	}
 
-	rendered := model.renderBlock(block, 80)
+	rendered, _ := model.renderBlock(block, 80)
 	if !strings.Contains(rendered, "[... 50 rows omitted; use /copy to export full table]") {
 		t.Fatalf("rendered block should contain 200-row truncation badge: %s", rendered)
 	}
@@ -670,6 +687,404 @@ func TestConversationTUICopyCommand(t *testing.T) {
 	}
 }
 
+func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
+	api := &conversationAPITestDouble{submissions: make(chan protocol.ConversationSubmitParams, 1)}
+	model := &conversationTUI{client: api, conversation: "conv-1", textarea: textarea.New(), width: 80, height: 24}
+	model.appendBlock(TranscriptBlock{ID: "activity", TurnID: "turn-1", Kind: BlockToolActivity, Header: "✓ bash", Body: "preview", Collapsed: true, Data: map[string]any{"output_ref": "out-1"}})
+	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	model = updated.(*conversationTUI)
+	if !model.transcriptFocused || model.selectedActivity != "activity" {
+		t.Fatal("F6 did not focus the transcript activity")
+	}
+	updated, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	model = updated.(*conversationTUI)
+	if cmd == nil || model.outputRef != "out-1" {
+		t.Fatal("Enter did not open the selected output pager")
+	}
+	if _, ok := cmd().(outputPageMsg); !ok {
+		t.Fatal("output request did not return a page message")
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	model = updated.(*conversationTUI)
+	if model.outputRef != "" || !model.transcriptFocused {
+		t.Fatal("Escape did not return to transcript focus")
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	model = updated.(*conversationTUI)
+	updated, _ = model.Update(tea.KeyPressMsg{Text: " ", Code: ' '})
+	model = updated.(*conversationTUI)
+	if model.textarea.Value() != " " {
+		t.Fatalf("Space did not remain composer input: %q", model.textarea.Value())
+	}
+}
+
+func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
+	firstPrompt := protocol.ConversationTranscriptEntry{Role: "user", TurnID: "turn-1", Content: "first prompt"}
+	answer := protocol.ConversationTranscriptEntry{Role: "assistant", TurnID: "turn-1", Content: "first answer"}
+	api := &conversationAPITestDouble{submissions: make(chan protocol.ConversationSubmitParams, 1)}
+	m := &conversationTUI{client: api, textarea: textarea.New(), width: 80, height: 24}
+	m.loadSync(&protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", Transcript: []protocol.ConversationTranscriptEntry{firstPrompt}})
+	activity := map[string]any{"turn_id": "turn-1", "step": float64(1), "tool_call_id": "call-1"}
+	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 1, Type: string(agent.EventToolCall),
+		Data: map[string]any{"tool_name": "bash", "activity_id": activity}})
+	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 2, Type: string(agent.EventToolResult), Content: "preview",
+		Data: map[string]any{"tool_name": "bash", "activity_id": activity, "output_ref": "out-1"}})
+	activityID := m.blocks[1].ID
+	openOutput := func(stage string, wantBlocks int) {
+		t.Helper()
+		if len(m.blocks) != wantBlocks || m.blocks[1].ID != activityID || !m.blocks[1].Completed || m.blocks[2].Body != "first answer" {
+			t.Fatalf("%s sync did not reconcile the activity with its originating turn: %+v", stage, m.blocks)
+		}
+		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+		_, open := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+		if m.selectedActivity != activityID || open == nil {
+			t.Fatalf("%s sync lost the selectable output activity", stage)
+		}
+		m.Update(open())
+		if m.outputRef != "out-1" || m.outputPage == nil || m.outputPage.Data != "page" {
+			t.Fatalf("%s sync did not preserve the output pager: ref=%q page=%+v", stage, m.outputRef, m.outputPage)
+		}
+		m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	}
+	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 3,
+		Transcript: []protocol.ConversationTranscriptEntry{firstPrompt, answer}}
+	_, sync := m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 3, Type: string(agent.EventFinished)})
+	m.Update(sync())
+	openOutput("completion", 3)
+
+	nextPrompt := protocol.ConversationTranscriptEntry{Role: "user", TurnID: "turn-2", Content: "second prompt"}
+	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 4,
+		Transcript: []protocol.ConversationTranscriptEntry{firstPrompt, answer, nextPrompt}}
+	_, sync = m.Update(m.submit(nextPrompt.Content, persistence.SubmissionQueue)())
+	m.Update(sync())
+	openOutput("next prompt", 4)
+}
+
+func TestConversationTUIDropsOutputWhenConversationOrWorkerChanges(t *testing.T) {
+	for _, next := range []protocol.ConversationSyncResult{
+		{ConversationID: "conv-1", WorkerEpoch: "worker-2"},
+		{ConversationID: "conv-2", WorkerEpoch: "worker-1"},
+	} {
+		old := &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1"}
+		m := &conversationTUI{client: &conversationAPITestDouble{syncResult: old}}
+		m.loadSync(old)
+		m.appendBlock(TranscriptBlock{ID: "activity", Kind: BlockToolActivity, Data: map[string]any{"output_ref": "old-ref"}})
+		m.selectedActivity, m.outputRef, m.outputLoading = "activity", "old-ref", true
+		lateSync := m.syncConversation()
+		m.loadSync(&next)
+		m.Update(lateSync())
+		m.Update(outputPageMsg{ref: "old-ref", err: errors.New("stale output error")})
+		if m.conversation != next.ConversationID || m.workerEpoch != next.WorkerEpoch || len(m.blocks) != 0 ||
+			m.selectedActivity != "" || m.outputRef != "" || m.outputLoading || m.errorText != "" {
+			t.Fatalf("old output state leaked after switching to %s/%s", next.ConversationID, next.WorkerEpoch)
+		}
+	}
+}
+
+func TestConversationTUIOutputPagerShowsExactByteRange(t *testing.T) {
+	model := &conversationTUI{
+		outputPage:       &protocol.OutputReadResult{Data: "page", TotalBytes: 262144},
+		outputPageStarts: []int64{131072},
+		outputPageIndex:  0,
+	}
+	if view := model.renderOutputView(24); !strings.Contains(view, "Bytes 131073–131076 of 262144") {
+		t.Fatalf("pager did not show exact byte range: %q", view)
+	}
+}
+
+func TestConversationTUIInspectionNoticesFitViewport(t *testing.T) {
+	files := make([]protocol.DiffFileEntry, 24)
+	for i := range files {
+		files[i] = protocol.DiffFileEntry{Path: fmt.Sprintf("file-%02d.txt", i), Diff: strings.Repeat("+changed line\n", 24), Truncated: true}
+	}
+	files[22].Path = strings.Repeat("long-path/", 12) + "file-22.txt"
+	for _, name := range []string{"output", "narrow output", "diff list", "diff file"} {
+		t.Run(name, func(t *testing.T) {
+			m := &conversationTUI{width: 80, height: 24, conversation: "conversation-1", textarea: textarea.New()}
+			var want []string
+			if name == "output" || name == "narrow output" {
+				if name == "narrow output" {
+					m.width = 35
+					m.errorText = "Could not retrieve a previous output page."
+					want = append(want, m.errorText)
+				}
+				data := strings.Repeat("output line\n", 24)
+				m.outputRef = "output-1"
+				m.outputPage = &protocol.OutputReadResult{Data: data, TotalBytes: int64(len(data)), Truncated: true}
+				want = append(want, "output line", "Output capped", "End of available output", "Esc returns to activity")
+			} else {
+				m.width = 58
+				m.diffView = &protocol.DiffInspectResult{
+					Files: files, Stats: protocol.DiffStats{FilesChanged: len(files)},
+					Warning: "Some Git changes could not be read safely\nCheck the worktree before continuing.", OmittedPaths: 3, Truncated: true,
+				}
+				want = []string{"could not be read safely", "Check the worktree", "3 paths omitted", "Diff output was capped"}
+				if name == "diff file" {
+					m.diffFileOpen = true
+					want = append(want, "+changed line", "Esc file list")
+				} else {
+					m.diffSelected = len(files) - 1
+					want = append(want, "› file-23.txt", "Esc close")
+				}
+			}
+			view := m.View().Content
+			if rows := strings.Count(strings.TrimSuffix(view, "\n"), "\n") + 1; rows > m.height {
+				t.Errorf("inspection uses %d rows for a %d-row terminal", rows, m.height)
+			}
+			for line := range strings.SplitSeq(view, "\n") {
+				if width := ansi.StringWidth(line); width > m.width {
+					t.Errorf("inspection line width %d exceeds terminal width %d: %q", width, m.width, line)
+				}
+			}
+			text := strings.Join(strings.Fields(ansi.Strip(view)), " ")
+			for _, fragment := range want {
+				if !strings.Contains(text, fragment) {
+					t.Errorf("inspection lost %q in %q", fragment, view)
+				}
+			}
+		})
+	}
+}
+
+func TestConversationTUIInspectionPansLongLines(t *testing.T) {
+	start := strings.Repeat("界", 5)
+	line := strings.Repeat("界", 12) + "TAIL"
+	for _, tc := range []struct {
+		name string
+		open func(*conversationTUI) string
+	}{
+		{"output", func(m *conversationTUI) string {
+			m.outputRef = "output-1"
+			m.outputPage = &protocol.OutputReadResult{Data: line, TotalBytes: int64(len(line))}
+			return m.renderOutputView(m.height)
+		}},
+		{"diff", func(m *conversationTUI) string {
+			m.diffView = &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: "file.go", Diff: line}}}
+			m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+			return m.renderDiffView(m.height)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &conversationTUI{width: 10, height: 24, textarea: textarea.New()}
+			if view := tc.open(m); strings.Contains(view, "TAIL") || !strings.Contains(view, "\n"+start+"\n") {
+				t.Fatalf("initial viewport did not clip the long line: %q", view)
+			}
+			for range 6 {
+				m.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+			}
+			if view := m.View().Content; !strings.Contains(view, "\n界界界TAIL\n") {
+				t.Fatalf("right pan did not reveal the line ending: %q", view)
+			}
+			for range 6 {
+				m.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
+			}
+			if view := m.View().Content; !strings.Contains(view, "\n"+start+"\n") {
+				t.Fatalf("left pan did not return to the line beginning: %q", view)
+			}
+		})
+	}
+}
+
+func TestConversationTUIDiffNavigationAndDismissal(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24, diffView: &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: "one.go"}, {Path: "two.go", Diff: "header\n@@ -1 +1 @@\n-a\n+b\n@@ -5 +5 @@\n-c\n+d"}}}}
+	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	model = updated.(*conversationTUI)
+	if model.diffSelected != 1 {
+		t.Fatal("Down did not select next changed file")
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	model = updated.(*conversationTUI)
+	if !model.diffFileOpen {
+		t.Fatal("Enter did not open selected diff")
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	model = updated.(*conversationTUI)
+	if model.diffScroll != 1 {
+		t.Fatal("Down did not scroll within the open diff")
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	model = updated.(*conversationTUI)
+	if model.diffScroll != 4 {
+		t.Fatalf("PageDown did not navigate to the next hunk: %d", model.diffScroll)
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	model = updated.(*conversationTUI)
+	if model.diffFileOpen || model.diffView == nil {
+		t.Fatal("Escape did not return to file list")
+	}
+	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	model = updated.(*conversationTUI)
+	if model.diffView != nil {
+		t.Fatal("Escape did not close diff viewer")
+	}
+}
+
+func TestConversationTUIIgnoresDiffNavigationWhileLoading(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New()}
+	model.inspectDiff()
+	for _, key := range []tea.KeyPressMsg{
+		{Code: tea.KeyUp}, {Code: 'k', Text: "k"}, {Code: tea.KeyDown}, {Code: 'j', Text: "j"},
+		{Code: tea.KeyEnter}, {Code: tea.KeyPgUp}, {Code: tea.KeyPgDown},
+	} {
+		_, cmd := model.Update(key)
+		if cmd != nil || !model.diffLoading || model.diffSelected != 0 || model.diffFileOpen || model.diffScroll != 0 || model.textarea.Value() != "" {
+			t.Fatalf("%q changed the UI while the diff was loading", key.String())
+		}
+	}
+	generation := model.diffRequestGeneration
+	model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	model.Update(diffInspectMsg{generation: generation, result: &protocol.DiffInspectResult{}})
+	if model.diffLoading || model.diffView != nil {
+		t.Fatal("Escape did not dismiss the pending diff")
+	}
+}
+
+func TestConversationTUIDiffPageUpAfterPageDownAtEnd(t *testing.T) {
+	model := &conversationTUI{height: 24, diffView: &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{
+		{Path: "tiny.go", Diff: "@@ -1 +1 @@\n-a\n+b"},
+	}}}
+	model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	model.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	pageDownOffset := model.diffScroll
+	model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	downOffset := model.diffScroll
+	model.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+	if model.diffScroll != 0 {
+		t.Fatalf("PageUp did not return to the hunk: %d", model.diffScroll)
+	}
+	if pageDownOffset != 2 || downOffset != 2 {
+		t.Fatalf("scrolling exceeded the last line: PageDown=%d Down=%d", pageDownOffset, downOffset)
+	}
+}
+
+func TestActivityIdentityIncludesModelStep(t *testing.T) {
+	one := map[string]any{"activity_id": map[string]any{"turn_id": "turn-1", "step": float64(2), "tool_call_id": "call-1"}}
+	two := map[string]any{"activity_id": map[string]any{"turn_id": "turn-1", "step": float64(3), "tool_call_id": "call-1"}}
+	if activityDataKey(one) == activityDataKey(two) {
+		t.Fatal("activity keys collided across model steps")
+	}
+}
+
+func TestConversationTUIEscapesUntrustedTerminalContent(t *testing.T) {
+	malicious := "safe\x1b]52;c;clipboard-payload\x07\x1b[2Jtext\x00"
+	clean := terminalText(malicious)
+	if strings.Contains(clean, "\x1b") || strings.ContainsRune(clean, '\x00') || !strings.Contains(clean, "safetext") {
+		t.Fatalf("terminal controls were not removed: %q", clean)
+	}
+	model := &conversationTUI{width: 80, height: 24, diffView: &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: malicious, Diff: malicious}}}}
+	view := model.renderDiffView(model.height)
+	if strings.Contains(view, "\x1b]52") || strings.Contains(view, "\x1b[2J") {
+		t.Fatalf("diff view retained terminal control sequences: %q", view)
+	}
+}
+
+func TestConversationTUIGroupsSubagentActivities(t *testing.T) {
+	model := &conversationTUI{width: 80, height: 24}
+	parent := TranscriptBlock{ID: "parent", Kind: BlockToolActivity, Header: "✓ invoke_subagent", Collapsed: true, Data: map[string]any{"tool_name": "invoke_subagent", "agent_name": "worker"}}
+	child := TranscriptBlock{ID: "child", ParentID: "parent", Kind: BlockSubagentActivity, Header: "✓ read_file", Body: "file contents", Collapsed: true, Completed: true, Data: map[string]any{"output_ref": "child-output"}}
+	model.blocks = []TranscriptBlock{parent, child}
+	collapsed, _ := model.renderBlock(parent, 80)
+	if !strings.Contains(collapsed, "[Subagent: worker (1 step completed)]") || strings.Contains(collapsed, "read_file") {
+		t.Fatalf("collapsed parent did not summarize child activity: %q", collapsed)
+	}
+	parent.Collapsed = false
+	expanded, _ := model.renderBlock(parent, 80)
+	if !strings.Contains(expanded, "read_file") || strings.Contains(strings.Join(model.computeVisibleLines(), "\n"), "file contents") {
+		t.Fatalf("expanded grouping did not nest child activity: %q", expanded)
+	}
+	model.transcriptFocused = true
+	model.blocks[0].Collapsed = false
+	model.selectedActivity = "parent"
+	model.selectActivity(1)
+	if model.selectedActivity != "child" {
+		t.Fatalf("expanded child was not selectable: %q", model.selectedActivity)
+	}
+	updated, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	model = updated.(*conversationTUI)
+	if cmd == nil || model.outputRef != "child-output" {
+		t.Fatal("selected child output did not open its pager")
+	}
+}
+
+func TestConversationTUISelectionKeepsExpandedChildVisible(t *testing.T) {
+	m := &conversationTUI{textarea: textarea.New(), width: 40, height: 21, transcriptFocused: true, selectedActivity: "parent"}
+	m.appendBlock(TranscriptBlock{ID: "parent", Kind: BlockToolActivity, Header: "subagent"})
+	for i := 1; i <= 20; i++ {
+		name := fmt.Sprintf("child-%02d", i)
+		m.appendBlock(TranscriptBlock{
+			ID: name, ParentID: "parent", Kind: BlockSubagentActivity, Header: name,
+			Body: strings.Repeat("wrapped output ", 10) + "\nsecond body line",
+		})
+	}
+	assertVisible := func(step int) {
+		t.Helper()
+		want := fmt.Sprintf("child-%02d", step)
+		view := strings.Join(m.computeVisibleLines(), "\n")
+		if m.selectedActivity != want || !strings.Contains(view, "↳ "+want) {
+			t.Fatalf("selected child %q should be visible after navigation, selected=%q view=%q", want, m.selectedActivity, view)
+		}
+	}
+	for i := 1; i <= 20; i++ {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		assertVisible(i)
+	}
+	for i := 19; i >= 1; i-- {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+		assertVisible(i)
+	}
+}
+
+func TestConversationTUIResultOnlyChildIsDetached(t *testing.T) {
+	model := &conversationTUI{conversation: "conv-1"}
+	updated, _ := model.Update(conversationEventMsg(protocol.SessionEventNotification{
+		ConversationID: "conv-1",
+		TurnID:         "turn-1",
+		Type:           string(agent.EventToolResult),
+		Content:        "read complete",
+		Data: map[string]any{
+			"tool_name":          "read_file",
+			"activity_id":        map[string]any{"turn_id": "turn-1", "step": float64(2), "tool_call_id": "child-call"},
+			"parent_activity_id": map[string]any{"turn_id": "turn-1", "step": float64(1), "tool_call_id": "parent-call"},
+		},
+	}))
+	model = updated.(*conversationTUI)
+	if len(model.blocks) != 1 || model.blocks[0].Kind != BlockSubagentActivity || !strings.HasPrefix(model.blocks[0].Header, "Detached child · ") {
+		t.Fatalf("result-only child was not rendered as detached: %+v", model.blocks)
+	}
+}
+
+func TestConversationTUINestedActivityRefreshesCachedParent(t *testing.T) {
+	m := &conversationTUI{conversation: "conv-1", width: 80, height: 24, textarea: textarea.New()}
+	identity := func(call string) map[string]any {
+		return map[string]any{"turn_id": "turn-1", "step": float64(1), "tool_call_id": call}
+	}
+	emit := func(eventType agent.EventType, tool, call, content string, parent map[string]any) {
+		t.Helper()
+		data := map[string]any{"tool_name": tool, "activity_id": identity(call)}
+		if parent != nil {
+			data["parent_activity_id"] = parent
+		}
+		m.Update(conversationEventMsg(protocol.SessionEventNotification{
+			ConversationID: "conv-1", TurnID: "turn-1", Type: string(eventType), Content: content, Data: data,
+		}))
+	}
+	emit(agent.EventToolCall, "invoke_subagent", "parent", "", nil)
+	_ = m.View()
+	emit(agent.EventToolCall, "read_file", "child", "", identity("parent"))
+	if view := m.View().Content; !strings.Contains(view, "worker (1 step)") {
+		t.Fatalf("cached parent did not show the new child: %q", view)
+	}
+	emit(agent.EventToolResult, "read_file", "child", "read complete", identity("parent"))
+	if view := m.View().Content; !strings.Contains(view, "worker (1 step completed)") {
+		t.Fatalf("cached parent did not show child completion: %q", view)
+	}
+	emit(agent.EventToolResult, "read_file", "result-only", "second read", identity("parent"))
+	if view := m.View().Content; !strings.Contains(view, "worker (2 steps completed)") {
+		t.Fatalf("cached parent did not show the result-only child: %q", view)
+	}
+}
+
 func TestConversationTUILongBlockClipping(t *testing.T) {
 	model := &conversationTUI{
 		textarea:       textarea.New(),
@@ -716,6 +1131,24 @@ func TestConversationTUILongBlockClipping(t *testing.T) {
 	}
 	if strings.Contains(topText, "Response line 100") {
 		t.Fatalf("top view should not contain last response line: %s", topText)
+	}
+}
+
+func TestConversationTUIClippedTranscriptSkipsNestedChildRows(t *testing.T) {
+	m := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	m.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: strings.Repeat("older response\n", m.viewportHeight())})
+	m.appendBlock(TranscriptBlock{ID: "parent", Kind: BlockToolActivity, Header: "subagent", Collapsed: true})
+	for range 10 {
+		m.appendBlock(TranscriptBlock{ParentID: "parent", Kind: BlockSubagentActivity, Header: "child activity", Completed: true})
+	}
+	m.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "latest response"})
+	lines := m.computeVisibleLines()
+	if len(lines) != m.viewportHeight() {
+		t.Fatalf("clipped transcript has %d rows, want %d", len(lines), m.viewportHeight())
+	}
+	view := strings.Join(lines, "\n")
+	if !strings.Contains(view, "subagent (10 steps completed)") || !strings.Contains(view, "latest response") {
+		t.Fatalf("clipped transcript lost visible activity: %q", view)
 	}
 }
 
@@ -869,6 +1302,40 @@ func TestConversationTUIKeepsStreamingWhileApprovalCardIsOpen(t *testing.T) {
 	model = updated.(*conversationTUI)
 	if model.pendingApproval == nil || model.approvalModal == nil || model.activeBlockID == "" {
 		t.Fatalf("approval card blocked streaming: approval=%+v activeBlock=%q", model.pendingApproval, model.activeBlockID)
+	}
+}
+
+func TestConversationTUIApprovalTakesPrecedenceOverInspection(t *testing.T) {
+	request := protocol.PermissionRequestNotification{
+		ConversationID: "conversation-1", TurnID: "turn-1", RequestID: "request-1", Tool: "bash",
+		Arguments: map[string]any{"command": "echo approval details"},
+	}
+	for _, overlay := range []string{"diff", "loading diff", "output"} {
+		t.Run(overlay, func(t *testing.T) {
+			m := &conversationTUI{conversation: request.ConversationID, textarea: textarea.New(), width: 80, height: 24}
+			switch overlay {
+			case "diff":
+				m.diffView = &protocol.DiffInspectResult{}
+			case "loading diff":
+				m.diffLoading = true
+			case "output":
+				m.outputRef = "output-1"
+			}
+			if view := m.View().Content; !strings.Contains(view, "Working tree diff") && !strings.Contains(view, "Tool output") {
+				t.Fatalf("expected inspection before approval: %q", view)
+			}
+			m.Update(permissionRequestMsg(request))
+			if overlay == "loading diff" {
+				m.Update(diffInspectMsg{result: &protocol.DiffInspectResult{}})
+			}
+			if view := m.View().Content; !strings.Contains(view, "bash · turn-1") || !strings.Contains(view, "echo approval details") ||
+				strings.Contains(view, "Working tree diff") || strings.Contains(view, "Tool output") {
+				t.Fatalf("approval request did not take precedence: %q", view)
+			}
+			if _, cmd := m.Update(tea.KeyPressMsg{Code: '1', Text: "1"}); cmd == nil {
+				t.Fatal("visible approval did not receive the allow shortcut")
+			}
+		})
 	}
 }
 

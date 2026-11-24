@@ -8,14 +8,17 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/hoangndst/buddy-agent/internal/agent"
 	"github.com/hoangndst/buddy-agent/internal/agent/provider"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
+	"github.com/hoangndst/buddy-agent/internal/history"
 	"github.com/hoangndst/buddy-agent/internal/persistence"
 	"github.com/hoangndst/buddy-agent/internal/tools"
 )
@@ -191,6 +194,26 @@ func TestSessionManager_BoundCompletedRetention(t *testing.T) {
 
 func TestSessionManager_StartConversationAndQueueSubmissions(t *testing.T) {
 	workspace := t.TempDir()
+	if _, err := exec.LookPath("git"); err == nil {
+		git := func(args ...string) {
+			t.Helper()
+			cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, out)
+			}
+		}
+		git("init", "-q")
+		git("config", "user.email", "test@example.invalid")
+		git("config", "user.name", "Test")
+		if err := os.WriteFile(filepath.Join(workspace, "dirty.txt"), []byte("base\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		git("add", "dirty.txt")
+		git("commit", "-qm", "base")
+		if err := os.WriteFile(filepath.Join(workspace, "dirty.txt"), []byte("pre-existing change\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	store, err := persistence.NewSQLiteStore(filepath.Join(workspace, "buddy.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -212,6 +235,22 @@ func TestSessionManager_StartConversationAndQueueSubmissions(t *testing.T) {
 	}
 	if started.ConversationID == "" || started.TurnID == "" || started.SessionID != started.ConversationID {
 		t.Fatalf("invalid start result: %+v", started)
+	}
+	snapshot, err := store.GetLatestSnapshot(t.Context(), started.ConversationID)
+	if err != nil || snapshot == nil {
+		t.Fatalf("initial baseline snapshot missing: snapshot=%+v err=%v", snapshot, err)
+	}
+	var baseline history.StateTrackerData
+	if err := json.Unmarshal([]byte(snapshot.StateTrackerJSON), &baseline); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".git")); err == nil {
+		if !baseline.BaselineKnown {
+			t.Fatal("initial Git baseline was not marked known")
+		}
+		if _, ok := baseline.InitialDirtyPaths["dirty.txt"]; !ok {
+			t.Fatalf("pre-existing dirty path missing from snapshot: %+v", baseline.InitialDirtyPaths)
+		}
 	}
 
 	// A retry must return the same durable conversation and first turn.
@@ -272,6 +311,15 @@ func TestSessionManager_StartConversationAndQueueSubmissions(t *testing.T) {
 	}
 	if record.ID != started.ConversationID || record.InteractionKind != persistence.InteractionConversation {
 		t.Fatalf("restored wrong conversation record: %+v", record)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".git")); err == nil {
+		recoveredBaseline := restored.runtime.History().Tracker().ExportData()
+		if !recoveredBaseline.BaselineKnown {
+			t.Fatal("resume lost the original Git baseline")
+		}
+		if _, ok := recoveredBaseline.InitialDirtyPaths["dirty.txt"]; !ok {
+			t.Fatalf("resume lost the original dirty path: %+v", recoveredBaseline.InitialDirtyPaths)
+		}
 	}
 	if _, _, err := restored.Submit(t.Context(), &persistence.SubmissionRecord{
 		ConversationID: started.ConversationID, SubmissionID: "submission-after-restore", Prompt: "continue after restore", Mode: persistence.SubmissionQueue,
@@ -707,7 +755,7 @@ func TestServer_OversizedFrameClosesConnectionWithoutLoop(t *testing.T) {
 	}
 	oversized[len(oversized)-1] = '\n'
 
-	if _, err := conn.Write(oversized); err != nil {
+	if _, err := conn.Write(oversized); err != nil && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("failed to write oversized frame: %v", err)
 	}
 
@@ -832,5 +880,21 @@ func TestCreateEventNotificationToolArgsExtractionAliases(t *testing.T) {
 	}
 	if notify.Data["line"] != float64(99) {
 		t.Fatalf("expected line 99, got %v", notify.Data["line"])
+	}
+}
+
+func TestCreateEventNotificationCarriesSubagentRole(t *testing.T) {
+	msg, err := createEventNotification("sess_test", 1, agent.Event{
+		Type: agent.EventToolCall, ToolName: "invoke_subagent", ToolArgs: `{"role":"Explore MCP Config"}`,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notify protocol.SessionEventNotification
+	if err := json.Unmarshal(msg.Params, &notify); err != nil {
+		t.Fatal(err)
+	}
+	if notify.Data["agent_name"] != "Explore MCP Config" {
+		t.Fatalf("subagent role = %v", notify.Data["agent_name"])
 	}
 }

@@ -65,6 +65,8 @@ type ConversationWorker struct {
 	evictionStarted     bool
 	executionBlocked    string
 	cleanupOnce         sync.Once
+	workspaceDir        string
+	outputStore         *outputStore
 	doneOnce            sync.Once
 }
 
@@ -103,6 +105,7 @@ func NewConversationWorker(parent context.Context, id string, engine *agent.Engi
 		ring: NewEventRingBuffer(DefaultRingBufferCapacity), pendingBroadcasts: make(map[uint64]sequencedEvent), nextBroadcast: 1, workerEpoch: generateWorkerID("epoch"), cleanup: cleanup,
 		approvalTimeout: 15 * time.Minute, detachedTimeout: 5 * time.Minute,
 		sessionToolAllow: make(map[string]struct{}), sessionBashAllow: make(map[string]struct{}),
+		workspaceDir: engine.WorkspaceDir(), outputStore: newOutputStore(),
 	}
 	if controller != nil {
 		w.subscribers[controller] = struct{}{}
@@ -229,6 +232,7 @@ func (w *ConversationWorker) run() {
 		w.currentCancel = nil
 		w.mu.Unlock()
 		w.cleanupOnce.Do(func() {
+			w.outputStore.clear()
 			if w.cleanup != nil {
 				w.cleanup()
 			}
@@ -1186,6 +1190,12 @@ func (w *ConversationWorker) broadcast(events []sequencedEvent) {
 }
 
 func (w *ConversationWorker) emit(evt agent.Event, terminal bool) {
+	if evt.Type == agent.EventToolResult && len(evt.ToolResult) > 256*1024 {
+		stored := persistence.RedactSecrets(evt.ToolResult)
+		ref, total, truncated := w.outputStore.put(stored)
+		evt.OutputRef, evt.OutputBytes, evt.OutputTruncated = ref, total, truncated
+		evt.ToolResult = boundedToolPreview(stored, 1024)
+	}
 	w.eventMu.Lock()
 	item, err := w.sequenceLocked(evt, terminal)
 	w.eventMu.Unlock()
@@ -1358,6 +1368,7 @@ func (w *ConversationWorker) StopAsync() {
 		return
 	}
 	w.cleanupOnce.Do(func() {
+		w.outputStore.clear()
 		if w.cleanup != nil {
 			w.cleanup()
 		}

@@ -33,6 +33,8 @@ const (
 	MethodConversationWorkspaces = "conversation.list_workspaces"
 	MethodConversationList       = "conversation.list"
 	MethodTurnInterrupt          = "turn.interrupt"
+	MethodOutputRead             = "output.read"
+	MethodDiffInspect            = "diff.inspect"
 	MethodDaemonPing             = "daemon.ping"
 	MethodDaemonStatus           = "daemon.status"
 	MethodDaemonCapabilities     = "daemon.capabilities"
@@ -277,6 +279,55 @@ type TurnInterruptResult struct {
 type DaemonCapabilitiesResult struct {
 	ProtocolVersion int      `json:"protocol_version"`
 	Methods         []string `json:"methods"`
+}
+
+// OutputReadParams selects a byte range from a worker-local tool output.
+type OutputReadParams struct {
+	ConversationID string `json:"conversation_id"`
+	OutputRef      string `json:"output_ref"`
+	Offset         int64  `json:"offset,omitempty"`
+	Limit          int    `json:"limit,omitempty"`
+}
+
+// OutputReadResult contains one UTF-8-safe output page.
+type OutputReadResult struct {
+	Data       string `json:"data"`
+	TotalBytes int64  `json:"total_bytes"`
+	NextOffset int64  `json:"next_offset"`
+	HasMore    bool   `json:"has_more"`
+	Truncated  bool   `json:"truncated"`
+}
+
+// DiffInspectParams selects the conversation workspace to inspect.
+type DiffInspectParams struct {
+	ConversationID string `json:"conversation_id"`
+}
+
+// DiffFileEntry describes one changed file and its attribution.
+type DiffFileEntry struct {
+	Path               string `json:"path"`
+	Diff               string `json:"diff"`
+	WasDirtyAtStart    bool   `json:"was_dirty_at_start"`
+	IsBuddyEdit        bool   `json:"is_buddy_edit"`
+	AttributionUnknown bool   `json:"attribution_unknown,omitempty"`
+	IsBinary           bool   `json:"is_binary"`
+	Truncated          bool   `json:"truncated,omitempty"`
+}
+
+// DiffStats summarizes the changed files and line counts.
+type DiffStats struct {
+	FilesChanged int `json:"files_changed"`
+	Additions    int `json:"additions"`
+	Deletions    int `json:"deletions"`
+}
+
+// DiffInspectResult contains the bounded working-tree inspection response.
+type DiffInspectResult struct {
+	Files        []DiffFileEntry `json:"files"`
+	Stats        DiffStats       `json:"stats"`
+	Warning      string          `json:"warning,omitempty"`
+	OmittedPaths int             `json:"omitted_paths,omitempty"`
+	Truncated    bool            `json:"truncated,omitempty"`
 }
 
 // SessionAttachParams specifies options for session.attach.

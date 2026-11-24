@@ -1,0 +1,417 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"unicode/utf8"
+
+	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
+	"github.com/hoangndst/buddy-agent/internal/history"
+)
+
+func TestOutputStorePagingAndEviction(t *testing.T) {
+	store := newOutputStore()
+	ref, total, truncated := store.put(strings.Repeat("界", maxOutputRefBytes))
+	if !truncated || total <= maxOutputRefBytes {
+		t.Fatalf("expected bounded output, total=%d truncated=%v", total, truncated)
+	}
+	page, err := store.read(ref, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Data) != len("界") || page.NextOffset != int64(len("界")) || !page.HasMore || !page.Truncated {
+		t.Fatalf("invalid UTF-8 page: %+v", page)
+	}
+	for i := 0; i < 16; i++ {
+		store.put(strings.Repeat("x", maxOutputRefBytes))
+	}
+	if _, err := store.read(ref, 0, 1); err == nil || !strings.Contains(err.Error(), "rerun") {
+		t.Fatalf("evicted reference error = %v", err)
+	}
+	store.clear()
+	if len(store.entries) != 0 || store.bytes != 0 {
+		t.Fatalf("clear retained output: %+v", store)
+	}
+}
+
+func TestInspectWorkspaceDiffAttribution(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	workspace := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	git("config", "color.diff", "always")
+	for _, path := range []string{"dirty.txt", "buddy.txt", "unknown.txt"} {
+		if err := os.WriteFile(filepath.Join(workspace, path), []byte("base\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("add", ".")
+	git("commit", "-qm", "base")
+	for _, path := range []string{"dirty.txt", "buddy.txt", "unknown.txt"} {
+		if err := os.WriteFile(filepath.Join(workspace, path), []byte("changed\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tracker := history.NewStateTracker("task", nil)
+	tracker.SetInitialDirtyPaths([]string{"dirty.txt"}, true)
+	tracker.RecordFileAccess("buddy.txt", "modified")
+	tracker.RecordFileAccess("dirty.txt", "modified")
+	result, err := inspectWorkspaceDiff(context.Background(), workspace, tracker.ExportData())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := make(map[string]protocol.DiffFileEntry)
+	for _, file := range result.Files {
+		if strings.ContainsRune(file.Diff, '\x1b') || !strings.Contains(file.Diff, "\n@@ ") {
+			t.Fatalf("expected plain diff with a navigable hunk for %s: %q", file.Path, file.Diff)
+		}
+		byPath[file.Path] = file
+	}
+	if result.Stats != (protocol.DiffStats{FilesChanged: 3, Additions: 3, Deletions: 3}) {
+		t.Fatalf("diff stats with forced Git color: %+v", result.Stats)
+	}
+	if !byPath["dirty.txt"].WasDirtyAtStart || !byPath["dirty.txt"].IsBuddyEdit {
+		t.Fatalf("dirty + Buddy attribution = %+v", byPath["dirty.txt"])
+	}
+	if byPath["buddy.txt"].WasDirtyAtStart || !byPath["buddy.txt"].IsBuddyEdit || byPath["buddy.txt"].AttributionUnknown {
+		t.Fatalf("Buddy attribution = %+v", byPath["buddy.txt"])
+	}
+	if !byPath["unknown.txt"].AttributionUnknown {
+		t.Fatalf("unknown attribution = %+v", byPath["unknown.txt"])
+	}
+}
+
+func TestInspectWorkspaceDiffFromRepositorySubdirectory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	workspace := filepath.Join(root, "nested", "workspace")
+	if err := os.MkdirAll(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	write := func(path, contents string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(contents+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	inside := filepath.Join(workspace, "tracked.txt")
+	outside := filepath.Join(root, "outside.txt")
+	write(inside, "before")
+	write(outside, "before")
+	git("add", ".")
+	git("commit", "-qm", "base")
+	write(inside, "dirty at start")
+	write(outside, "outside change")
+	paths, omitted, err := gitChangedPaths(context.Background(), workspace)
+	if err != nil || omitted != 0 || len(paths) != 1 || paths[0] != "tracked.txt" {
+		t.Fatalf("workspace baseline paths=%q omitted=%d err=%v", paths, omitted, err)
+	}
+	tracker := history.NewStateTracker("task", nil)
+	tracker.SetInitialDirtyPaths(paths, true)
+	tracker.RecordFileAccess("tracked.txt", "modified")
+	write(inside, "after")
+	result, err := inspectWorkspaceDiff(context.Background(), workspace, tracker.ExportData())
+	if err != nil || len(result.Files) != 1 || result.Warning != "" {
+		t.Fatalf("workspace diff=%+v err=%v", result, err)
+	}
+	file := result.Files[0]
+	if file.Path != "tracked.txt" || !file.WasDirtyAtStart || !file.IsBuddyEdit || file.AttributionUnknown || !strings.Contains(file.Diff, "+after\n") {
+		t.Fatalf("workspace diff entry=%+v", file)
+	}
+}
+
+func TestInspectWorkspaceDiffIncludesBothSidesOfStagedRename(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	workspace := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	git("config", "status.renames", "true")
+	common := strings.Repeat("unchanged common text\n", 5)
+	if err := os.WriteFile(filepath.Join(workspace, "source.txt"), []byte("---\n"+common), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "source.txt")
+	git("commit", "-qm", "base")
+	git("mv", "source.txt", "destination.txt")
+	if err := os.WriteFile(filepath.Join(workspace, "destination.txt"), []byte("++counter;\n++ value\n"+common), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tracker := history.NewStateTracker("task", nil)
+	tracker.SetInitialDirtyPaths([]string{"source.txt"}, true)
+	tracker.RecordFileAccess("destination.txt", "modified")
+	result, err := inspectWorkspaceDiff(context.Background(), workspace, tracker.ExportData())
+	if err != nil || len(result.Files) != 1 || result.Warning != "" {
+		t.Fatalf("rename diff=%+v err=%v", result, err)
+	}
+	file := result.Files[0]
+	if file.Path != "destination.txt" || !file.WasDirtyAtStart || !file.IsBuddyEdit || file.AttributionUnknown {
+		t.Fatalf("rename path and attribution=%+v", file)
+	}
+	for _, want := range []string{"rename from source.txt\n", "rename to destination.txt\n", "----\n", "+++counter;\n", "+++ value\n"} {
+		if !strings.Contains(file.Diff, want) {
+			t.Errorf("rename patch missing %q: %s", want, file.Diff)
+		}
+	}
+	if result.Stats != (protocol.DiffStats{FilesChanged: 1, Deletions: 1, Additions: 2}) {
+		t.Fatalf("rename stats=%+v", result.Stats)
+	}
+}
+
+func TestInspectWorkspaceDiffBeforeFirstCommit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	workspace := t.TempDir()
+	if out, err := exec.Command("git", "-C", workspace, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	path := filepath.Join(workspace, "staged.txt")
+	if err := os.WriteFile(path, []byte("staged content\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", workspace, "add", "staged.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v: %s", err, out)
+	}
+	if err := os.WriteFile(path, []byte("staged content\nworktree edit\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := inspectWorkspaceDiff(context.Background(), workspace, history.StateTrackerData{})
+	if err != nil || len(result.Files) != 1 || result.Warning != "" {
+		t.Fatalf("initial repository diff=%+v err=%v", result, err)
+	}
+	file := result.Files[0]
+	if file.Path != "staged.txt" || !strings.Contains(file.Diff, "+staged content\n+worktree edit\n") {
+		t.Fatalf("initial repository diff entry=%+v", file)
+	}
+	if result.Stats != (protocol.DiffStats{FilesChanged: 1, Additions: 2}) {
+		t.Fatalf("initial repository diff stats=%+v", result.Stats)
+	}
+}
+
+func TestInspectWorkspaceDiffShowsStagedDeletionAndUntrackedReplacement(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	workspace := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	path := filepath.Join(workspace, "file.txt")
+	if err := os.WriteFile(path, []byte("tracked content\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "file.txt")
+	git("commit", "-qm", "base")
+	git("rm", "--cached", "file.txt")
+	if err := os.WriteFile(path, []byte("untracked replacement\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := inspectWorkspaceDiff(context.Background(), workspace, history.StateTrackerData{})
+	if err != nil || len(result.Files) != 2 || result.Warning != "" {
+		t.Fatalf("staged deletion and untracked replacement diff=%+v err=%v", result, err)
+	}
+	if !strings.Contains(result.Files[0].Diff, "-tracked content\n") || !strings.Contains(result.Files[1].Diff, "+untracked replacement") {
+		t.Fatalf("expected one deletion and one addition: %+v", result.Files)
+	}
+	if result.Stats.Deletions != 1 || result.Stats.Additions != 1 {
+		t.Fatalf("expected one deleted and one added line: %+v", result.Stats)
+	}
+}
+
+func TestInspectWorkspaceDiffUntrackedLineCounts(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	for _, tc := range []struct {
+		name      string
+		content   string
+		patch     string
+		additions int
+	}{
+		{name: "newline terminated", content: "hello\n", patch: "+hello", additions: 1},
+		{name: "blank line at end", content: "hello\n\n", patch: "+hello\n+", additions: 2},
+		{name: "leading plus signs", content: "++counter;\n", patch: "+++counter;", additions: 1},
+		{name: "empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			if out, err := exec.Command("git", "-C", workspace, "init", "-q").CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v: %s", err, out)
+			}
+			if err := os.WriteFile(filepath.Join(workspace, "new.txt"), []byte(tc.content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			result, err := inspectWorkspaceDiff(context.Background(), workspace, history.StateTrackerData{})
+			if err != nil || len(result.Files) != 1 || result.Warning != "" {
+				t.Fatalf("untracked diff=%+v err=%v", result, err)
+			}
+			if diff := result.Files[0].Diff; diff != "--- /dev/null\n+++ b/new.txt\n"+tc.patch {
+				t.Errorf("unexpected untracked patch: %q", diff)
+			}
+			if result.Stats != (protocol.DiffStats{FilesChanged: 1, Additions: tc.additions}) {
+				t.Errorf("untracked diff stats=%+v, want %d additions", result.Stats, tc.additions)
+			}
+		})
+	}
+}
+
+func TestCountDiffStatsDistinguishesHeadersFromIdenticalContent(t *testing.T) {
+	diff := "diff --git a/one b/one\n--- a/one\n+++ b/one\n@@ -1 +1 @@\n--- a/one\n+++ b/one\n" +
+		"diff --git a/two b/two\n--- a/two\n+++ b/two\n@@ -1 +1 @@\n-before\n+after\n"
+	var stats protocol.DiffStats
+	countDiffStats(&stats, diff)
+	if stats.Additions != 2 || stats.Deletions != 2 {
+		t.Fatalf("diff stats=%+v, want two additions and two deletions", stats)
+	}
+}
+
+func TestInspectWorkspaceDiffBoundsNonGitFallback(t *testing.T) {
+	workspace := t.TempDir()
+	tracker := history.NewStateTracker("task", nil)
+	for i := 0; i < 1000; i++ {
+		tracker.RecordFileAccess(strings.Repeat("x", 80)+string(rune('a'+i%26))+strings.Repeat("y", 80)+string(rune(i)), "modified")
+	}
+	result, err := inspectWorkspaceDiff(context.Background(), workspace, tracker.ExportData())
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > maxDiffResultBytes || !result.Truncated || result.OmittedPaths == 0 {
+		t.Fatalf("non-Git fallback exceeded cap or omitted no paths: bytes=%d result=%+v", len(encoded), result)
+	}
+}
+
+func TestDiffPathTruncatesAtUTF8Boundary(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	workspace := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	path := filepath.Join(workspace, "unicode.txt")
+	if err := os.WriteFile(path, []byte("base\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "unicode.txt")
+	git("commit", "-qm", "base")
+	if err := os.WriteFile(path, []byte(strings.Repeat("界", 100000)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	diff, binary, truncated, err := diffChange(context.Background(), workspace, "HEAD", gitChange{path: "unicode.txt"})
+	if err != nil || binary || !truncated || !utf8.ValidString(diff) {
+		t.Fatalf("diff=%q binary=%v truncated=%v err=%v", diff[len(diff)-min(20, len(diff)):], binary, truncated, err)
+	}
+}
+
+func TestGitChangedPathsAndSafeDiffPath(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	workspace := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(workspace, "tracked.txt"), []byte("before\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "tracked.txt")
+	git("commit", "-qm", "initial")
+	if err := os.WriteFile(filepath.Join(workspace, "tracked.txt"), []byte("Binary files a and b differ\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "new.txt"), []byte("untracked\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	changes, omitted, err := gitChanges(context.Background(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if omitted != 0 || len(changes) != 2 {
+		t.Fatalf("changes=%+v omitted=%d", changes, omitted)
+	}
+	for _, change := range changes {
+		diff, binary, _, err := diffChange(context.Background(), workspace, "HEAD", change)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if binary || !strings.Contains(diff, change.path) {
+			t.Fatalf("unexpected diff for %s: binary=%v diff=%q", change.path, binary, diff)
+		}
+		if change.path == "tracked.txt" && !strings.Contains(diff, "+Binary files a and b differ\n") {
+			t.Fatalf("tracked text did not appear in its diff: %q", diff)
+		}
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(workspace, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	diff, _, _, err := diffChange(context.Background(), workspace, "HEAD", gitChange{path: "linked"})
+	if err != nil || !strings.Contains(diff, "Symlink omitted") {
+		t.Fatalf("symlink diff=%q err=%v", diff, err)
+	}
+}

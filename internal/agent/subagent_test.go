@@ -85,6 +85,39 @@ func TestSubagentTool_RoleGating(t *testing.T) {
 	}
 }
 
+func TestSubagentEventsCarryParentActivityIdentity(t *testing.T) {
+	workspace := t.TempDir()
+	provider := &mockChatClient{responses: []*openai.ChatCompletion{
+		{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Role: "assistant", ToolCalls: []openai.ChatCompletionMessageToolCall{{ID: "child-call", Function: openai.ChatCompletionMessageToolCallFunction{Name: "read_file", Arguments: `{"path":"README.md"}`}}}}}}},
+		{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Role: "assistant", Content: "done"}}}},
+	}}
+	registry := tools.NewRegistry(1000)
+	registry.Register(&dummyTestTool{name: "read_file"})
+	var events []Event
+	subTool := NewInvokeSubagentTool(SubagentToolConfig{ParentRegistry: registry, Provider: provider, Model: "test", WorkspaceDir: workspace, EventHandler: func(event Event) { events = append(events, event) }})
+	parent := ActivityID{TurnID: "root-turn", Step: 4, ToolCallID: "invoke-call"}
+	if _, err := subTool.Execute(withParentActivity(context.Background(), parent), json.RawMessage(`{"task":"inspect","role":"researcher"}`)); err != nil {
+		t.Fatal(err)
+	}
+	var call, result bool
+	for _, event := range events {
+		if event.Type != EventToolCall && event.Type != EventToolResult {
+			continue
+		}
+		if event.ParentActivityID != parent || event.Depth != 1 {
+			t.Fatalf("child event lost parent identity: %+v", event)
+		}
+		if event.ActivityID.ToolCallID != "child-call" || event.ActivityID.TurnID == "" || event.ActivityID.Step <= 0 {
+			t.Fatalf("child event lacks activity identity: %+v", event)
+		}
+		call = call || event.Type == EventToolCall
+		result = result || event.Type == EventToolResult
+	}
+	if !call || !result {
+		t.Fatalf("expected wrapped child tool call and result events: %+v", events)
+	}
+}
+
 func TestSubagentTool_DepthCeiling(t *testing.T) {
 	// An engine running at depth=1 must be barred from delegating
 	subTool := NewInvokeSubagentTool(SubagentToolConfig{

@@ -136,6 +136,7 @@ func TestEngineExecutionFlow(t *testing.T) {
 	hasToolCall := false
 	hasToolResult := false
 	hasFinished := false
+	var toolActivity ActivityID
 
 	for _, ev := range events {
 		switch ev.Type {
@@ -143,8 +144,15 @@ func TestEngineExecutionFlow(t *testing.T) {
 			hasTextComplete = true
 		case EventToolCall:
 			hasToolCall = true
+			toolActivity = ev.ActivityID
+			if ev.ActivityID.ToolCallID != "call_123" || ev.ActivityID.TurnID == "" || ev.ActivityID.Step <= 0 {
+				t.Fatalf("tool call event lacks stable activity identity: %+v", ev)
+			}
 		case EventToolResult:
 			hasToolResult = true
+			if ev.ActivityID != toolActivity {
+				t.Fatalf("tool result activity identity mismatch: call=%+v result=%+v", toolActivity, ev.ActivityID)
+			}
 		case EventFinished:
 			hasFinished = true
 		}
@@ -296,11 +304,12 @@ func TestConversationRuntimeRunsSequentialTurnsAgainstSharedHistory(t *testing.T
 
 	firstPrompt := "inspect the project"
 	firstTurnID := "conversation-turn-1"
+	workspace := t.TempDir()
 	firstFingerprint := persistence.SubmissionFingerprint(firstPrompt, persistence.SubmissionQueue)
 	start, err := store.CreateConversation(context.Background(), &persistence.ConversationStartRequest{
 		Session: persistence.SessionRecord{
 			ID:         "conversation-runtime-test",
-			WorkingDir: t.TempDir(),
+			WorkingDir: workspace,
 			Model:      "test-model",
 		},
 		StartID:            "start-runtime-test",
@@ -321,7 +330,7 @@ func TestConversationRuntimeRunsSequentialTurnsAgainstSharedHistory(t *testing.T
 		{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Role: "assistant", Content: "The project is a Go service."}}}},
 		{Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{Role: "assistant", Content: "It uses SQLite for persistence."}}}},
 	}}
-	engine := NewEngine(provider, "test-model", 5, tools.NewRegistry(1000), nil, nil, WithStore(store))
+	engine := NewEngine(provider, "test-model", 5, tools.NewRegistry(1000), nil, nil, WithStore(store), WithWorkspaceDir(workspace))
 	conversationHistory, err := engine.NewHistorySession(firstPrompt)
 	if err != nil {
 		t.Fatalf("create history: %v", err)
@@ -376,6 +385,12 @@ func TestConversationRuntimeRunsSequentialTurnsAgainstSharedHistory(t *testing.T
 	}); err != nil {
 		t.Fatalf("save snapshot before follow-up turn: %v", err)
 	}
+	if err := store.CommitTurn(context.Background(), &persistence.TurnRecord{
+		SessionID: start.ConversationID, ConversationTurnID: secondTurnID, StepNumber: 3, Role: "assistant",
+		ToolCalls: []persistence.ToolCallRecord{{ID: "write-1", Name: "write_file", Args: `{"path":"after-snapshot.txt"}`, ExitCode: 0}}, CreatedAt: time.Now().UTC(),
+	}, 3, persistence.TokenUsage{}); err != nil {
+		t.Fatalf("persist trailing file tool call: %v", err)
+	}
 	restored, err := RestoreConversationRuntime(context.Background(), engine, store, start.ConversationID)
 	if err != nil {
 		t.Fatalf("restore conversation runtime: %v", err)
@@ -389,6 +404,9 @@ func TestConversationRuntimeRunsSequentialTurnsAgainstSharedHistory(t *testing.T
 	}
 	if !followupRestored {
 		t.Fatalf("restored history lost the follow-up prompt or turn order: %+v", restoredMessages)
+	}
+	if _, ok := restored.History().Tracker().ExportData().ModifiedFiles["after-snapshot.txt"]; !ok {
+		t.Fatal("resume lost successful file-tool attribution after the latest snapshot")
 	}
 }
 
@@ -1292,6 +1310,7 @@ func TestEngine_SessionIDOverride(t *testing.T) {
 	lastRes := eng.LastExecutionResult()
 	if lastRes == nil {
 		t.Fatal("expected LastExecutionResult to be non-nil")
+		return
 	}
 	if lastRes.SessionID != "sess_override_1234" {
 		t.Errorf("expected session ID 'sess_override_1234', got %q", lastRes.SessionID)

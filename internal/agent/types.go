@@ -57,20 +57,44 @@ const (
 
 // Event conveys real-time execution telemetry to listeners.
 type Event struct {
-	Type            EventType
-	Step            int
-	Timestamp       time.Time
-	Duration        time.Duration
-	Protocol        string
-	Content         string
-	ToolCallID      string
-	ToolName        string
-	ToolArgs        string
-	ToolResult      string
-	ToolExitCode    int
-	Usage           provider.TokenUsage
-	HistoryRevision int64
-	Error           error
+	Type             EventType
+	Step             int
+	Timestamp        time.Time
+	Duration         time.Duration
+	Protocol         string
+	Content          string
+	ToolCallID       string
+	ToolName         string
+	ToolArgs         string
+	ToolResult       string
+	ToolExitCode     int
+	ActivityID       ActivityID
+	ParentActivityID ActivityID
+	Depth            int
+	OutputRef        string
+	OutputBytes      int64
+	OutputTruncated  bool
+	Usage            provider.TokenUsage
+	HistoryRevision  int64
+	Error            error
+}
+
+// ActivityID identifies one tool invocation across conversation turns.
+type ActivityID struct {
+	TurnID     string `json:"turn_id"`
+	Step       int    `json:"step"`
+	ToolCallID string `json:"tool_call_id"`
+}
+
+type parentActivityContextKey struct{}
+
+func withParentActivity(ctx context.Context, id ActivityID) context.Context {
+	return context.WithValue(ctx, parentActivityContextKey{}, id)
+}
+
+func parentActivityFromContext(ctx context.Context) ActivityID {
+	id, _ := ctx.Value(parentActivityContextKey{}).(ActivityID)
+	return id
 }
 
 // EventHandler receives agent lifecycle events.
