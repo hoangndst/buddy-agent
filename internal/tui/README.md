@@ -6,6 +6,7 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 
 ## Interface
 
+- `Run` owns Bubble Tea startup, terminal cleanup, and context/input/output wiring for the interactive view.
 - `InputHistoryRing` loads and stores prompt history at a caller-supplied path.
 - `SlashCommandRegistry` stores and matches composer commands.
 - `Transcript` owns canonical blocks, reading offset, rendered-row caching, reflow, and visible-window selection; `TranscriptBlock` and `Activity` are UI-owned values.

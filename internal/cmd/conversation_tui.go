@@ -293,9 +293,7 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 			return fmt.Errorf("sync resumed conversation: %w", syncErr)
 		}
 	}
-	program := tea.NewProgram(m, tea.WithContext(ctx), tea.WithInput(f.IOStreams.In), tea.WithOutput(f.IOStreams.Out))
-	_, err = program.Run()
-	return err
+	return tui.Run(ctx, m, f.IOStreams.In, f.IOStreams.Out)
 }
 
 func isInteractive(stream any) bool {
