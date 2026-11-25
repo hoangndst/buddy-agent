@@ -68,7 +68,7 @@ func buildMascotStyles() [7][7]lipgloss.Style {
 }
 
 // RenderMascot converts the checked-in Buddy SVG raster into ANSI half-block pixels.
-// Welcome uses an 8 by 4 cell canvas, Compact 24 by 12, and Large 48 by 24.
+// Welcome uses a 16 by 8 cell canvas, Compact 24 by 12, and Large 48 by 24.
 func RenderMascot(size MascotSize) []string {
 	pixelSize := mascotPixelWidth
 	switch size {
@@ -136,8 +136,21 @@ func mascotPixel(y, x, width int) uint8 {
 	if width == mascotPixelWidth {
 		return mascotPixelGrid[y*mascotPixelWidth+x] - '0'
 	}
-	sourceY, sourceX := y*mascotPixelWidth/width, x*mascotPixelWidth/width
-	return mascotPixelGrid[sourceY*mascotPixelWidth+sourceX] - '0'
+	scale := mascotPixelWidth / width
+	var counts [7]uint8
+	for sourceY := y * scale; sourceY < (y+1)*scale; sourceY++ {
+		for sourceX := x * scale; sourceX < (x+1)*scale; sourceX++ {
+			counts[mascotPixelGrid[sourceY*mascotPixelWidth+sourceX]-'0']++
+		}
+	}
+	center := mascotPixelGrid[(y*scale+scale/2)*mascotPixelWidth+x*scale+scale/2] - '0'
+	best := uint8(0)
+	for index := uint8(1); index < uint8(len(counts)); index++ {
+		if counts[index] > counts[best] || counts[index] == counts[best] && index == center {
+			best = index
+		}
+	}
+	return best
 }
 
 func mascotColorEnabled() bool {

@@ -1,12 +1,12 @@
 ╭─ Buddy Agent vdev ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│   ██       █▓▓                                       │ Tips for getting started                                                                              │
-│  █▓▒▓▓    █▓▒▒█                                      │ Ask Buddy to explain this project or help with a coding task.                                         │
-│  ▓▓▒▒▒▓▓▒▓▓▒▒▒▓                                      │ ───────────────────────────────────────────────────────────────────────────────────────────────────── │
-│  ██▒▒▓▓▓▓▒▒▓█▒▓                                      │ What Buddy can do                                                                                     │
-│   ██▓▒██▓▓▓█▓██                                      │ Explore files, edit code, run tests, and review your changes.                                         │
-│   ▓▒▒▓▒▓▒▒▒▒▒▓▒▀                                     │                                                                                                       │
-│    ▓▓▒▒▒▒▓▓▒▒▓▓                                      │ Useful commands                                                                                       │
-│       ▀▀▀▀▀▀▀                                        │ /help       Show available commands                                                                   │
+│   ▓▓       ▓▓▓                                       │ Tips for getting started                                                                              │
+│  ▓▒▒▓▓   ▓▓▒▒▓█                                      │ Ask Buddy to explain this project or help with a coding task.                                         │
+│  ▓▒▒▒▓▓▓▓▓▓▒▒▓▓                                      │ ───────────────────────────────────────────────────────────────────────────────────────────────────── │
+│  ▓▒▒█▓▓▓▓▒▓▓██▀                                      │ What Buddy can do                                                                                     │
+│  ▀█▓▓███▒▓▓██▓█                                      │ Explore files, edit code, run tests, and review your changes.                                         │
+│   ▒▒▒▒▓▒▓▒▒▓▓▓▓                                      │                                                                                                       │
+│    ▓▓▒▒▒▒▓▒▒▒▀▀                                      │ Useful commands                                                                                       │
+│        ▀▀▀▀                                          │ /help       Show available commands                                                                   │
 │ Welcome back!                                        │ /resume     Continue a previous conversation                                                          │
 │ GPT-5.4                                              │ /diff       Review working-tree changes                                                               │
 │ ~/Developer/buddy-agent                              │                                                                                                       │

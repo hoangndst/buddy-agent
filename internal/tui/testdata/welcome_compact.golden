@@ -1,12 +1,12 @@
 ╭─ Buddy Agent vdev ───────────────────────────────────────────────────────────────────────────────╮
-│   ██       █▓▓                     │ Tips for getting started                                    │
-│  █▓▒▓▓    █▓▒▒█                    │ Ask Buddy to explain this project or help with a coding     │
-│  ▓▓▒▒▒▓▓▒▓▓▒▒▒▓                    │ task.                                                       │
-│  ██▒▒▓▓▓▓▒▒▓█▒▓                    │ ─────────────────────────────────────────────────────────── │
-│   ██▓▒██▓▓▓█▓██                    │ What Buddy can do                                           │
-│   ▓▒▒▓▒▓▒▒▒▒▒▓▒▀                   │ Explore files, edit code, run tests, and review your        │
-│    ▓▓▒▒▒▒▓▓▒▒▓▓                    │ changes.                                                    │
-│       ▀▀▀▀▀▀▀                      │                                                             │
+│   ▓▓       ▓▓▓                     │ Tips for getting started                                    │
+│  ▓▒▒▓▓   ▓▓▒▒▓█                    │ Ask Buddy to explain this project or help with a coding     │
+│  ▓▒▒▒▓▓▓▓▓▓▒▒▓▓                    │ task.                                                       │
+│  ▓▒▒█▓▓▓▓▒▓▓██▀                    │ ─────────────────────────────────────────────────────────── │
+│  ▀█▓▓███▒▓▓██▓█                    │ What Buddy can do                                           │
+│   ▒▒▒▒▓▒▓▒▒▓▓▓▓                    │ Explore files, edit code, run tests, and review your        │
+│    ▓▓▒▒▒▒▓▒▒▒▀▀                    │ changes.                                                    │
+│        ▀▀▀▀                        │                                                             │
 │ Welcome back!                      │ Useful commands                                             │
 │ GPT-5.4                            │ /help       Show available commands                         │
 │ ~/Developer/buddy-agent            │ /resume     Continue a previous conversation                │
