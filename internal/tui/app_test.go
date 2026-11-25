@@ -73,6 +73,25 @@ func TestModelOwnsTranscriptActivityFocusAndActivation(t *testing.T) {
 	}
 }
 
+func TestModelClearsActivityHighlightInScreenContentAfterF6(t *testing.T) {
+	m := NewModel(Header{})
+	m.Width, m.Height = 60, 16
+	m.Transcript.Append(TranscriptBlock{
+		ID: "activity", Kind: BlockToolActivity, Header: "bash", Collapsed: true,
+		Activity: &Activity{Tool: "bash"},
+	}, m.Width)
+	m.SetScreenContent(ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	if view := m.View().Content; !strings.Contains(view, "›") {
+		t.Fatalf("selected activity was not highlighted while transcript had focus: %q", view)
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	if view := m.View().Content; strings.Contains(view, "›") {
+		t.Fatalf("activity highlight remained after focus returned to composer: %q", view)
+	}
+}
+
 func updateEvent(m *Model, event Event) {
 	m.Update(event)
 }

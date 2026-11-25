@@ -234,6 +234,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // View renders the transcript model without any runtime or command state.
 func (m *Model) View() tea.View {
+	m.Transcript.SetRenderState(m.streamingText, m.SelectedActivity, m.TranscriptFocused)
 	if m.screenContent != nil {
 		content := m.screenContent
 		body, footer := content.Body, content.Footer
@@ -264,7 +265,6 @@ func (m *Model) View() tea.View {
 		}
 		return RenderScreen(Screen{Width: m.Width, Height: m.Height, Header: content.Header, Body: body, Footer: footer})
 	}
-	m.Transcript.SetRenderState(m.streamingText, m.SelectedActivity, m.TranscriptFocused)
 	body := m.Transcript.VisibleLines(max(0, m.Height-2), m.Width)
 	return RenderScreen(Screen{
 		Width: m.Width, Height: m.Height,
