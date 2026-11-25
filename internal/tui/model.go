@@ -1,7 +1,11 @@
 // Package tui contains terminal-facing models and rendering helpers.
 package tui
 
-import "time"
+import (
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+)
 
 // BlockKind identifies one renderable entry in a conversation transcript.
 type BlockKind uint8
@@ -51,4 +55,56 @@ type Activity struct {
 	OutputRef       string
 	OutputBytes     int64
 	OutputTruncated bool
+}
+
+// EventKind identifies a protocol-neutral change to conversation presentation.
+type EventKind uint8
+
+// Event kinds describe protocol-neutral presentation updates.
+const (
+	EventSnapshot EventKind = iota
+	EventAssistantDelta
+	EventAssistantComplete
+	EventReasoning
+	EventActivityStarted
+	EventActivityCompleted
+	EventTurnFinished
+	EventFailure
+	EventCompactionStatus
+)
+
+// Event contains only display data. Runtime and protocol values stay in cmd.
+type Event struct {
+	Kind     EventKind
+	TurnID   string
+	Text     string
+	At       time.Time
+	Blocks   []TranscriptBlock
+	Activity *Activity
+}
+
+// ActionKind identifies an intent that the runtime adapter can execute.
+type ActionKind uint8
+
+// Action kinds describe runtime intents produced by the terminal UI.
+const (
+	ActionSubmitPrompt ActionKind = iota
+	ActionInterruptTurn
+	ActionOpenOutput
+)
+
+// Action is a protocol-neutral runtime intent.
+type Action struct {
+	Kind   ActionKind
+	Prompt string
+	Mode   string
+	Ref    string
+}
+
+// ActionMsg carries a UI intent through Bubble Tea's message loop.
+type ActionMsg struct{ Action Action }
+
+// EmitAction sends a neutral action through Bubble Tea's normal message loop.
+func EmitAction(action Action) func() tea.Msg {
+	return func() tea.Msg { return ActionMsg{Action: action} }
 }

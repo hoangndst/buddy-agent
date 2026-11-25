@@ -7,6 +7,7 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 ## Interface
 
 - `Run` owns Bubble Tea startup, terminal cleanup, and context/input/output wiring for the interactive view.
+- `Model` owns canonical transcript blocks, stream reduction, terminal dimensions, transcript scrolling, and display metadata. It reduces protocol-neutral `Event` values; `Action` and `ActionMsg` define the runtime-intent contract used by the command adapter.
 - `InputHistoryRing` loads and stores prompt history at a caller-supplied path.
 - `SlashCommandRegistry` stores and matches composer commands.
 - `Transcript` owns canonical blocks, reading offset, rendered-row caching, reflow, and visible-window selection; `TranscriptBlock` and `Activity` are UI-owned values.
@@ -27,6 +28,8 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 - Screen layout receives rendered strings and dimensions only; it has no workspace, daemon, or runtime dependencies.
 - Transcript bodies retain source Markdown; activity values contain only allowlisted display metadata.
 - The command adapter may map protocol events into transcript blocks, but transcript layout and cache behavior stay in this package.
+- Protocol ordering, stale-event rejection, sync generations, RPCs, and permission policy stay in `internal/cmd`; events passed to `Model` contain no protocol values or arbitrary maps.
+- Composer, picker, approval, and inspection orchestration still live in the command adapter during this migration; their remaining state and event handling are follow-up work.
 - Permission policy and protocol response construction stay in `internal/cmd`.
 
 ## Side Effects
