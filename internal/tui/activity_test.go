@@ -46,3 +46,22 @@ func TestRenderBlockCleansMarkdownFallback(t *testing.T) {
 		t.Fatalf("fallback body = %q, want %q", body, want)
 	}
 }
+
+func TestRenderActivityGroupSummaryAndExpansion(t *testing.T) {
+	code := 1
+	group := TranscriptBlock{ID: "group", Kind: BlockActivityGroup, Collapsed: true}
+	children := []TranscriptBlock{
+		{ID: "running", GroupID: "group", Kind: BlockToolActivity, Header: "Running read_file src/main.go", Activity: &Activity{Tool: "read_file"}},
+		{ID: "failed", GroupID: "group", Kind: BlockToolActivity, Header: "Failed bash", Body: "permission denied", Completed: true, Activity: &Activity{Tool: "bash", ExitCode: &code}},
+	}
+	blocks := append([]TranscriptBlock{group}, children...)
+	collapsed, _ := RenderBlock(group, blocks, 80, "", "", false)
+	if !strings.Contains(collapsed, "2 tool calls") || !strings.Contains(collapsed, "read_file, bash") || !strings.Contains(collapsed, "1 running") || !strings.Contains(collapsed, "1 failed") || strings.Contains(collapsed, "permission denied") {
+		t.Fatalf("collapsed activity group summary = %q", collapsed)
+	}
+	group.Collapsed = false
+	expanded, _ := RenderBlock(group, append([]TranscriptBlock{group}, children...), 80, "", "", false)
+	if !strings.Contains(expanded, "read_file") || !strings.Contains(expanded, "bash") || !strings.Contains(expanded, "permission denied") {
+		t.Fatalf("expanded activity group omitted child details: %q", expanded)
+	}
+}

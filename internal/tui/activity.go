@@ -106,6 +106,17 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 		}
 	case BlockSystemStatus:
 		content = mutedStyle.Render(cleanText(block.Body))
+	case BlockActivityGroup:
+		children := activityGroupChildren(block.ID, blocks)
+		content = toolStyle.Render(activityGroupSummary(block, children))
+		if !block.Collapsed {
+			for _, child := range children {
+				rendered, _ := RenderBlock(child, blocks, max(1, width-2), streamingText, selectedActivity, focused)
+				for _, line := range strings.Split(rendered, "\n") {
+					content += "\n  " + line
+				}
+			}
+		}
 	default:
 		content = cleanText(block.Body)
 	}
@@ -113,6 +124,81 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 		content = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render("› " + content)
 	}
 	return content, childOffset
+}
+
+func activityGroupChildren(groupID string, blocks []TranscriptBlock) []TranscriptBlock {
+	var children []TranscriptBlock
+	for _, block := range blocks {
+		if block.GroupID == groupID {
+			children = append(children, block)
+		}
+	}
+	return children
+}
+
+func activityGroupSummary(group TranscriptBlock, children []TranscriptBlock) string {
+	count, running, done, failed := len(children), 0, 0, 0
+	var elapsed time.Duration
+	tools := make([]string, 0, 3)
+	seenTools := make(map[string]struct{})
+	for _, child := range children {
+		if !child.Completed {
+			running++
+		} else if child.Activity != nil && child.Activity.ExitCode != nil && *child.Activity.ExitCode != 0 {
+			failed++
+		} else {
+			done++
+		}
+		if child.Activity != nil {
+			elapsed += child.Activity.Elapsed
+			tool := cleanText(child.Activity.Tool)
+			if tool != "" {
+				if _, exists := seenTools[tool]; !exists {
+					seenTools[tool] = struct{}{}
+					tools = append(tools, tool)
+				}
+			}
+		}
+	}
+	label := fmt.Sprintf("%d tool calls", count)
+	if count == 1 {
+		label = "1 tool call"
+	}
+	if len(tools) > 0 {
+		shown := tools
+		if len(shown) > 2 {
+			shown = shown[:2]
+		}
+		label += " · " + strings.Join(shown, ", ")
+		if len(tools) > len(shown) {
+			label += fmt.Sprintf(" +%d", len(tools)-len(shown))
+		}
+	}
+	if running > 0 {
+		label += fmt.Sprintf(" · %d running", running)
+	}
+	if done > 0 {
+		label += fmt.Sprintf(" · %d done", done)
+	}
+	if failed > 0 {
+		label += fmt.Sprintf(" · %d failed", failed)
+	}
+	if running > 0 && !group.CreatedAt.IsZero() {
+		elapsed = time.Since(group.CreatedAt)
+	}
+	if elapsed > 0 {
+		label += " · " + elapsed.Round(100*time.Millisecond).String()
+	}
+	if group.Collapsed {
+		label += "  ·  Enter to expand"
+	}
+	icon := "●"
+	if failed > 0 {
+		icon = "!"
+	} else if running == 0 && count > 0 {
+		icon = "✓"
+	}
+	return icon + " " + label
 }
 
 func activityPresentation(block TranscriptBlock) (string, string) {

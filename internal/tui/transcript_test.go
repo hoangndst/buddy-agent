@@ -40,3 +40,18 @@ func TestTranscriptVisibleWindowCachesAndAnchors(t *testing.T) {
 		t.Fatalf("replace changed reading position or failed to install blocks: offset=%d blocks=%+v", transcript.ScrollOffset, transcript.Blocks)
 	}
 }
+
+func TestTranscriptGroupGrowthPreservesHistoricalAnchor(t *testing.T) {
+	var transcript Transcript
+	for i := range 10 {
+		transcript.Append(TranscriptBlock{ID: fmt.Sprintf("old-%d", i), Kind: BlockAssistantMessage, Body: "old message"}, 80)
+	}
+	transcript.Append(TranscriptBlock{ID: "group", Kind: BlockActivityGroup, Collapsed: false}, 80)
+	transcript.ScrollOffset = 5
+	before := transcript.LineCount(transcript.Blocks[len(transcript.Blocks)-1], 80)
+	transcript.Append(TranscriptBlock{ID: "call", GroupID: "group", Kind: BlockToolActivity, Header: "Done read_file", Completed: true}, 80)
+	after := transcript.LineCount(transcript.Blocks[len(transcript.Blocks)-2], 80)
+	if transcript.ScrollOffset != 5+after-before {
+		t.Fatalf("group growth moved the historical anchor incorrectly: offset=%d before=%d after=%d", transcript.ScrollOffset, before, after)
+	}
+}

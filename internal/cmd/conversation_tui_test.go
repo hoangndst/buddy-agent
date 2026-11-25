@@ -867,13 +867,15 @@ func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 		Data: map[string]any{"tool_name": "bash", "activity_id": activity}})
 	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 2, Type: string(agent.EventToolResult), Content: "preview",
 		Data: map[string]any{"tool_name": "bash", "activity_id": activity, "output_ref": "out-1"}})
-	activityID := m.ui.Transcript.Blocks[1].ID
+	activityID := m.ui.Transcript.Blocks[2].ID
 	openOutput := func(stage string, wantBlocks int) {
 		t.Helper()
-		if len(m.ui.Transcript.Blocks) != wantBlocks || m.ui.Transcript.Blocks[1].ID != activityID || !m.ui.Transcript.Blocks[1].Completed || m.ui.Transcript.Blocks[2].Body != "first answer" {
+		if len(m.ui.Transcript.Blocks) != wantBlocks || m.ui.Transcript.Blocks[2].ID != activityID || !m.ui.Transcript.Blocks[2].Completed || m.ui.Transcript.Blocks[3].Body != "first answer" {
 			t.Fatalf("%s sync did not reconcile the activity with its originating turn: %+v", stage, m.ui.Transcript.Blocks)
 		}
 		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+		m.Update(tea.KeyPressMsg{Code: tea.KeyEnter}) // Expand the tool group.
+		m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		_, open := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 		if m.ui.SelectedActivity != activityID || open == nil {
 			t.Fatalf("%s sync lost the selectable output activity", stage)
@@ -894,14 +896,14 @@ func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 		Transcript: []protocol.ConversationTranscriptEntry{firstPrompt, answer}}
 	_, sync := m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 3, Type: string(agent.EventFinished)})
 	m.Update(sync())
-	openOutput("completion", 3)
+	openOutput("completion", 4)
 
 	nextPrompt := protocol.ConversationTranscriptEntry{Role: "user", TurnID: "turn-2", Content: "second prompt"}
 	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 4,
 		Transcript: []protocol.ConversationTranscriptEntry{firstPrompt, answer, nextPrompt}}
 	_, sync = m.Update(m.submit(nextPrompt.Content, persistence.SubmissionQueue)())
 	m.Update(sync())
-	openOutput("next prompt", 4)
+	openOutput("next prompt", 5)
 }
 
 func TestConversationTUIDropsOutputWhenConversationOrWorkerChanges(t *testing.T) {
@@ -1222,6 +1224,7 @@ func TestConversationTUINestedActivityRefreshesCachedParent(t *testing.T) {
 		}))
 	}
 	emit(agent.EventToolCall, "invoke_subagent", "parent", "", nil)
+	m.ui.Transcript.Update(0, func(block *TranscriptBlock) { block.Collapsed = false }, m.ui.Width)
 	_ = m.View()
 	emit(agent.EventToolCall, "read_file", "child", "", identity("parent"))
 	if view := m.View().Content; !strings.Contains(view, "worker (1 step)") {

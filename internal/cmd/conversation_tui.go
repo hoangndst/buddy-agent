@@ -80,6 +80,8 @@ const (
 	BlockToolActivity = tui.BlockToolActivity
 	// BlockSubagentActivity identifies delegated tool activity.
 	BlockSubagentActivity = tui.BlockSubagentActivity
+	// BlockActivityGroup summarizes tool calls from one model step.
+	BlockActivityGroup = tui.BlockActivityGroup
 	// BlockSystemStatus identifies a system notice.
 	BlockSystemStatus = tui.BlockSystemStatus
 )
@@ -1328,7 +1330,7 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	var activityTurns []string
 	if m.conversation == result.ConversationID && m.workerEpoch == result.WorkerEpoch {
 		for _, block := range m.ui.Transcript.Blocks {
-			if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity {
+			if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity && block.Kind != BlockActivityGroup {
 				continue
 			}
 			if len(activitiesByTurn[block.TurnID]) == 0 {
@@ -1580,7 +1582,13 @@ func activityDataKey(data map[string]any) string {
 }
 
 func activityFromEvent(data map[string]any, _ string) *tui.Activity {
-	activity := &tui.Activity{Identity: activityDataKey(data), StartedAt: time.Now()}
+	step := eventInt(data["step"])
+	if step <= 0 {
+		if id, ok := data["activity_id"].(map[string]any); ok {
+			step = eventInt(id["step"])
+		}
+	}
+	activity := &tui.Activity{Identity: activityDataKey(data), Step: step, StartedAt: time.Now()}
 	if data == nil {
 		return activity
 	}
@@ -1625,12 +1633,12 @@ func activityIdentityKey(id map[string]any) string {
 		return ""
 	}
 	turn, _ := id["turn_id"].(string)
-	step, _ := id["step"].(float64)
+	step := eventInt(id["step"])
 	call, _ := id["tool_call_id"].(string)
 	if turn == "" || call == "" {
 		return ""
 	}
-	return turn + "\x00" + strconv.Itoa(int(step)) + "\x00" + call
+	return turn + "\x00" + strconv.Itoa(step) + "\x00" + call
 }
 
 func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {

@@ -29,7 +29,7 @@ func TestTUIEventAdapterMapsDisplayEventsAndDropsUnknownData(t *testing.T) {
 			msg := protocol.SessionEventNotification{TurnID: "turn-1", Type: tt.typeName, Content: tt.content}
 			if tt.typeName == string(agent.EventToolCall) || tt.typeName == string(agent.EventToolResult) {
 				msg.Data = map[string]any{
-					"tool_name": "read_file", "path": "internal/main.go", "line": float64(4),
+					"tool_name": "read_file", "path": "internal/main.go", "line": float64(4), "step": float64(2),
 					"output_ref": "output-1", "activity_id": map[string]any{"turn_id": "turn-1", "step": float64(2), "tool_call_id": "call-1"},
 					"command": "must not enter UI event",
 				}
@@ -39,7 +39,7 @@ func TestTUIEventAdapterMapsDisplayEventsAndDropsUnknownData(t *testing.T) {
 				t.Fatalf("mapped event = %+v, %v; want kind %v", got, ok, tt.want)
 			}
 			if (tt.typeName == string(agent.EventToolCall) || tt.typeName == string(agent.EventToolResult)) && got.Activity != nil {
-				if got.Activity.Tool != "read_file" || got.Activity.Path != "internal/main.go" || got.Activity.OutputRef != "output-1" {
+				if got.Activity.Tool != "read_file" || got.Activity.Path != "internal/main.go" || got.Activity.OutputRef != "output-1" || got.Activity.Step != 2 {
 					t.Fatalf("activity was not reduced to allowlisted display fields: %+v", got.Activity)
 				}
 			}

@@ -90,10 +90,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.Transcript.ScrollOffset = max(0, m.Transcript.ScrollOffset-3)
 		}
 	case FlushMsg:
+		m.tickerActive = false
 		m.flushDelta()
-		if m.tickerActive {
-			return m, tea.Tick(33*time.Millisecond, func(time.Time) tea.Msg { return FlushMsg{} })
-		}
 	case Event:
 		return m, m.reduce(msg)
 	case tea.KeyPressMsg:
@@ -305,10 +303,14 @@ func (m *Model) CurrentOutputPage() *OutputPage { return m.inspection.Output }
 func (m *Model) selectActivity(delta int) {
 	activities := make([]string, 0)
 	for _, block := range m.Transcript.Blocks {
+		if block.Kind == BlockActivityGroup {
+			activities = append(activities, block.ID)
+			continue
+		}
 		if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity {
 			continue
 		}
-		if block.ParentID == "" || parentActivityIsExpanded(block, m.Transcript.Blocks) {
+		if block.ParentID != "" && parentActivityIsExpanded(block, m.Transcript.Blocks) || block.ParentID == "" && (block.GroupID == "" || activityGroupIsExpanded(block, m.Transcript.Blocks)) {
 			activities = append(activities, block.ID)
 		}
 	}
@@ -335,6 +337,9 @@ func (m *Model) selectActivity(delta int) {
 		return
 	}
 	selectedParent := m.Transcript.Blocks[selected].ParentID
+	if selectedParent == "" {
+		selectedParent = m.Transcript.Blocks[selected].GroupID
+	}
 	target := m.SelectedActivity
 	if selectedParent != "" {
 		target = selectedParent
@@ -381,6 +386,9 @@ func (m *Model) invalidateActivity(id string) {
 		if parent := m.Transcript.Blocks[index].ParentID; parent != "" {
 			m.Transcript.Invalidate(parent)
 		}
+		if group := m.Transcript.Blocks[index].GroupID; group != "" {
+			m.Transcript.Invalidate(group)
+		}
 	}
 }
 
@@ -393,11 +401,24 @@ func parentActivityIsExpanded(block TranscriptBlock, blocks []TranscriptBlock) b
 	return false
 }
 
+func activityGroupIsExpanded(block TranscriptBlock, blocks []TranscriptBlock) bool {
+	for _, group := range blocks {
+		if group.ID == block.GroupID {
+			return !group.Collapsed
+		}
+	}
+	return false
+}
+
 func (m *Model) activateSelectedActivity() tea.Cmd {
 	m.Transcript.SetRenderState(m.streamingText, m.SelectedActivity, m.TranscriptFocused)
 	for index, block := range m.Transcript.Blocks {
 		if block.ID != m.SelectedActivity {
 			continue
+		}
+		if block.Kind == BlockActivityGroup {
+			m.Transcript.Update(index, func(current *TranscriptBlock) { current.Collapsed = !current.Collapsed }, m.Width)
+			return nil
 		}
 		if block.Activity != nil && block.Activity.OutputRef != "" {
 			return EmitAction(Action{Kind: ActionOpenOutput, Ref: block.Activity.OutputRef})
@@ -554,9 +575,7 @@ func (m *Model) reduce(event Event) tea.Cmd {
 			m.Transcript.Append(TranscriptBlock{ID: m.newBlockID(), TurnID: event.TurnID, Kind: BlockAssistantMessage, Role: "assistant", Header: "Buddy", Body: content, CreatedAt: at, Activity: event.Activity}, m.Width)
 		}
 	case EventReasoning:
-		if event.Text != "" {
-			m.Transcript.Append(TranscriptBlock{ID: m.newBlockID(), TurnID: event.TurnID, Kind: BlockAssistantMessage, Role: "reasoning", Header: "Reasoning", Body: event.Text, CreatedAt: at, Activity: event.Activity}, m.Width)
-		}
+		// Reasoning events are model-internal; show progress through public activity instead.
 	case EventActivityStarted:
 		if event.Activity == nil {
 			return nil
@@ -575,7 +594,11 @@ func (m *Model) reduce(event Event) tea.Cmd {
 		if a.Path != "" {
 			header += " " + FormatWorkspaceFileHyperlink(m.Metadata.Workspace, a.Path, a.Line)
 		}
-		block := TranscriptBlock{ID: m.newBlockID(), TurnID: event.TurnID, Kind: kind, Role: "tool", Header: "Running " + header, CreatedAt: at, Activity: &a}
+		groupID := ""
+		if a.ParentIdentity == "" {
+			groupID = m.activityGroup(event.TurnID, a.Step, at)
+		}
+		block := TranscriptBlock{ID: m.newBlockID(), TurnID: event.TurnID, GroupID: groupID, Step: a.Step, Kind: kind, Role: "tool", Header: "Running " + header, CreatedAt: at, Activity: &a}
 		if kind == BlockSubagentActivity {
 			block.Collapsed = true
 			if parent := m.activityBlock(a.ParentIdentity); parent >= 0 {
@@ -596,44 +619,48 @@ func (m *Model) reduce(event Event) tea.Cmd {
 		matched := false
 		for i := len(m.Transcript.Blocks) - 1; i >= 0; i-- {
 			block := m.Transcript.Blocks[i]
-			if block.TurnID != event.TurnID || block.Activity == nil || block.Activity.Identity != activity.Identity || activity.Identity == "" {
+			if event.TurnID != "" && block.TurnID != event.TurnID || block.Activity == nil || activity.Identity == "" || block.Activity.Identity != activity.Identity {
 				continue
 			}
-			m.Transcript.Update(i, func(block *TranscriptBlock) {
-				block.Body, block.Activity, block.Completed, block.Collapsed = event.Text, &activity, true, true
-				name, mark, elapsed := activity.Tool, "Done", ""
-				if activity.ExitCode != nil && *activity.ExitCode != 0 {
-					mark = "Failed"
-				}
-				if activity.Elapsed > 0 {
-					elapsed = "  ·  " + activity.Elapsed.Round(100*time.Millisecond).String()
-				}
-				if name != "" {
-					block.Header = mark + " " + name + elapsed
-				}
-			}, m.Width)
+			m.completeActivity(i, event.Text, activity)
 			matched = true
 			break
 		}
-		if !matched && event.Text != "" {
-			kind, header := BlockToolActivity, "Result"
-			if activity.ParentIdentity != "" {
-				kind = BlockSubagentActivity
-				header = activity.Tool
-				if header == "" {
-					header = "tool"
+		if !matched {
+			if activity.Identity == "" {
+				if candidate := m.unambiguousActivity(event.TurnID, activity); candidate >= 0 {
+					m.completeActivity(candidate, event.Text, activity)
+					matched = true
 				}
 			}
-			block := TranscriptBlock{ID: m.newBlockID(), TurnID: event.TurnID, Kind: kind, Role: "tool", Header: header, Body: event.Text, CreatedAt: at, Collapsed: len(event.Text) > 500 || activity.OutputRef != "", Completed: true, Activity: &activity}
-			if kind == BlockSubagentActivity {
-				if parent := m.activityBlock(activity.ParentIdentity); parent >= 0 {
-					block.ParentID = m.Transcript.Blocks[parent].ID
-					m.Transcript.Update(parent, func(b *TranscriptBlock) { b.Collapsed = true }, m.Width)
-				} else {
-					block.Header = "Detached child · " + block.Header
+			if !matched && (event.Text != "" || activity.ExitCode != nil) {
+				kind := BlockToolActivity
+				if activity.ParentIdentity != "" {
+					kind = BlockSubagentActivity
 				}
+				tool := activity.Tool
+				if tool == "" {
+					tool = "tool"
+				}
+				mark := "Done"
+				if activity.ExitCode != nil && *activity.ExitCode != 0 {
+					mark = "Failed"
+				}
+				groupID := ""
+				if activity.ParentIdentity == "" {
+					groupID = m.activityGroup(event.TurnID, activity.Step, at)
+				}
+				block := TranscriptBlock{ID: m.newBlockID(), TurnID: event.TurnID, GroupID: groupID, Step: activity.Step, Kind: kind, Role: "tool", Header: mark + " " + tool, Body: event.Text, CreatedAt: at, Collapsed: len(event.Text) > 500 || activity.OutputRef != "", Completed: true, Activity: &activity}
+				if kind == BlockSubagentActivity {
+					if parent := m.activityBlock(activity.ParentIdentity); parent >= 0 {
+						block.ParentID = m.Transcript.Blocks[parent].ID
+						m.Transcript.Update(parent, func(b *TranscriptBlock) { b.Collapsed = true }, m.Width)
+					} else {
+						block.Header = "Detached child · " + block.Header
+					}
+				}
+				m.Transcript.Append(block, m.Width)
 			}
-			m.Transcript.Append(block, m.Width)
 		}
 	case EventTurnFinished:
 		m.flushDelta()
@@ -700,6 +727,62 @@ func (m *Model) activityBlock(identity string) int {
 		}
 	}
 	return -1
+}
+
+func (m *Model) activityGroup(turnID string, step int, at time.Time) string {
+	if step > 0 {
+		for i := range m.Transcript.Blocks {
+			group := m.Transcript.Blocks[i]
+			if group.Kind == BlockActivityGroup && group.TurnID == turnID && group.Step == step {
+				m.Transcript.Invalidate(group.ID)
+				return group.ID
+			}
+		}
+	}
+	id := m.newBlockID()
+	m.Transcript.Append(TranscriptBlock{ID: id, TurnID: turnID, Kind: BlockActivityGroup, Step: step, Header: "Tool activity", Collapsed: true, CreatedAt: at}, m.Width)
+	return id
+}
+
+func (m *Model) completeActivity(index int, output string, activity Activity) {
+	if activity.Identity == "" && m.Transcript.Blocks[index].Activity != nil {
+		activity.Identity = m.Transcript.Blocks[index].Activity.Identity
+	}
+	if activity.Step == 0 {
+		activity.Step = m.Transcript.Blocks[index].Step
+	}
+	m.Transcript.Update(index, func(block *TranscriptBlock) {
+		block.Body, block.Activity, block.Completed, block.Collapsed = output, &activity, true, true
+		name, mark := activity.Tool, "Done"
+		if activity.ExitCode != nil && *activity.ExitCode != 0 {
+			mark = "Failed"
+		}
+		if name != "" {
+			block.Header = mark + " " + name
+		}
+	}, m.Width)
+}
+
+func (m *Model) unambiguousActivity(turnID string, activity Activity) int {
+	candidate := -1
+	for i := len(m.Transcript.Blocks) - 1; i >= 0; i-- {
+		block := m.Transcript.Blocks[i]
+		if block.Activity == nil || block.Completed || activity.Tool == "" || block.Activity.Tool != activity.Tool || block.Activity.ParentIdentity != activity.ParentIdentity || turnID != "" && block.TurnID != turnID {
+			continue
+		}
+		step := activity.Step
+		if step == 0 {
+			step = block.Step
+		}
+		if step > 0 && block.Step != step {
+			continue
+		}
+		if candidate >= 0 {
+			return -1
+		}
+		candidate = i
+	}
+	return candidate
 }
 
 func (m *Model) newBlockID() string {
