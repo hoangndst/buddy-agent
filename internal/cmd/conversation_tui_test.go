@@ -1313,21 +1313,31 @@ func TestConversationTUIFormatsVisibleTranscript(t *testing.T) {
 }
 
 func TestConversationTUIDynamicComposerAndUnicodeWidth(t *testing.T) {
-	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
-	model.textarea.SetPromptFunc(2, composerPrompt)
+	model := &conversationTUI{textarea: newConversationComposer(), width: 80, height: 24}
 	model.textarea.SetWidth(76)
 	model.resizeComposer()
-	if model.textarea.Height() != 2 {
-		t.Fatalf("empty standard composer height = %d, want 2", model.textarea.Height())
+	if model.textarea.Height() != 1 {
+		t.Fatalf("empty standard composer height = %d, want 1", model.textarea.Height())
 	}
-	if got := ansi.Strip(model.textarea.View()); strings.Count(got, "›") != 1 {
-		t.Fatalf("empty composer repeated its prompt: %q", got)
+	if !model.textarea.VirtualCursor() {
+		t.Fatal("empty standard composer should render a visible virtual cursor")
 	}
+	withCursor := model.textarea.View()
+	model.textarea.SetVirtualCursor(false)
+	if withoutCursor := model.textarea.View(); withCursor == withoutCursor {
+		t.Fatal("placeholder view did not change when its block cursor was disabled")
+	}
+	model.textarea.SetVirtualCursor(true)
 	model.textarea.SetWidth(30)
 	model.textarea.SetValue("first line\nsecond line\nthird line")
 	model.resizeComposer()
 	if model.textarea.Height() < 3 {
 		t.Fatalf("multiline composer height = %d, want at least 3", model.textarea.Height())
+	}
+	model.textarea.SetValue(strings.Repeat("x", 100))
+	model.resizeComposer()
+	if model.textarea.Height() < 3 {
+		t.Fatalf("wrapped pasted composer height = %d, want at least 3", model.textarea.Height())
 	}
 	model.width = 12
 	model.textarea.SetValue("界面 🐕 Buddy")

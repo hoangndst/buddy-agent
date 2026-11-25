@@ -227,15 +227,7 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 	if !containsConversationMethods(capabilities.Methods) {
 		return fmt.Errorf("this daemon does not support M9 conversations; restart it when its current work is safe to stop, then retry")
 	}
-	input := textarea.New()
-	input.ShowLineNumbers = false
-	input.Placeholder = "Ask Buddy anything…"
-	input.SetHeight(1)
-	input.SetVirtualCursor(false)
-	input.SetStyles(textarea.DefaultStyles(true))
-	input.SetPromptFunc(2, composerPrompt)
-	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"), key.WithHelp("shift+enter", "new line"))
-	input.Focus()
+	input := newConversationComposer()
 	historyPath := os.Getenv("BUDDY_HISTORY_FILE")
 	if historyPath == "" {
 		home, homeErr := os.UserHomeDir()
@@ -2165,11 +2157,17 @@ func (m *conversationTUI) renderTextarea() string {
 	return m.textarea.View()
 }
 
-func composerPrompt(info textarea.PromptInfo) string {
-	if info.LineNumber == 0 {
-		return "› "
-	}
-	return "  "
+func newConversationComposer() textarea.Model {
+	input := textarea.New()
+	input.ShowLineNumbers = false
+	input.Placeholder = "Ask Buddy anything…"
+	input.SetHeight(1)
+	input.SetStyles(textarea.DefaultStyles(true))
+	input.Prompt = "› "
+	input.SetVirtualCursor(true)
+	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"), key.WithHelp("shift+enter", "new line"))
+	input.Focus()
+	return input
 }
 
 func (m *conversationTUI) resizeComposer() {
@@ -2181,9 +2179,7 @@ func (m *conversationTUI) resizeComposer() {
 		maxRows = 1
 	}
 	rows := 1
-	if strings.TrimSpace(m.textarea.Value()) == "" && m.width >= 80 && m.height >= 24 {
-		rows = 2
-	} else if strings.TrimSpace(m.textarea.Value()) != "" {
+	if strings.TrimSpace(m.textarea.Value()) != "" {
 		width := max(1, m.textarea.Width())
 		rows = 0
 		for _, line := range strings.Split(m.textarea.Value(), "\n") {
