@@ -16,6 +16,11 @@ type FlushMsg struct{}
 type Model struct {
 	Transcript    Transcript
 	Composer      *Composer
+	Approvals     []ApprovalRequest
+	Choices       []Choice
+	Picker        PickerKind
+	PickerCursor  int
+	PickerGen     uint64
 	Width, Height int
 	Metadata      Header
 	State         string
@@ -25,6 +30,9 @@ type Model struct {
 	activeBlockID string
 	streamingText string
 	blockSequence uint64
+	approvalModal *ApprovalModal
+	inspection    inspectionState
+	screenContent *ScreenContent
 }
 
 // NewModel creates conversation presentation state for one terminal session.
@@ -65,8 +73,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.Composer != nil {
 			m.Composer.Resize(msg.Width, msg.Height)
 		}
+		if m.approvalModal != nil {
+			m.approvalModal.Resize(msg.Width, msg.Height)
+		}
 		m.Transcript.ClearCache()
 	case tea.MouseWheelMsg:
+		if m.HasInspection() {
+			return m, m.updateInspectionWheel(msg)
+		}
 		switch msg.Button {
 		case tea.MouseWheelUp:
 			m.Transcript.ScrollOffset += 3
@@ -80,12 +94,133 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case Event:
 		return m, m.reduce(msg)
+	case tea.KeyPressMsg:
+		if request := m.ActiveApproval(); request != nil && m.approvalModal != nil {
+			choice, done, cmd := m.approvalModal.HandleKey(msg, *request)
+			if done && choice != nil {
+				return m, EmitAction(Action{Kind: ActionPermissionChoice, ApprovalGeneration: request.Generation, ApprovalChoice: *choice})
+			}
+			return m, cmd
+		}
+		if m.HasPicker() {
+			switch msg.String() {
+			case "up", "k":
+				m.PickerCursor = max(0, m.PickerCursor-1)
+			case "down", "j":
+				m.PickerCursor = min(max(0, len(m.Choices)-1), m.PickerCursor+1)
+			case "esc":
+				picker := m.Picker
+				generation := m.PickerGen
+				m.closePicker()
+				return m, EmitAction(Action{Kind: ActionCancelPicker, PickerKind: picker, PickerGeneration: generation})
+			case "enter":
+				if len(m.Choices) > 0 {
+					return m, EmitAction(Action{Kind: ActionSelectChoice, PickerKind: m.Picker, PickerGeneration: m.PickerGen, ChoiceID: m.Choices[m.PickerCursor].ID})
+				}
+			}
+			return m, nil
+		}
+		if m.HasInspection() {
+			return m.updateInspectionKey(msg)
+		}
+		if m.Composer.CompletionKind() != "" {
+			switch msg.String() {
+			case "esc":
+				m.Composer.ClearCompletion()
+				return m, nil
+			case "up", "down":
+				step := -1
+				if msg.String() == "down" {
+					step = 1
+				}
+				m.Composer.MoveCompletion(step)
+				return m, nil
+			case "tab", "enter":
+				if m.Composer.AcceptCompletion(msg.String() == "enter") {
+					return m, nil
+				}
+			}
+		}
+		if m.Composer.HasHistory() {
+			switch msg.String() {
+			case "ctrl+p":
+				if prompt, ok := m.Composer.Previous(m.Composer.Editor.Value()); ok {
+					m.Composer.SetValue(prompt, m.Width, m.Height)
+					m.Composer.ClearCompletion()
+				}
+				return m, nil
+			case "ctrl+n":
+				if prompt, ok := m.Composer.Next(); ok {
+					m.Composer.SetValue(prompt, m.Width, m.Height)
+					m.Composer.ClearCompletion()
+				}
+				return m, nil
+			case "up":
+				lineInfo := m.Composer.Editor.LineInfo()
+				if m.Composer.Editor.Line() == 0 && lineInfo.RowOffset == 0 {
+					if prompt, ok := m.Composer.Previous(m.Composer.Editor.Value()); ok {
+						m.Composer.SetValue(prompt, m.Width, m.Height)
+						m.Composer.ClearCompletion()
+						return m, nil
+					}
+				}
+			case "down":
+				lineInfo := m.Composer.Editor.LineInfo()
+				if m.Composer.Editor.Line() == m.Composer.Editor.LineCount()-1 && lineInfo.RowOffset+1 >= lineInfo.Height {
+					if prompt, ok := m.Composer.Next(); ok {
+						m.Composer.SetValue(prompt, m.Width, m.Height)
+						m.Composer.ClearCompletion()
+						return m, nil
+					}
+				}
+			}
+		}
+		switch msg.String() {
+		case "pgup":
+			m.Transcript.ScrollOffset += max(1, m.Height/2)
+			return m, nil
+		case "pgdown":
+			m.Transcript.ScrollOffset = max(0, m.Transcript.ScrollOffset-max(1, m.Height/2))
+			return m, nil
+		case "end":
+			m.Transcript.ScrollOffset = 0
+			return m, nil
+		case "enter":
+			prompt := strings.TrimSpace(m.Composer.Editor.Value())
+			if prompt == "" {
+				return m, nil
+			}
+			m.Composer.Reset(m.Width, m.Height)
+			return m, EmitAction(Action{Kind: ActionSubmitPrompt, Prompt: prompt})
+		}
+	case tea.PasteMsg:
+		if m.approvalModal != nil && m.approvalModal.Editing() {
+			return m, m.approvalModal.UpdateEditor(msg)
+		}
+		if m.HasPicker() || m.HasInspection() {
+			return m, nil
+		}
 	}
-	return m, nil
+	return m, m.Composer.Update(msg, m.Width, m.Height, m.Metadata.Workspace)
 }
 
 // View renders the transcript model without any runtime or command state.
 func (m *Model) View() tea.View {
+	if m.screenContent != nil {
+		content := m.screenContent
+		body, footer := content.Body, content.Footer
+		if m.HasPicker() && !m.HasPendingApproval() {
+			footer = nil
+			if m.Width >= 40 && m.Height >= 12 {
+				footer = []string{mutedStyle.Render("↑/↓ select · Enter choose · Esc back")}
+			}
+			body = m.PickerView(m.Height - len(content.Header) - len(footer))
+		} else if m.HasInspection() && !m.HasPendingApproval() {
+			footer = nil
+			body = m.InspectionView(max(0, m.Height-len(content.Header)))
+		}
+		return RenderScreen(Screen{Width: m.Width, Height: m.Height, Header: content.Header, Body: body, Footer: footer})
+	}
 	m.Transcript.SetRenderState(m.streamingText, "", false)
 	body := m.Transcript.VisibleLines(max(0, m.Height-2), m.Width)
 	return RenderScreen(Screen{
@@ -93,6 +228,78 @@ func (m *Model) View() tea.View {
 		Header: RenderHeader(Header{Width: m.Width, Model: m.Metadata.Model, Workspace: m.Metadata.Workspace, GitBranch: m.Metadata.GitBranch, State: m.State, Standard: m.Metadata.Standard}),
 		Body:   body,
 	})
+}
+
+// SetScreenContent supplies rows the runtime adapter derives from daemon state.
+func (m *Model) SetScreenContent(content ScreenContent) { m.screenContent = &content }
+
+// ActiveApproval returns the oldest pending approval shown by the modal.
+func (m *Model) ActiveApproval() *ApprovalRequest {
+	if len(m.Approvals) == 0 {
+		return nil
+	}
+	return &m.Approvals[0]
+}
+
+// HasPendingApproval reports whether approval interaction currently has focus.
+func (m *Model) HasPendingApproval() bool { return len(m.Approvals) > 0 }
+
+// HasPicker reports whether a workspace or conversation picker is active.
+func (m *Model) HasPicker() bool { return m.Picker != PickerNone }
+
+// HasInspection reports whether an output or diff inspector is active.
+func (m *Model) HasInspection() bool { return m.inspection.Kind != InspectionNone }
+
+// InspectionKind returns the currently active inspector type.
+func (m *Model) InspectionKind() InspectionKind { return m.inspection.Kind }
+
+// InspectionRef returns the output reference displayed by the active output inspector.
+func (m *Model) InspectionRef() string { return m.inspection.Ref }
+
+// CurrentOutputPage returns the output page currently displayed by the model.
+func (m *Model) CurrentOutputPage() *OutputPage { return m.inspection.Output }
+
+// InspectionView renders the active inspector within the supplied row budget.
+func (m *Model) InspectionView(height int) []string { return m.inspection.view(m.Width, height) }
+
+// PickerView renders the active picker within the supplied row budget.
+func (m *Model) PickerView(height int) []string {
+	if !m.HasPicker() {
+		return nil
+	}
+	label := "Choose a project"
+	if m.Picker == PickerConversation {
+		label = "Choose a conversation"
+	}
+	items := make([]string, len(m.Choices))
+	for i, choice := range m.Choices {
+		items[i] = choice.Label
+	}
+	return RenderChoiceList(ChoiceList{Label: label, Items: items, Cursor: m.PickerCursor, Height: height})
+}
+
+// ApprovalView renders the active approval within the supplied footer area.
+func (m *Model) ApprovalView(height int) string {
+	request := m.ActiveApproval()
+	if request == nil || m.approvalModal == nil {
+		return ""
+	}
+	modalHeight := min(max(2, m.Height/2), max(2, m.Height))
+	return m.approvalModal.View(*request, m.Width, min(height, modalHeight))
+}
+
+// ApprovalActionRow renders the active approval's keyboard choices.
+func (m *Model) ApprovalActionRow() string {
+	request := m.ActiveApproval()
+	if request == nil || m.approvalModal == nil {
+		return "Resize terminal to decide"
+	}
+	return m.approvalModal.ActionRow(*request, max(1, m.Width))
+}
+
+// ApprovalEditing reports whether the active approval editor is open.
+func (m *Model) ApprovalEditing() bool {
+	return m.approvalModal != nil && m.approvalModal.Editing()
 }
 
 func (m *Model) reduce(event Event) tea.Cmd {
@@ -105,6 +312,66 @@ func (m *Model) reduce(event Event) tea.Cmd {
 		m.flushDelta()
 		m.activeBlockID, m.streamingText, m.tickerActive = "", "", false
 		m.Transcript.Replace(event.Blocks)
+	case EventApprovalSnapshot:
+		m.setApprovals(event.Approvals)
+	case EventApprovalPending:
+		if event.Approval != nil {
+			approvals := append([]ApprovalRequest(nil), m.Approvals...)
+			found := false
+			for i := range approvals {
+				if approvals[i].Generation == event.Approval.Generation {
+					approvals[i], found = *event.Approval, true
+					break
+				}
+			}
+			if !found {
+				approvals = append(approvals, *event.Approval)
+			}
+			m.setApprovals(approvals)
+		}
+	case EventApprovalResolved:
+		approvals := make([]ApprovalRequest, 0, len(m.Approvals))
+		for _, approval := range m.Approvals {
+			if approval.Generation != event.ApprovalGeneration {
+				approvals = append(approvals, approval)
+			}
+		}
+		m.setApprovals(approvals)
+	case EventPickerSnapshot:
+		m.Picker = event.PickerKind
+		m.PickerGen = event.PickerGeneration
+		m.Choices = append(m.Choices[:0], event.Choices...)
+		m.PickerCursor = 0
+	case EventPickerGeneration:
+		m.PickerGen = event.PickerGeneration
+	case EventPickerClosed:
+		m.closePicker()
+	case EventInspectionStart:
+		m.inspection = inspectionState{Kind: event.InspectionKind, Generation: event.InspectionGeneration, Ref: event.InspectionRef, Loading: true}
+	case EventInspectionPageLoading:
+		if m.inspection.Generation == event.InspectionGeneration {
+			m.inspection.Loading, m.inspection.Error = true, ""
+			m.inspection.Scroll, m.inspection.Column = 0, 0
+		}
+	case EventOutputPage:
+		if m.inspection.Generation == event.InspectionGeneration && m.inspection.Kind == InspectionOutput {
+			m.inspection.Output = event.OutputPage
+			m.inspection.Loading, m.inspection.Error = false, ""
+		}
+	case EventDiffResult:
+		if m.inspection.Generation == event.InspectionGeneration && m.inspection.Kind == InspectionDiff {
+			m.inspection.Diff = event.DiffView
+			m.inspection.Loading, m.inspection.Error = false, ""
+			m.inspection.SelectedFile, m.inspection.FileOpen, m.inspection.Scroll, m.inspection.Column = 0, false, 0, 0
+		}
+	case EventInspectionFailure:
+		if m.inspection.Generation == event.InspectionGeneration {
+			m.inspection.Loading, m.inspection.Error = false, event.InspectionError
+		}
+	case EventInspectionClosed:
+		if event.InspectionGeneration == 0 || m.inspection.Generation == event.InspectionGeneration {
+			m.closeInspection()
+		}
 	case EventAssistantDelta:
 		if event.Text == "" {
 			return nil
@@ -227,6 +494,28 @@ func (m *Model) reduce(event Event) tea.Cmd {
 		m.Transcript.Append(TranscriptBlock{ID: m.newBlockID(), TurnID: event.TurnID, Kind: BlockSystemStatus, Role: "system", Header: "System", Body: event.Text, CreatedAt: at}, m.Width)
 	}
 	return nil
+}
+
+func (m *Model) closePicker() {
+	m.Picker = PickerNone
+	m.PickerGen = 0
+	m.Choices = nil
+	m.PickerCursor = 0
+}
+
+func (m *Model) setApprovals(approvals []ApprovalRequest) {
+	oldGeneration := uint64(0)
+	if active := m.ActiveApproval(); active != nil {
+		oldGeneration = active.Generation
+	}
+	m.Approvals = append(m.Approvals[:0], approvals...)
+	if len(m.Approvals) == 0 {
+		m.approvalModal = nil
+		return
+	}
+	if m.Approvals[0].Generation != oldGeneration || m.approvalModal == nil {
+		m.approvalModal = NewApprovalModal(m.Approvals[0].ArgumentsJSON, m.Width, m.Height)
+	}
 }
 
 func (m *Model) flushDelta() {

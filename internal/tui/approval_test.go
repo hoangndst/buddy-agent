@@ -123,6 +123,20 @@ func TestApprovalModalShiftEnterInsertsNewline(t *testing.T) {
 	}
 }
 
+func TestApprovalModalReceivesPastedJSON(t *testing.T) {
+	request := ApprovalRequest{Tool: "write_file", ArgumentsJSON: "{}"}
+	modal := NewApprovalModal("", 80, 24)
+	approvalKey(t, modal, tea.KeyPressMsg{Text: "4", Code: '4'}, request)
+	modal.UpdateEditor(tea.PasteMsg{Content: `{"path":"pasted.go"}`})
+	if got := modal.Editor.Value(); got != `{"path":"pasted.go"}` {
+		t.Fatalf("pasted JSON = %q", got)
+	}
+	choice, done, _ := approvalKey(t, modal, tea.KeyPressMsg{Code: tea.KeyEnter}, request)
+	if !done || choice == nil || choice.EditedArgumentsJSON != `{"path":"pasted.go"}` {
+		t.Fatalf("pasted JSON choice = %+v done=%t", choice, done)
+	}
+}
+
 func approvalKey(t *testing.T, modal *ApprovalModal, msg tea.KeyPressMsg, request ApprovalRequest) (*ApprovalChoice, bool, tea.Cmd) {
 	t.Helper()
 	return modal.HandleKey(msg, request)

@@ -9,6 +9,43 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
+func TestModelComposesPickerAndInspectionScreens(t *testing.T) {
+	m := NewModel(Header{})
+	m.Width, m.Height = 40, 12
+	m.SetScreenContent(ScreenContent{Body: []string{"transcript body"}, Footer: []string{"normal footer"}})
+	m.Update(Event{Kind: EventPickerSnapshot, PickerKind: PickerWorkspace, PickerGeneration: 1, Choices: []Choice{{ID: "w", Label: "workspace choice"}}})
+	view := m.View().Content
+	if !strings.Contains(view, "workspace choice") || strings.Contains(view, "transcript body") {
+		t.Fatalf("picker did not take composition focus: %q", view)
+	}
+	m.Update(Event{Kind: EventInspectionStart, InspectionKind: InspectionOutput, InspectionGeneration: 2, InspectionRef: "out"})
+	m.Update(Event{Kind: EventOutputPage, InspectionGeneration: 2, OutputPage: &OutputPage{Data: "inspector body"}})
+	if view = m.View().Content; !strings.Contains(view, "workspace choice") || strings.Contains(view, "inspector body") {
+		t.Fatalf("picker did not retain priority over inspector: %q", view)
+	}
+	m.Update(Event{Kind: EventPickerClosed})
+	view = m.View().Content
+	if !strings.Contains(view, "inspector body") || strings.Contains(view, "workspace choice") {
+		t.Fatalf("inspector did not replace the picker screen: %q", view)
+	}
+}
+
+func TestModelSubmitsComposerInputAsNeutralAction(t *testing.T) {
+	m := NewModel(Header{Workspace: t.TempDir()})
+	m.Composer.Editor.SetValue("implement the change")
+	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter did not emit a submit action")
+	}
+	msg, ok := cmd().(ActionMsg)
+	if !ok || msg.Action.Kind != ActionSubmitPrompt || msg.Action.Prompt != "implement the change" || msg.Action.Mode != "" {
+		t.Fatalf("unexpected composer action: %#v", msg)
+	}
+	if m.Composer.Editor.Value() != "" {
+		t.Fatal("submitted prompt remained in the composer")
+	}
+}
+
 func updateEvent(m *Model, event Event) {
 	m.Update(event)
 }
@@ -73,6 +110,99 @@ func TestModelOwnsResizeAndWheelViewportState(t *testing.T) {
 	m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
 	if m.Width != 58 || m.Height != 18 || m.Transcript.ScrollOffset != 3 {
 		t.Fatalf("terminal events did not update model-owned layout state: %dx%d offset=%d", m.Width, m.Height, m.Transcript.ScrollOffset)
+	}
+}
+
+func TestModelOwnsOrderedApprovalsAndEmitsGenerationBoundChoice(t *testing.T) {
+	m := NewModel(Header{})
+	approvals := []ApprovalRequest{
+		{Generation: 10, Tool: "write_file", TurnID: "turn-1", ArgumentsJSON: `{"path":"one.go"}`},
+		{Generation: 11, Tool: "bash", TurnID: "turn-2", ArgumentsJSON: `{"command":"go test"}`, AllowSession: true},
+	}
+	updateEvent(m, Event{Kind: EventApprovalSnapshot, Approvals: approvals})
+	if len(m.Approvals) != 2 || m.ActiveApproval().Generation != 10 {
+		t.Fatalf("approval snapshot order = %+v", m.Approvals)
+	}
+	_, cmd := m.Update(tea.KeyPressMsg{Text: "1", Code: '1'})
+	if cmd == nil {
+		t.Fatal("visible approval did not emit a choice action")
+	}
+	choice, ok := cmd().(ActionMsg)
+	if !ok || choice.Action.Kind != ActionPermissionChoice || choice.Action.ApprovalGeneration != 10 || choice.Action.ApprovalChoice.Decision != ApprovalAllowOnce {
+		t.Fatalf("approval action = %#v", choice)
+	}
+	updateEvent(m, Event{Kind: EventApprovalResolved, ApprovalGeneration: 10})
+	if len(m.Approvals) != 1 || m.ActiveApproval().Generation != 11 {
+		t.Fatalf("resolving first approval did not focus next: %+v", m.Approvals)
+	}
+	if got := m.approvalModal.Editor.Value(); got != approvals[1].ArgumentsJSON {
+		t.Fatalf("next approval inherited the previous editor contents: %q", got)
+	}
+}
+
+func TestModelApprovalPendingAndResizeKeepEditorLocal(t *testing.T) {
+	m := NewModel(Header{})
+	approval := ApprovalRequest{Generation: 7, Tool: "write_file", TurnID: "turn-1", ArgumentsJSON: `{"path":"file"}`}
+	updateEvent(m, Event{Kind: EventApprovalPending, Approval: &approval})
+	if !m.HasPendingApproval() || m.ActiveApproval().Generation != 7 {
+		t.Fatalf("pending event did not activate approval: %+v", m.Approvals)
+	}
+	_, _ = m.Update(tea.KeyPressMsg{Text: "4", Code: '4'})
+	if !m.ApprovalEditing() {
+		t.Fatal("approval edit did not open in the model")
+	}
+	m.Update(tea.WindowSizeMsg{Width: 10, Height: 1})
+	if view := m.ApprovalView(1); !strings.Contains(view, "Resize") {
+		t.Fatalf("small resize hid edit safety message: %q", view)
+	}
+	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("hidden editor emitted an approval action")
+	}
+}
+
+func TestModelPickerNavigationBoundsResizeAndEscape(t *testing.T) {
+	for _, kind := range []PickerKind{PickerWorkspace, PickerConversation} {
+		m := NewModel(Header{})
+		updateEvent(m, Event{Kind: EventPickerSnapshot, PickerKind: kind, Choices: []Choice{
+			{ID: "one", Label: "One"}, {ID: "two", Label: "Two"},
+		}})
+		_, _ = m.Update(tea.KeyPressMsg{Text: "k", Code: 'k'})
+		if m.PickerCursor != 0 {
+			t.Fatalf("picker %d moved above the first row: %d", kind, m.PickerCursor)
+		}
+		_, _ = m.Update(tea.KeyPressMsg{Text: "j", Code: 'j'})
+		_, _ = m.Update(tea.KeyPressMsg{Text: "j", Code: 'j'})
+		if m.PickerCursor != 1 {
+			t.Fatalf("picker %d moved past the last row: %d", kind, m.PickerCursor)
+		}
+		m.Update(tea.WindowSizeMsg{Width: 24, Height: 3})
+		if rows := m.PickerView(3); len(rows) != 3 {
+			t.Fatalf("resized picker rows = %d, want 3: %q", len(rows), rows)
+		}
+		_, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+		if m.HasPicker() {
+			t.Fatalf("Escape did not close picker %d", kind)
+		}
+	}
+}
+
+func TestModelPickerEmptyAndSelectionAction(t *testing.T) {
+	m := NewModel(Header{})
+	updateEvent(m, Event{Kind: EventPickerSnapshot, PickerKind: PickerWorkspace})
+	if _, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter}); cmd != nil {
+		t.Fatal("empty picker emitted a selection")
+	}
+	updateEvent(m, Event{Kind: EventPickerSnapshot, PickerKind: PickerConversation, PickerGeneration: 12, Choices: []Choice{
+		{ID: "conversation-2", Label: "second"},
+	}})
+	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("picker did not emit selection")
+	}
+	action, ok := cmd().(ActionMsg)
+	if !ok || action.Action.Kind != ActionSelectChoice || action.Action.PickerKind != PickerConversation || action.Action.PickerGeneration != 12 || action.Action.ChoiceID != "conversation-2" {
+		t.Fatalf("picker selection action = %#v", action)
 	}
 }
 

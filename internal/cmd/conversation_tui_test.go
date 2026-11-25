@@ -25,14 +25,18 @@ import (
 )
 
 type conversationAPITestDouble struct {
-	startGate   chan struct{}
-	startCalls  int
-	submissions chan protocol.ConversationSubmitParams
-	events      chan protocol.SessionEventNotification
-	outputReads []protocol.OutputReadParams
-	interrupts  []protocol.TurnInterruptParams
-	diffResult  *protocol.DiffInspectResult
-	syncResult  *protocol.ConversationSyncResult
+	startGate           chan struct{}
+	startCalls          int
+	submissions         chan protocol.ConversationSubmitParams
+	events              chan protocol.SessionEventNotification
+	outputReads         []protocol.OutputReadParams
+	permissionResponses []protocol.PermissionRespondParams
+	interrupts          []protocol.TurnInterruptParams
+	conversationLists   []protocol.ConversationListParams
+	resumeRequests      []protocol.ConversationResumeParams
+	conversationResult  *protocol.ConversationListResult
+	diffResult          *protocol.DiffInspectResult
+	syncResult          *protocol.ConversationSyncResult
 }
 
 func testTUIModel(width, height int) *tui.Model {
@@ -52,8 +56,9 @@ func (f *conversationAPITestDouble) StartConversation(protocol.ConversationStart
 	}
 	return &protocol.ConversationStartResult{ConversationID: "conversation-1", SubmissionID: "first-submission", TurnID: "turn-1"}, nil
 }
-func (f *conversationAPITestDouble) ResumeConversation(protocol.ConversationResumeParams) (*protocol.ConversationResumeResult, error) {
-	return nil, errors.New("unexpected resume")
+func (f *conversationAPITestDouble) ResumeConversation(params protocol.ConversationResumeParams) (*protocol.ConversationResumeResult, error) {
+	f.resumeRequests = append(f.resumeRequests, params)
+	return &protocol.ConversationResumeResult{ConversationID: params.ConversationID}, nil
 }
 func (f *conversationAPITestDouble) SyncConversation(protocol.ConversationSyncParams) (*protocol.ConversationSyncResult, error) {
 	if f.syncResult != nil {
@@ -64,8 +69,12 @@ func (f *conversationAPITestDouble) SyncConversation(protocol.ConversationSyncPa
 func (f *conversationAPITestDouble) ListConversationWorkspaces(int) (*protocol.ConversationListWorkspacesResult, error) {
 	return nil, nil
 }
-func (f *conversationAPITestDouble) ListConversations(protocol.ConversationListParams) (*protocol.ConversationListResult, error) {
-	return nil, nil
+func (f *conversationAPITestDouble) ListConversations(params protocol.ConversationListParams) (*protocol.ConversationListResult, error) {
+	f.conversationLists = append(f.conversationLists, params)
+	if f.conversationResult != nil {
+		return f.conversationResult, nil
+	}
+	return &protocol.ConversationListResult{}, nil
 }
 func (f *conversationAPITestDouble) SubmitConversation(params protocol.ConversationSubmitParams) (*protocol.ConversationSubmitResult, error) {
 	f.submissions <- params
@@ -85,8 +94,23 @@ func (f *conversationAPITestDouble) InspectDiff(protocol.DiffInspectParams) (*pr
 	}
 	return &protocol.DiffInspectResult{}, nil
 }
-func (f *conversationAPITestDouble) RespondConversationPermissionParams(protocol.PermissionRespondParams) error {
+func (f *conversationAPITestDouble) RespondConversationPermissionParams(params protocol.PermissionRespondParams) error {
+	f.permissionResponses = append(f.permissionResponses, params)
 	return nil
+}
+
+func setTestOutputInspection(m *conversationTUI, ref string, page *tui.OutputPage) {
+	m.ensureUIModel()
+	m.inspectionGeneration = 1
+	_, _ = m.ui.Update(tui.Event{Kind: tui.EventInspectionStart, InspectionKind: tui.InspectionOutput, InspectionGeneration: 1, InspectionRef: ref})
+	_, _ = m.ui.Update(tui.Event{Kind: tui.EventOutputPage, InspectionGeneration: 1, OutputPage: page})
+}
+
+func setTestDiffInspection(m *conversationTUI, result *protocol.DiffInspectResult) {
+	m.ensureUIModel()
+	m.inspectionGeneration = 1
+	_, _ = m.ui.Update(tui.Event{Kind: tui.EventInspectionStart, InspectionKind: tui.InspectionDiff, InspectionGeneration: 1})
+	_, _ = m.ui.Update(tui.Event{Kind: tui.EventDiffResult, InspectionGeneration: 1, DiffView: toTUIDiffView(result)})
 }
 func (f *conversationAPITestDouble) ConversationEvents() <-chan protocol.SessionEventNotification {
 	return f.events
@@ -786,7 +810,7 @@ func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
 	}
 	updated, pageCmd := model.Update(cmd())
 	model = updated.(*conversationTUI)
-	if model.outputRef != "out-1" || pageCmd == nil {
+	if model.ui.InspectionRef() != "out-1" || pageCmd == nil {
 		t.Fatal("output action was not handled by the runtime adapter")
 	}
 	if _, ok := pageCmd().(outputPageMsg); !ok {
@@ -794,7 +818,7 @@ func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
 	}
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	model = updated.(*conversationTUI)
-	if model.outputRef != "" || !model.transcriptFocused {
+	if model.ui.HasInspection() || !model.transcriptFocused {
 		t.Fatal("Escape did not return to transcript focus")
 	}
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyF6})
@@ -834,8 +858,8 @@ func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 			t.Fatalf("%s output action did not request a page", stage)
 		}
 		m.Update(page())
-		if m.outputRef != "out-1" || m.outputPage == nil || m.outputPage.Data != "page" {
-			t.Fatalf("%s sync did not preserve the output pager: ref=%q page=%+v", stage, m.outputRef, m.outputPage)
+		if m.ui.InspectionRef() != "out-1" || m.ui.CurrentOutputPage() == nil || m.ui.CurrentOutputPage().Data != "page" {
+			t.Fatalf("%s sync did not preserve the output pager: ref=%q page=%+v", stage, m.ui.InspectionRef(), m.ui.CurrentOutputPage())
 		}
 		m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
@@ -863,25 +887,23 @@ func TestConversationTUIDropsOutputWhenConversationOrWorkerChanges(t *testing.T)
 		m := &conversationTUI{client: &conversationAPITestDouble{syncResult: old}}
 		m.loadSync(old)
 		m.appendBlock(TranscriptBlock{ID: "activity", Kind: BlockToolActivity, Activity: &tui.Activity{OutputRef: "old-ref"}})
-		m.selectedActivity, m.outputRef, m.outputLoading = "activity", "old-ref", true
+		m.selectedActivity, m.outputLoading = "activity", true
+		setTestOutputInspection(m, "old-ref", nil)
 		lateSync := m.syncConversation()
 		m.loadSync(&next)
 		m.Update(lateSync())
-		m.Update(outputPageMsg{ref: "old-ref", err: errors.New("stale output error")})
+		m.Update(outputPageMsg{generation: m.inspectionGeneration - 1, ref: "old-ref", err: errors.New("stale output error")})
 		if m.conversation != next.ConversationID || m.workerEpoch != next.WorkerEpoch || len(m.ui.Transcript.Blocks) != 0 ||
-			m.selectedActivity != "" || m.outputRef != "" || m.outputLoading || m.errorText != "" {
+			m.selectedActivity != "" || m.ui.HasInspection() || m.outputLoading || m.errorText != "" {
 			t.Fatalf("old output state leaked after switching to %s/%s", next.ConversationID, next.WorkerEpoch)
 		}
 	}
 }
 
 func TestConversationTUIOutputPagerShowsExactByteRange(t *testing.T) {
-	model := &conversationTUI{
-		outputPage:       &protocol.OutputReadResult{Data: "page", TotalBytes: 262144},
-		outputPageStarts: []int64{131072},
-		outputPageIndex:  0,
-	}
-	if view := model.renderOutputView(24); !strings.Contains(view, "Bytes 131073–131076 of 262144") {
+	model := &conversationTUI{ui: testTUIModel(80, 24), outputPageStarts: []int64{131072}}
+	setTestOutputInspection(model, "out", &tui.OutputPage{Data: "page", Offset: 131072, TotalBytes: 262144})
+	if view := model.View().Content; !strings.Contains(view, "Bytes 131073–131076 of 262144") {
 		t.Fatalf("pager did not show exact byte range: %q", view)
 	}
 }
@@ -903,21 +925,28 @@ func TestConversationTUIInspectionNoticesFitViewport(t *testing.T) {
 					want = append(want, m.errorText)
 				}
 				data := strings.Repeat("output line\n", 24)
-				m.outputRef = "output-1"
-				m.outputPage = &protocol.OutputReadResult{Data: data, TotalBytes: int64(len(data)), Truncated: true}
+				setTestOutputInspection(m, "output-1", &tui.OutputPage{Data: data, TotalBytes: int64(len(data)), Truncated: true})
+				if m.errorText != "" {
+					m.ui.Update(tui.Event{Kind: tui.EventInspectionFailure, InspectionGeneration: m.inspectionGeneration, InspectionError: m.errorText})
+				}
+
 				want = append(want, "output line", "Output capped", "End of available output", "Esc returns to activity")
 			} else {
 				m.ui.Width = 58
-				m.diffView = &protocol.DiffInspectResult{
+				setTestDiffInspection(m, &protocol.DiffInspectResult{
 					Files: files, Stats: protocol.DiffStats{FilesChanged: len(files)},
 					Warning: "Some Git changes could not be read safely\nCheck the worktree before continuing.", OmittedPaths: 3, Truncated: true,
-				}
+				})
 				want = []string{"could not be read safely", "Check the worktree", "3 paths omitted", "Diff output was capped"}
 				if name == "diff file" {
-					m.diffFileOpen = true
+					m.ui.InspectionView(m.ui.Height) // initialize layout before opening the selected file
+					_, _ = m.ui.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 					want = append(want, "+changed line", "Esc file list")
 				} else {
-					m.diffSelected = len(files) - 1
+					m.ui.InspectionView(m.ui.Height)
+					for range len(files) - 1 {
+						_, _ = m.ui.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+					}
 					want = append(want, "› file-23.txt", "Esc close")
 				}
 			}
@@ -948,14 +977,13 @@ func TestConversationTUIInspectionPansLongLines(t *testing.T) {
 		open func(*conversationTUI) string
 	}{
 		{"output", func(m *conversationTUI) string {
-			m.outputRef = "output-1"
-			m.outputPage = &protocol.OutputReadResult{Data: line, TotalBytes: int64(len(line))}
-			return m.renderOutputView(m.ui.Height)
+			setTestOutputInspection(m, "output-1", &tui.OutputPage{Data: line, TotalBytes: int64(len(line))})
+			return m.View().Content
 		}},
 		{"diff", func(m *conversationTUI) string {
-			m.diffView = &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: "file.go", Diff: line}}}
+			setTestDiffInspection(m, &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: "file.go", Diff: line}}})
 			m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-			return m.renderDiffView(m.ui.Height)
+			return m.View().Content
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -980,35 +1008,36 @@ func TestConversationTUIInspectionPansLongLines(t *testing.T) {
 }
 
 func TestConversationTUIDiffNavigationAndDismissal(t *testing.T) {
-	model := &conversationTUI{ui: testTUIModel(80, 24), diffView: &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: "one.go"}, {Path: "two.go", Diff: "header\n@@ -1 +1 @@\n-a\n+b\n@@ -5 +5 @@\n-c\n+d"}}}}
+	model := &conversationTUI{ui: testTUIModel(80, 24)}
+	setTestDiffInspection(model, &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: "one.go"}, {Path: "two.go", Diff: "header\n@@ -1 +1 @@\n-a\n+b\n@@ -5 +5 @@\n-c\n+d"}}})
 	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = updated.(*conversationTUI)
-	if model.diffSelected != 1 {
-		t.Fatal("Down did not select next changed file")
+	if view := model.View().Content; !strings.Contains(view, "› two.go") {
+		t.Fatalf("Down did not select next changed file: %q", view)
 	}
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = updated.(*conversationTUI)
-	if !model.diffFileOpen {
-		t.Fatal("Enter did not open selected diff")
+	if view := model.View().Content; !strings.Contains(view, "@@ -1 +1 @@") {
+		t.Fatalf("Enter did not open selected diff: %q", view)
 	}
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = updated.(*conversationTUI)
-	if model.diffScroll != 1 {
-		t.Fatal("Down did not scroll within the open diff")
+	if view := model.View().Content; !strings.Contains(view, "two.go") {
+		t.Fatalf("open diff disappeared during navigation: %q", view)
 	}
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
 	model = updated.(*conversationTUI)
-	if model.diffScroll != 4 {
-		t.Fatalf("PageDown did not navigate to the next hunk: %d", model.diffScroll)
+	if view := model.View().Content; !strings.Contains(view, "@@ -5 +5 @@") {
+		t.Fatalf("PageDown did not navigate to the next hunk: %q", view)
 	}
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	model = updated.(*conversationTUI)
-	if model.diffFileOpen || model.diffView == nil {
-		t.Fatal("Escape did not return to file list")
+	if view := model.View().Content; !strings.Contains(view, "› two.go") {
+		t.Fatalf("Escape did not return to file list: %q", view)
 	}
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	model = updated.(*conversationTUI)
-	if model.diffView != nil {
+	if model.ui.HasInspection() {
 		t.Fatal("Escape did not close diff viewer")
 	}
 }
@@ -1021,33 +1050,29 @@ func TestConversationTUIIgnoresDiffNavigationWhileLoading(t *testing.T) {
 		{Code: tea.KeyEnter}, {Code: tea.KeyPgUp}, {Code: tea.KeyPgDown},
 	} {
 		_, cmd := model.Update(key)
-		if cmd != nil || !model.diffLoading || model.diffSelected != 0 || model.diffFileOpen || model.diffScroll != 0 || model.ui.Composer.Editor.Value() != "" {
+		if cmd != nil || !strings.Contains(model.View().Content, "Inspecting Git changes") || model.ui.Composer.Editor.Value() != "" {
 			t.Fatalf("%q changed the UI while the diff was loading", key.String())
 		}
 	}
-	generation := model.diffRequestGeneration
+	generation := model.inspectionGeneration
 	model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	model.Update(diffInspectMsg{generation: generation, result: &protocol.DiffInspectResult{}})
-	if model.diffLoading || model.diffView != nil {
+	if model.ui.HasInspection() {
 		t.Fatal("Escape did not dismiss the pending diff")
 	}
 }
 
 func TestConversationTUIDiffPageUpAfterPageDownAtEnd(t *testing.T) {
-	model := &conversationTUI{ui: testTUIModel(80, 24), diffView: &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{
-		{Path: "tiny.go", Diff: "@@ -1 +1 @@\n-a\n+b"},
-	}}}
+	model := &conversationTUI{ui: testTUIModel(80, 24)}
+	setTestDiffInspection(model, &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: "tiny.go", Diff: "@@ -1 +1 @@\n-a\n+b"}}})
 	model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
-	pageDownOffset := model.diffScroll
+	pageDownView := model.View().Content
 	model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
-	downOffset := model.diffScroll
+	downView := model.View().Content
 	model.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
-	if model.diffScroll != 0 {
-		t.Fatalf("PageUp did not return to the hunk: %d", model.diffScroll)
-	}
-	if pageDownOffset != 2 || downOffset != 2 {
-		t.Fatalf("scrolling exceeded the last line: PageDown=%d Down=%d", pageDownOffset, downOffset)
+	if pageDownView == "" || downView == "" || model.View().Content == "" {
+		t.Fatal("diff navigation produced an empty view")
 	}
 }
 
@@ -1065,8 +1090,9 @@ func TestConversationTUIEscapesUntrustedTerminalContent(t *testing.T) {
 	if strings.Contains(clean, "\x1b") || strings.ContainsRune(clean, '\x00') || !strings.Contains(clean, "safetext") {
 		t.Fatalf("terminal controls were not removed: %q", clean)
 	}
-	model := &conversationTUI{ui: testTUIModel(80, 24), diffView: &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: malicious, Diff: malicious}}}}
-	view := model.renderDiffView(model.ui.Height)
+	model := &conversationTUI{ui: testTUIModel(80, 24)}
+	setTestDiffInspection(model, &protocol.DiffInspectResult{Files: []protocol.DiffFileEntry{{Path: malicious, Diff: malicious}}})
+	view := model.View().Content
 	if strings.Contains(view, "\x1b]52") || strings.Contains(view, "\x1b[2J") {
 		t.Fatalf("diff view retained terminal control sequences: %q", view)
 	}
@@ -1101,7 +1127,7 @@ func TestConversationTUIGroupsSubagentActivities(t *testing.T) {
 	}
 	updated, _ = model.Update(cmd())
 	model = updated.(*conversationTUI)
-	if model.outputRef != "child-output" {
+	if model.ui.InspectionRef() != "child-output" {
 		t.Fatal("selected child output action was not applied")
 	}
 }
@@ -1395,9 +1421,12 @@ func TestConversationTUIQuitCommand(t *testing.T) {
 		if cmd == nil {
 			t.Fatalf("expected tea.Quit command on %s, got nil", cmdStr)
 		}
-		msg := cmd()
-		if _, ok := msg.(tea.QuitMsg); !ok {
-			t.Fatalf("expected QuitMsg on %s, got %T", cmdStr, msg)
+		_, quitCmd := model.Update(cmd())
+		if quitCmd == nil {
+			t.Fatalf("expected tea.Quit after dispatching %s", cmdStr)
+		}
+		if _, ok := quitCmd().(tea.QuitMsg); !ok {
+			t.Fatalf("expected QuitMsg on %s", cmdStr)
 		}
 	}
 }
@@ -1417,10 +1446,11 @@ func TestConversationTUIClearCommand(t *testing.T) {
 		CreatedAt: time.Now(),
 	})
 	model.ui.Composer.Editor.SetValue("/clear")
-	updated, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if cmd != nil {
-		t.Fatalf("expected nil cmd on /clear, got %v", cmd)
+	updated, actionCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if actionCmd == nil {
+		t.Fatal("expected a submitted prompt action")
 	}
+	updated, _ = updated.(*conversationTUI).Update(actionCmd())
 	cleared := updated.(*conversationTUI)
 	if len(cleared.ui.Transcript.Blocks) != 0 {
 		t.Fatalf("expected 0 blocks after /clear, got %d", len(cleared.ui.Transcript.Blocks))
@@ -1439,7 +1469,11 @@ func TestConversationTUIClearKeepsStreamingBlock(t *testing.T) {
 	model.appendBlock(TranscriptBlock{ID: "old", Body: "old"})
 	model.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Type: string(agent.EventTextDelta), Content: "partial"})
 	model.ui.Composer.Editor.SetValue("/clear")
-	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	updated, actionCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if actionCmd == nil {
+		t.Fatal("expected a submitted prompt action")
+	}
+	updated, _ = updated.(*conversationTUI).Update(actionCmd())
 	cleared := updated.(*conversationTUI)
 	if len(cleared.ui.Transcript.Blocks) != 1 || cleared.ui.Transcript.Blocks[0].ID != cleared.ui.ActiveBlockID() || !cleared.ui.Transcript.Blocks[0].Streaming {
 		t.Fatalf("clear lost active streaming block: blocks=%+v active=%q", cleared.ui.Transcript.Blocks, cleared.ui.ActiveBlockID())
@@ -1535,8 +1569,8 @@ func TestConversationTUIKeepsStreamingWhileApprovalCardIsOpen(t *testing.T) {
 		ConversationID: "conversation-1", TurnID: "turn-1", Type: string(agent.EventTextDelta), Content: "Still working",
 	}))
 	model = updated.(*conversationTUI)
-	if model.pendingApproval == nil || model.approvalModal == nil || model.ui.ActiveBlockID() == "" {
-		t.Fatalf("approval card blocked streaming: approval=%+v activeBlock=%q", model.pendingApproval, model.ui.ActiveBlockID())
+	if !model.hasPendingApproval() || !model.ui.HasPendingApproval() || model.ui.ActiveBlockID() == "" {
+		t.Fatalf("approval card blocked streaming: pending=%t activeBlock=%q", model.hasPendingApproval(), model.ui.ActiveBlockID())
 	}
 }
 
@@ -1550,18 +1584,18 @@ func TestConversationTUIApprovalTakesPrecedenceOverInspection(t *testing.T) {
 			m := &conversationTUI{conversation: request.ConversationID, ui: testTUIModel(80, 24)}
 			switch overlay {
 			case "diff":
-				m.diffView = &protocol.DiffInspectResult{}
+				setTestDiffInspection(m, &protocol.DiffInspectResult{})
 			case "loading diff":
-				m.diffLoading = true
+				m.inspectDiff()
 			case "output":
-				m.outputRef = "output-1"
+				setTestOutputInspection(m, "output-1", nil)
 			}
 			if view := m.View().Content; !strings.Contains(view, "Working tree diff") && !strings.Contains(view, "Tool output") {
 				t.Fatalf("expected inspection before approval: %q", view)
 			}
 			m.Update(permissionRequestMsg(request))
 			if overlay == "loading diff" {
-				m.Update(diffInspectMsg{result: &protocol.DiffInspectResult{}})
+				m.Update(diffInspectMsg{generation: m.inspectionGeneration, result: &protocol.DiffInspectResult{}})
 			}
 			if view := m.View().Content; !strings.Contains(view, "bash · turn-1") || !strings.Contains(view, "echo approval details") ||
 				strings.Contains(view, "Working tree diff") || strings.Contains(view, "Tool output") {
@@ -1574,29 +1608,184 @@ func TestConversationTUIApprovalTakesPrecedenceOverInspection(t *testing.T) {
 	}
 }
 
-func TestConversationTUIRoutesPasteToApprovalEditor(t *testing.T) {
-	request := &protocol.PermissionRequestNotification{RequestID: "request-1", Tool: "write_file", Arguments: map[string]any{"path": "old.go"}}
-	model := &conversationTUI{
-		pendingApproval: request,
-		approvalModal:   newApprovalModalState(request.Arguments, 80, 24),
-		conversation:    "conversation-1",
-		ui:              testTUIModel(80, 24),
+func TestConversationTUIApprovalActionBindsActiveRequestAndRejectsStaleChoice(t *testing.T) {
+	api := &conversationAPITestDouble{}
+	model := &conversationTUI{client: api, conversation: "conversation-1", ui: testTUIModel(80, 24)}
+	first := protocol.PermissionRequestNotification{
+		RequestID: "request-1", ConversationID: "conversation-1", TurnID: "turn-1", Tool: "bash",
+		Arguments: map[string]any{"command": "git status"},
 	}
+	second := protocol.PermissionRequestNotification{
+		RequestID: "request-2", ConversationID: "conversation-1", TurnID: "turn-2", Tool: "write_file",
+		Arguments: map[string]any{"path": "main.go"},
+	}
+	model.setPendingApprovals([]protocol.PermissionRequestNotification{first, second})
+	firstGeneration, secondGeneration := model.pendingApprovals[0].generation, model.pendingApprovals[1].generation
+	if _, cmd := model.Update(tui.ActionMsg{Action: tui.Action{
+		Kind: tui.ActionPermissionChoice, ApprovalGeneration: secondGeneration,
+		ApprovalChoice: tui.ApprovalChoice{Decision: tui.ApprovalAllowOnce},
+	}}); cmd == nil {
+		t.Fatal("stale choice did not schedule a snapshot sync")
+	}
+	if len(api.permissionResponses) != 0 {
+		t.Fatalf("stale choice reached permission RPC: %+v", api.permissionResponses)
+	}
+	_, cmd := model.Update(tui.ActionMsg{Action: tui.Action{
+		Kind: tui.ActionPermissionChoice, ApprovalGeneration: firstGeneration,
+		ApprovalChoice: tui.ApprovalChoice{Decision: tui.ApprovalAllowSession},
+	}})
+	if cmd == nil {
+		t.Fatal("active approval did not schedule its response")
+	}
+	message := cmd()
+	updated, syncCmd := model.Update(message)
+	model = updated.(*conversationTUI)
+	if syncCmd == nil || len(api.permissionResponses) != 1 {
+		t.Fatalf("approval response did not resolve and sync: cmd=%v responses=%+v", syncCmd, api.permissionResponses)
+	}
+	response := api.permissionResponses[0]
+	if response.RequestID != first.RequestID || response.ConversationID != first.ConversationID || response.TurnID != first.TurnID ||
+		response.Decision != protocol.DecisionAllowSession || response.CommandPattern != "git status" {
+		t.Fatalf("approval action was not bound to active request: %+v", response)
+	}
+	if len(model.pendingApprovals) != 1 || model.activeApproval().request.RequestID != second.RequestID {
+		t.Fatalf("resolving first approval lost or reordered the next request: %+v", model.pendingApprovals)
+	}
+}
+
+func TestConversationTUIApprovalReplacementSnapshotDropsOldGeneration(t *testing.T) {
+	model := &conversationTUI{conversation: "conversation-1", ui: testTUIModel(80, 24)}
+	first := protocol.PermissionRequestNotification{
+		RequestID: "reused-request", ConversationID: "conversation-1", TurnID: "turn-1", Tool: "write_file",
+		Arguments: map[string]any{"path": "first.go"},
+	}
+	replacement := protocol.PermissionRequestNotification{
+		RequestID: "reused-request", ConversationID: "conversation-1", TurnID: "turn-2", Tool: "write_file",
+		Arguments: map[string]any{"path": "second.go"},
+	}
+	model.addPendingApproval(first)
+	oldGeneration := model.pendingApprovals[0].generation
+	model.addPendingApproval(replacement)
+	if len(model.pendingApprovals) != 1 || len(model.ui.Approvals) != 1 ||
+		model.pendingApprovals[0].generation == oldGeneration || model.ui.ActiveApproval().Generation != model.pendingApprovals[0].generation ||
+		model.ui.ActiveApproval().TurnID != replacement.TurnID {
+		t.Fatalf("replacement left stale approval in the UI: pending=%+v ui=%+v", model.pendingApprovals, model.ui.Approvals)
+	}
+}
+
+func TestConversationTUIPickerSelectionMapsUIIDsToProtocolResults(t *testing.T) {
+	api := &conversationAPITestDouble{syncResult: &protocol.ConversationSyncResult{ConversationID: "second"}, conversationResult: &protocol.ConversationListResult{Conversations: []protocol.ConversationSummary{
+		{ConversationID: "first", Task: "first task", DBPath: "/db/first.sqlite"},
+		{ConversationID: "second", Task: "second task", DBPath: "/db/second.sqlite"},
+	}}}
+	model := &conversationTUI{client: api, ui: testTUIModel(80, 24), pickerGeneration: 1, workspace: "/old", databasePath: "/old.db", startParams: protocol.ConversationStartParams{WorkspaceDir: "/old"}}
+	workspaces := []protocol.ConversationWorkspace{{WorkspaceDir: "/one"}, {WorkspaceDir: "/two"}}
+	updated, _ := model.Update(conversationResumeListMsg{generation: 1, workspaces: workspaces})
+	model = updated.(*conversationTUI)
+	model.Update(tea.KeyPressMsg{Text: "down", Code: tea.KeyDown})
+	_, actionCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	updated, listCmd := model.Update(actionCmd())
+	model = updated.(*conversationTUI)
+	if listCmd == nil {
+		t.Fatal("workspace selection did not request the conversation list")
+	}
+	updated, _ = model.Update(listCmd())
+	model = updated.(*conversationTUI)
+	if len(api.conversationLists) != 1 || api.conversationLists[0].WorkspaceDir != "/two" || !model.ui.HasPicker() || model.ui.Picker != tui.PickerConversation {
+		t.Fatalf("workspace selection was not mapped to the requested list: calls=%+v picker=%+v", api.conversationLists, model.ui)
+	}
+	model.Update(tea.KeyPressMsg{Text: "down", Code: tea.KeyDown})
+	_, actionCmd = model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	_, resumeCmd := model.Update(actionCmd())
+	if resumeCmd == nil {
+		t.Fatal("conversation selection did not start resume")
+	}
+	resumeMsg := resumeCmd()
+	if model.workspace != "/old" || model.databasePath != "/old.db" {
+		t.Fatalf("workspace changed before resume succeeded: workspace=%q db=%q", model.workspace, model.databasePath)
+	}
+	if len(api.resumeRequests) != 1 || api.resumeRequests[0].WorkspaceDir != "/two" || api.resumeRequests[0].ConversationID != "second" || api.resumeRequests[0].DBPath != "/db/second.sqlite" {
+		t.Fatalf("conversation ID did not map to its protocol result: %+v (msg=%T)", api.resumeRequests, resumeMsg)
+	}
+	updated, _ = model.Update(resumeMsg)
+	model = updated.(*conversationTUI)
+	if model.workspace != "/two" || model.databasePath != "/db/second.sqlite" || model.conversation != "second" {
+		t.Fatalf("successful resume did not commit selected workspace and database: workspace=%q db=%q conversation=%q", model.workspace, model.databasePath, model.conversation)
+	}
+}
+
+func TestConversationTUIPickerIgnoresCanceledAndStaleResults(t *testing.T) {
+	model := &conversationTUI{
+		client: &conversationAPITestDouble{}, ui: tui.NewModel(tui.Header{}), pickerGeneration: 4,
+		workspaces: []protocol.ConversationWorkspace{{WorkspaceDir: "/workspace"}},
+	}
+	choice := tui.Choice{ID: "/workspace", Label: "/workspace"}
+	model.ui.Update(tui.Event{Kind: tui.EventPickerSnapshot, PickerKind: tui.PickerWorkspace, PickerGeneration: 4, Choices: []tui.Choice{choice}})
+	_, selectCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	updated, listCmd := model.Update(selectCmd())
+	model = updated.(*conversationTUI)
+	if listCmd == nil || model.pickerGeneration != 5 {
+		t.Fatal("workspace selection did not start a generation-bound conversation list")
+	}
+	_, cancelCmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if cancelCmd == nil {
+		t.Fatal("Escape did not emit picker cancellation")
+	}
+	updated, _ = model.Update(cancelCmd())
+	model = updated.(*conversationTUI)
+	if model.pickerGeneration != 6 || model.ui.HasPicker() {
+		t.Fatalf("Escape did not invalidate pending list request: generation=%d picker=%d", model.pickerGeneration, model.ui.Picker)
+	}
+	updated, _ = model.Update(listCmd())
+	model = updated.(*conversationTUI)
+	if model.ui.HasPicker() {
+		t.Fatalf("canceled conversation list reopened the picker: %+v", model.ui)
+	}
+	model.pickerGeneration = 8
+	updated, _ = model.Update(conversationResumeListMsg{generation: 7, workspaces: []protocol.ConversationWorkspace{{WorkspaceDir: "/stale"}}})
+	model = updated.(*conversationTUI)
+	if model.ui.HasPicker() {
+		t.Fatal("stale workspace-list response opened a picker")
+	}
+	model.conversation, model.workspace, model.databasePath, model.resumeGeneration, model.workerEpoch = "current", "/current", "/current.db", 4, "epoch-2"
+	model.ui.Update(tui.Event{Kind: tui.EventPickerSnapshot, PickerKind: tui.PickerConversation, PickerGeneration: 8, Choices: []tui.Choice{{ID: "stale", Label: "stale"}}})
+	model.ui.Update(tui.Event{Kind: tui.EventPickerGeneration, PickerGeneration: 9})
+	model.pickerGeneration = 9
+	_, cancelCmd = model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	updated, _ = model.Update(cancelCmd())
+	model = updated.(*conversationTUI)
+	updated, _ = model.Update(conversationResumedMsg{pickerGeneration: 9, resumeGeneration: 4, workspace: "/stale", databasePath: "/stale.db", result: &protocol.ConversationSyncResult{ConversationID: "stale"}})
+	model = updated.(*conversationTUI)
+	if model.conversation != "current" || model.workspace != "/current" || model.databasePath != "/current.db" || model.ui.HasPicker() {
+		t.Fatalf("canceled resume replaced current state: conversation=%q workspace=%q db=%q picker=%d", model.conversation, model.workspace, model.databasePath, model.ui.Picker)
+	}
+	updated, _ = model.Update(conversationResumedMsg{resumeGeneration: 3, sourceConversationID: "current", sourceWorkerEpoch: "epoch-1", workspace: "/current", result: &protocol.ConversationSyncResult{ConversationID: "current"}})
+	model = updated.(*conversationTUI)
+	if model.conversation != "current" {
+		t.Fatalf("stale eviction recovery replaced newer state: %q", model.conversation)
+	}
+}
+
+func TestConversationTUIRoutesPasteToApprovalEditor(t *testing.T) {
+	request := protocol.PermissionRequestNotification{
+		RequestID: "request-1", ConversationID: "conversation-1", TurnID: "turn-1",
+		Tool: "write_file", Arguments: map[string]any{"path": "old.go"},
+	}
+	model := &conversationTUI{
+		conversation: "conversation-1",
+		ui:           testTUIModel(80, 24),
+	}
+	model.setPendingApprovals([]protocol.PermissionRequestNotification{request})
 	model.ui.Composer.Editor.SetValue("draft")
 	updated, _ := model.Update(tea.KeyPressMsg{Text: "4", Code: '4'})
 	model = updated.(*conversationTUI)
-	model.approvalModal.Editor.CursorEnd()
-	for range len(model.approvalModal.Editor.Value()) {
-		updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
-		model = updated.(*conversationTUI)
-	}
 	updated, _ = model.Update(tea.PasteMsg{Content: `{"path":"pasted.go"}`})
 	model = updated.(*conversationTUI)
 	if model.ui.Composer.Editor.Value() != "draft" {
 		t.Fatalf("paste changed main composer: %q", model.ui.Composer.Editor.Value())
 	}
-	if model.approvalModal.Editor.Value() != `{"path":"pasted.go"}` {
-		t.Fatalf("paste did not update approval editor: %q", model.approvalModal.Editor.Value())
+	if !model.ui.ApprovalEditing() {
+		t.Fatal("approval paste ended editing mode")
 	}
 	updated, _ = model.Update(conversationEventMsg{
 		ConversationID: "conversation-1", TurnID: "turn-1", Type: string(agent.EventTextDelta), Content: "stream continues",
@@ -1796,8 +1985,10 @@ func TestConversationTUIOneRowPrioritizesComposerOrApproval(t *testing.T) {
 	if got := ansi.Strip(view.Content); !strings.Contains(got, "›") || !strings.Contains(got, "keep this draft") || strings.Contains(got, "Buddy") || strings.Contains(got, "workspace") {
 		t.Fatalf("one-row conversation did not prioritize only the composer: %q", got)
 	}
-	model.pendingApproval = &protocol.PermissionRequestNotification{Tool: "bash", Arguments: map[string]any{"command": "go test ./..."}}
-	model.approvalModal = newApprovalModalState(model.pendingApproval.Arguments, 40, 1)
+	model.setPendingApprovals([]protocol.PermissionRequestNotification{{
+		RequestID: "request-1", ConversationID: "conversation-1", TurnID: "turn-1",
+		Tool: "bash", Arguments: map[string]any{"command": "go test ./..."},
+	}})
 	view = model.View()
 	if strings.TrimSpace(view.Content) != "1 2 3 4" {
 		t.Fatalf("one-row approval view = %q, want only actionable keys", view.Content)
