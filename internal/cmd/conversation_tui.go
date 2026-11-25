@@ -53,6 +53,7 @@ type conversationTUI struct {
 	queued                 []string
 	steers                 []string
 	errorText              string
+	noticeText             string
 	workspaces             []protocol.ConversationWorkspace
 	conversations          []protocol.ConversationSummary
 	selectedWorkspace      string
@@ -888,6 +889,7 @@ func (m *conversationTUI) handlePromptInput(input string) tea.Cmd {
 		return nil
 	}
 	m.errorText = ""
+	m.noticeText = ""
 	if err := m.ui.Composer.AddHistory(text); err != nil {
 		m.errorText = fmt.Sprintf("save prompt history: %v", err)
 	}
@@ -1010,7 +1012,7 @@ func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
 	return tui.RenderFooter(tui.Footer{
 		Width: m.ui.Width, Height: m.ui.Height, Emergency: emergency, Standard: standard,
 		PendingApproval: m.hasPendingApproval(), ApprovalView: approvalView, ApprovalKeys: approvalKeys,
-		Queued: queued, Steering: steering, Error: renderedError,
+		Queued: queued, Steering: steering, Error: renderedError, Notice: terminalText(m.noticeText),
 		HasError: m.errorText != "", Completion: m.completionLines(), Composer: composer,
 		State: m.state, Standalone: m.standalone, TranscriptFocused: m.ui.TranscriptFocused,
 	})
@@ -1356,7 +1358,9 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	restoredBlocks := make([]TranscriptBlock, 0, len(result.Transcript))
 	m.queued, m.steers = nil, nil
 	if result.OutputIncomplete {
-		m.errorText = "Some transient output is unavailable; restored from durable conversation history."
+		m.noticeText = "Restored saved history; some live activity details may be missing."
+	} else {
+		m.noticeText = ""
 	}
 	// Keep transient activity groups next to their turn's last durable entry.
 	lastEntry := make(map[string]int, len(activitiesByTurn))

@@ -19,16 +19,8 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 	childOffset := -1
 	switch block.Kind {
 	case BlockUserMessage:
-		header := block.Header
-		if header == "" {
-			header = "You"
-		}
-		content = userStyle.Render(cleanText(header)) + "\n" + cleanText(block.Body)
+		content = userStyle.Render("› " + cleanText(block.Body))
 	case BlockAssistantMessage:
-		header := block.Header
-		if header == "" {
-			header = "Buddy"
-		}
 		body := block.Body
 		if block.Streaming && streamingText != "" && len(streamingText) > len(body) {
 			body = streamingText
@@ -39,19 +31,19 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 			if !block.Streaming {
 				return "", -1
 			}
-			content = buddyStyle.Render(cleanText(header)) + "\n" + mutedStyle.Render("Working…")
+			content = mutedStyle.Render("Working…")
 		} else {
 			body = cleanText(body)
 			if rendered, err := RenderMarkdown(body, max(1, width-4)); err == nil {
-				body = rendered
+				body = strings.TrimLeft(rendered, "\n")
 			}
-			content = buddyStyle.Render(cleanText(header)) + "\n" + body
+			content = body
 		}
 	case BlockToolActivity:
 		icon, elapsed := activityPresentation(block)
 		header := activitySummary(block.Header)
 		if block.Collapsed {
-			content = toolStyle.Render(icon + " " + header + elapsed + "  ·  Enter to expand")
+			content = toolStyle.Render(icon + " " + header + elapsed)
 		} else if block.Body == "" {
 			content = toolStyle.Render(icon + " " + header + elapsed)
 		} else {
@@ -190,7 +182,9 @@ func activityGroupSummary(group TranscriptBlock, children []TranscriptBlock) str
 		label += " · " + elapsed.Round(100*time.Millisecond).String()
 	}
 	if group.Collapsed {
-		label += "  ·  Enter to expand"
+		label += "  ·  Ctrl+O to expand"
+	} else {
+		label += "  ·  Ctrl+O to collapse"
 	}
 	icon := "●"
 	if failed > 0 {

@@ -123,6 +123,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.HasInspection() {
 			return m.updateInspectionKey(msg)
 		}
+		if msg.String() == "ctrl+o" {
+			m.toggleActivityGroups()
+			return m, nil
+		}
 		if msg.String() == "f6" {
 			m.TranscriptFocused = !m.TranscriptFocused
 			if m.TranscriptFocused {
@@ -427,6 +431,22 @@ func (m *Model) activateSelectedActivity() tea.Cmd {
 		return nil
 	}
 	return nil
+}
+
+func (m *Model) toggleActivityGroups() {
+	allExpanded := true
+	for _, block := range m.Transcript.Blocks {
+		if block.Kind == BlockActivityGroup && block.Collapsed {
+			allExpanded = false
+			break
+		}
+	}
+	for index := range m.Transcript.Blocks {
+		if m.Transcript.Blocks[index].Kind == BlockActivityGroup {
+			collapsed := allExpanded
+			m.Transcript.Update(index, func(block *TranscriptBlock) { block.Collapsed = collapsed }, m.Width)
+		}
+	}
 }
 
 // InspectionView renders the active inspector within the supplied row budget.

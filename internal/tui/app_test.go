@@ -46,6 +46,28 @@ func TestModelSubmitsComposerInputAsNeutralAction(t *testing.T) {
 	}
 }
 
+func TestCtrlOTogglesAllActivityGroupsWithoutChangingComposer(t *testing.T) {
+	m := NewModel(Header{})
+	m.Transcript.Append(TranscriptBlock{ID: "group-a", Kind: BlockActivityGroup, Collapsed: true}, 80)
+	m.Transcript.Append(TranscriptBlock{ID: "group-b", Kind: BlockActivityGroup, Collapsed: true}, 80)
+	m.Composer.Editor.SetValue("draft")
+	m.Update(tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl})
+	for _, block := range m.Transcript.Blocks {
+		if block.Kind == BlockActivityGroup && block.Collapsed {
+			t.Fatalf("Ctrl+O did not expand %q", block.ID)
+		}
+	}
+	if m.Composer.Editor.Value() != "draft" {
+		t.Fatal("Ctrl+O changed the composer draft")
+	}
+	m.Update(tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl})
+	for _, block := range m.Transcript.Blocks {
+		if block.Kind == BlockActivityGroup && !block.Collapsed {
+			t.Fatalf("second Ctrl+O did not collapse %q", block.ID)
+		}
+	}
+}
+
 func TestModelOwnsTranscriptActivityFocusAndActivation(t *testing.T) {
 	m := NewModel(Header{})
 	m.Width, m.Height = 60, 16

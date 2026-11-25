@@ -1566,7 +1566,7 @@ func TestConversationTUILoadSyncSkipsEmptyAssistantToolSteps(t *testing.T) {
 		t.Fatalf("restored visible block count = %d, want 2: %+v", len(model.ui.Transcript.Blocks), model.ui.Transcript.Blocks)
 	}
 	lines := ansi.Strip(strings.Join(model.computeVisibleLines(), "\n"))
-	if strings.Count(lines, "Buddy") != 1 || !strings.Contains(lines, "Found one file.") {
+	if strings.Contains(lines, "Buddy") || !strings.Contains(lines, "› inspect files") || !strings.Contains(lines, "Found one file.") {
 		t.Fatalf("restored transcript contains empty assistant rows: %q", lines)
 	}
 }

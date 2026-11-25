@@ -16,6 +16,7 @@ type Footer struct {
 	ApprovalView, ApprovalKeys string
 	Queued, Steering           int
 	Error                      string
+	Notice                     string
 	HasError                   bool
 	Completion                 []string
 	Composer                   string
@@ -41,6 +42,9 @@ func RenderFooter(f Footer) []string {
 	}
 	if f.Error != "" {
 		rows = append(rows, f.Error)
+	}
+	if f.Notice != "" {
+		rows = append(rows, mutedStyle.Render(f.Notice))
 	}
 	rows = append(rows, f.Completion...)
 	if f.Height <= 0 {
