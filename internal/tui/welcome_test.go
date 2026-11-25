@@ -73,6 +73,28 @@ func TestMascotSpriteRowsAreRectangular(t *testing.T) {
 			if len(pixels) != len(rows[0]) {
 				t.Errorf("sprite row %d width = %d, want %d", row, len(pixels), len(rows[0]))
 			}
+			for _, pixel := range pixels {
+				if !strings.ContainsRune(".KOCPW", pixel) {
+					t.Errorf("sprite row %d contains unknown pixel %q", row, pixel)
+				}
+			}
+		}
+	}
+}
+
+func TestColoredWelcomeRowsStayWithinTerminalBounds(t *testing.T) {
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("COLORTERM", "truecolor")
+	t.Setenv("CLICOLOR_FORCE", "1")
+	t.Setenv("NO_COLOR", "")
+	const width, height = 160, 40
+	rows := RenderWelcome(Welcome{Width: width, Height: height, Workspace: "/workspace/buddy", Version: "dev"})
+	if len(rows) > height {
+		t.Fatalf("colored welcome has %d rows for %d-row terminal", len(rows), height)
+	}
+	for i, row := range rows {
+		if rowWidth := ansi.StringWidth(row); rowWidth > width {
+			t.Errorf("colored welcome row %d uses %d columns, want at most %d", i, rowWidth, width)
 		}
 	}
 }

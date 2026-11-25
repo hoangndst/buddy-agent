@@ -27,9 +27,12 @@ func buildMascotStyles() [7][7]lipgloss.Style {
 	if !isLightTerminal() {
 		palette[1] = "#29252B"
 	}
-	for top := 1; top < len(mascotPalette); top++ {
+	for top := 0; top < len(mascotPalette); top++ {
 		for bottom := 0; bottom < len(mascotPalette); bottom++ {
-			style := lipgloss.NewStyle().Foreground(lipgloss.Color(palette[top]))
+			style := lipgloss.NewStyle()
+			if top > 0 {
+				style = style.Foreground(lipgloss.Color(palette[top]))
+			}
 			if bottom > 0 {
 				style = style.Background(lipgloss.Color(palette[bottom]))
 			}
@@ -73,6 +76,8 @@ func RenderMascot(size MascotSize) []string {
 				} else {
 					row.WriteRune(monochromePixel((top + bottom) / 2))
 				}
+			case top == bottom:
+				row.WriteString(styles[0][top].Render(" "))
 			case top == 0:
 				row.WriteString(styles[bottom][0].Render("▄"))
 			case bottom == 0:
