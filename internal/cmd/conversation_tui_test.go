@@ -482,8 +482,12 @@ func TestConversationTUIWelcomeResizesToNarrowFallback(t *testing.T) {
 	if !strings.Contains(standardView, "╭─ Buddy Agent") || !strings.Contains(standardView, "Tips for getting started") || !strings.Contains(standardView, "╰") {
 		t.Fatalf("standard welcome panel was clipped: %q", standardView)
 	}
-	if rows := strings.Split(standardView, "\n"); len(rows) > 24 {
+	rows := strings.Split(standardView, "\n")
+	if len(rows) > 24 {
 		t.Fatalf("standard welcome has %d rows for a 24-row terminal", len(rows))
+	}
+	if !strings.HasPrefix(rows[0], "╭─ Buddy Agent") {
+		t.Fatalf("welcome panel should start at the top without a duplicate header: %q", rows[:min(3, len(rows))])
 	}
 	standard.appendBlock(TranscriptBlock{ID: "user-prompt", Kind: BlockUserMessage, Body: "Start a conversation"})
 	transcriptView := ansi.Strip(standard.View().Content)
@@ -491,10 +495,10 @@ func TestConversationTUIWelcomeResizesToNarrowFallback(t *testing.T) {
 		t.Fatalf("welcome panel remained after transcript content appeared: %q", transcriptView)
 	}
 
-	model := &conversationTUI{textarea: textarea.New(), width: 160, height: 40, workspace: "/workspace/buddy", state: "ready", startParams: protocol.ConversationStartParams{Model: "GPT-5.4"}}
+	model := &conversationTUI{textarea: textarea.New(), width: 160, height: 40, workspace: "/workspace/buddy", gitBranch: "main", state: "ready", startParams: protocol.ConversationStartParams{Model: "GPT-5.4"}}
 	wide := ansi.Strip(model.View().Content)
-	if !strings.Contains(wide, "▀") || !strings.Contains(wide, "GPT-5.4") {
-		t.Fatalf("wide welcome missing mascot or model metadata: %q", wide)
+	if !strings.Contains(wide, "▀") || !strings.Contains(wide, "GPT-5.4") || !strings.Contains(wide, "main") {
+		t.Fatalf("wide welcome missing mascot or project metadata: %q", wide)
 	}
 
 	updated, _ = model.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
@@ -1310,6 +1314,15 @@ func TestConversationTUIFormatsVisibleTranscript(t *testing.T) {
 
 func TestConversationTUIDynamicComposerAndUnicodeWidth(t *testing.T) {
 	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	model.textarea.SetPromptFunc(2, composerPrompt)
+	model.textarea.SetWidth(76)
+	model.resizeComposer()
+	if model.textarea.Height() != 2 {
+		t.Fatalf("empty standard composer height = %d, want 2", model.textarea.Height())
+	}
+	if got := ansi.Strip(model.textarea.View()); strings.Count(got, "›") != 1 {
+		t.Fatalf("empty composer repeated its prompt: %q", got)
+	}
 	model.textarea.SetWidth(30)
 	model.textarea.SetValue("first line\nsecond line\nthird line")
 	model.resizeComposer()

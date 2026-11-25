@@ -11,7 +11,7 @@ import (
 type MascotSize uint8
 
 const (
-	// MascotWelcome renders 8 columns by 4 rows for the welcome header.
+	// MascotWelcome renders 16 columns by 8 rows for the welcome header.
 	MascotWelcome MascotSize = iota
 	// MascotCompact renders 24 columns by 12 rows.
 	MascotCompact
@@ -73,7 +73,7 @@ func RenderMascot(size MascotSize) []string {
 	pixelSize := mascotPixelWidth
 	switch size {
 	case MascotWelcome:
-		pixelSize = 8
+		pixelSize = 16
 	case MascotCompact:
 		pixelSize /= 2
 	}

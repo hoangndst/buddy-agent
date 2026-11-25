@@ -1,14 +1,15 @@
 ╭─ Buddy Agent vdev ───────────────────────────────────────────────────────────────────────────────╮
-│  ▓▓  █▓█                           │ Tips for getting started                                    │
-│  ▓▒▓▓▓▒▓                           │ Ask Buddy to explain this project or help with a coding     │
-│  █▓█▒▓▒▒                           │ task.                                                       │
-│   ▀▓▒▓▓▀                           │ ─────────────────────────────────────────────────────────── │
-│ Welcome back!                      │ What Buddy can do                                           │
-│ GPT-5.4                            │ Explore files, edit code, run tests, and review your        │
-│ ~/Developer/buddy-agent            │ changes.                                                    │
-│ Version dev                        │                                                             │
-│ ● Connected                        │ Useful commands                                             │
-│                                    │ /help       Show available commands                         │
-│                                    │ /resume     Continue a previous conversation                │
-│                                    │ /diff       Review working-tree changes                     │
+│   ██       █▓▓                     │ Tips for getting started                                    │
+│  █▓▒▓▓    █▓▒▒█                    │ Ask Buddy to explain this project or help with a coding     │
+│  ▓▓▒▒▒▓▓▒▓▓▒▒▒▓                    │ task.                                                       │
+│  ██▒▒▓▓▓▓▒▒▓█▒▓                    │ ─────────────────────────────────────────────────────────── │
+│   ██▓▒██▓▓▓█▓██                    │ What Buddy can do                                           │
+│   ▓▒▒▓▒▓▒▒▒▒▒▓▒▀                   │ Explore files, edit code, run tests, and review your        │
+│    ▓▓▒▒▒▒▓▓▒▒▓▓                    │ changes.                                                    │
+│       ▀▀▀▀▀▀▀                      │                                                             │
+│ Welcome back!                      │ Useful commands                                             │
+│ GPT-5.4                            │ /help       Show available commands                         │
+│ ~/Developer/buddy-agent            │ /resume     Continue a previous conversation                │
+│ Version dev                        │ /diff       Review working-tree changes                     │
+│ ● Connected                        │                                                             │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

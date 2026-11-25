@@ -233,7 +233,7 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 	input.SetHeight(1)
 	input.SetVirtualCursor(false)
 	input.SetStyles(textarea.DefaultStyles(true))
-	input.Prompt = "› "
+	input.SetPromptFunc(2, composerPrompt)
 	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"), key.WithHelp("shift+enter", "new line"))
 	input.Focus()
 	historyPath := os.Getenv("BUDDY_HISTORY_FILE")
@@ -1497,7 +1497,9 @@ func (m *conversationTUI) View() tea.View {
 	emergency := width < 40 || height < 12
 	standard := width >= 80 && height >= 24
 	var header, body, footer []string
-	if !emergency {
+	welcomeScreen := m.choosing == "" && m.pendingApproval == nil && m.diffView == nil && !m.diffLoading &&
+		m.outputRef == "" && len(m.transcript.Blocks) == 0 && m.streamingText == "" && m.state != "running"
+	if !emergency && !welcomeScreen {
 		header = m.headerLines(standard)
 	}
 	if m.choosing != "" && m.pendingApproval == nil {
@@ -1527,7 +1529,6 @@ func (m *conversationTUI) View() tea.View {
 	}
 	return tui.RenderScreen(tui.Screen{
 		Width: width, Height: height, Header: header, Body: body, Footer: footer,
-		CenterBody: m.choosing == "" && m.pendingApproval == nil && m.diffView == nil && m.outputRef == "" && len(m.transcript.Blocks) == 0 && m.streamingText == "",
 	})
 }
 
@@ -1567,7 +1568,7 @@ func (m *conversationTUI) conversationLines(available int) []string {
 			}
 			lines = tui.RenderWelcome(tui.Welcome{
 				Width: m.width, Height: available, Model: m.startParams.Model,
-				Workspace: m.workspace, Version: conversationBuildVersion(), Status: status,
+				Workspace: m.workspace, GitBranch: m.gitBranch, Version: conversationBuildVersion(), Status: status,
 			})
 		}
 	}
@@ -1585,6 +1586,14 @@ func (m *conversationTUI) conversationLines(available int) []string {
 func conversationBuildVersion() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return "dev"
+	}
+	if strings.HasPrefix(info.Main.Version, "v0.0.0-") {
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" && len(setting.Value) >= 7 {
+				return "dev+" + setting.Value[:7]
+			}
+		}
 		return "dev"
 	}
 	return info.Main.Version
@@ -2156,6 +2165,13 @@ func (m *conversationTUI) renderTextarea() string {
 	return m.textarea.View()
 }
 
+func composerPrompt(info textarea.PromptInfo) string {
+	if info.LineNumber == 0 {
+		return "› "
+	}
+	return "  "
+}
+
 func (m *conversationTUI) resizeComposer() {
 	maxRows := 5
 	if m.width < 80 || m.height < 24 {
@@ -2165,7 +2181,9 @@ func (m *conversationTUI) resizeComposer() {
 		maxRows = 1
 	}
 	rows := 1
-	if strings.TrimSpace(m.textarea.Value()) != "" {
+	if strings.TrimSpace(m.textarea.Value()) == "" && m.width >= 80 && m.height >= 24 {
+		rows = 2
+	} else if strings.TrimSpace(m.textarea.Value()) != "" {
 		width := max(1, m.textarea.Width())
 		rows = 0
 		for _, line := range strings.Split(m.textarea.Value(), "\n") {

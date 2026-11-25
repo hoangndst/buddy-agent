@@ -18,18 +18,17 @@ func TestRenderScreenAllocatesRegions(t *testing.T) {
 	}
 }
 
-func TestRenderScreenCentersEmptyConversationAndClipsWideRows(t *testing.T) {
+func TestRenderScreenKeepsBodyAtTopAndClipsWideRows(t *testing.T) {
 	view := RenderScreen(Screen{
 		Width: 5, Height: 6,
 		Header: []string{"header"}, Body: []string{"one", "two"}, Footer: []string{"footer"},
-		CenterBody: true,
 	})
 	lines := strings.Split(view.Content, "\n")
 	if len(lines) != 6 {
 		t.Fatalf("got %d rows, want 6: %q", len(lines), view.Content)
 	}
-	if lines[2] != "one" || lines[3] != "two" {
-		t.Fatalf("body not vertically centered: %q", view.Content)
+	if lines[1] != "one" || lines[2] != "two" {
+		t.Fatalf("body was not aligned below the header: %q", view.Content)
 	}
 	if strings.Contains(lines[0], "header") || strings.Contains(lines[5], "footer") {
 		t.Fatalf("wide rows were not clipped to terminal width: %q", view.Content)

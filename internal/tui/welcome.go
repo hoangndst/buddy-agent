@@ -11,6 +11,7 @@ import (
 type Welcome struct {
 	Width, Height             int
 	Model, Workspace, Version string
+	GitBranch                 string
 	Status                    string
 }
 
@@ -30,15 +31,15 @@ func RenderWelcome(w Welcome) []string {
 	if status == "" {
 		status = "Connected"
 	}
-	if width < 70 || w.Height < 18 {
-		return compactWelcome(width, model, workspace, version, status)
+	if width < 70 || w.Height < 16 {
+		return compactWelcome(width, model, workspace, w.GitBranch, version, status)
 	}
 
 	art := RenderMascot(MascotWelcome)
 	leftWidth := min(52, max(34, width/3))
 	rightWidth := width - leftWidth - 7
 	if rightWidth < 24 {
-		return compactWelcome(width, model, workspace, version, status)
+		return compactWelcome(width, model, workspace, w.GitBranch, version, status)
 	}
 
 	left := append([]string{}, art...)
@@ -48,9 +49,11 @@ func RenderWelcome(w Welcome) []string {
 	}
 	left = append(left,
 		mutedStyle.Render(ansi.Truncate(workspace, leftWidth, "…")),
-		mutedStyle.Render("Version "+version),
-		runtimeStatus(status),
 	)
+	if branch := cleanText(strings.TrimSpace(w.GitBranch)); branch != "" {
+		left = append(left, mutedStyle.Render("on "+ansi.Truncate(branch, leftWidth-3, "…")))
+	}
+	left = append(left, mutedStyle.Render("Version "+version), runtimeStatus(status))
 
 	right := []string{
 		accentStyle().Render("Tips for getting started"),
@@ -76,16 +79,16 @@ func RenderWelcome(w Welcome) []string {
 	return welcomeFrame(welcomeTitle(version), left, right, rightWidth, width)
 }
 
-func compactWelcome(width int, model, workspace, version, status string) []string {
+func compactWelcome(width int, model, workspace, branch, version, status string) []string {
 	lines := []string{titleStyle.Render("Buddy Agent"), mutedStyle.Render("Your terminal coding companion")}
 	if model != "" {
 		lines = append(lines, mutedStyle.Render(ansi.Truncate(model, width, "…")))
 	}
-	lines = append(lines,
-		mutedStyle.Render(ansi.Truncate(workspace, width, "…")),
-		mutedStyle.Render("Version "+version),
-		runtimeStatus(status),
-	)
+	lines = append(lines, mutedStyle.Render(ansi.Truncate(workspace, width, "…")))
+	if branch = cleanText(strings.TrimSpace(branch)); branch != "" {
+		lines = append(lines, mutedStyle.Render("on "+ansi.Truncate(branch, max(1, width-3), "…")))
+	}
+	lines = append(lines, mutedStyle.Render("Version "+version), runtimeStatus(status))
 	for i := range lines {
 		lines[i] = ansi.Truncate(lines[i], width, "…")
 	}

@@ -55,6 +55,9 @@ func RenderFooter(f Footer) []string {
 			rows = append(rows, mutedStyle.Render(strings.Repeat("─", max(1, f.Width))))
 		}
 		rows = append(rows, strings.Split(input, "\n")...)
+		if f.Standard {
+			rows = append(rows, mutedStyle.Render(strings.Repeat("─", max(1, f.Width))))
+		}
 	}
 	if !f.Emergency {
 		connection := "Connected"

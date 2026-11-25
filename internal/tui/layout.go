@@ -11,7 +11,6 @@ import (
 type Screen struct {
 	Width, Height        int
 	Header, Body, Footer []string
-	CenterBody           bool
 }
 
 // RenderScreen allocates terminal rows to the header, body, and footer.
@@ -23,15 +22,8 @@ func RenderScreen(screen Screen) tea.View {
 	if len(body) > available {
 		body = body[len(body)-available:]
 	}
-	if screen.CenterBody && len(body) < available {
-		leading := (available - len(body)) / 2
-		rows = append(rows, make([]string, leading)...)
-		rows = append(rows, body...)
-		rows = append(rows, make([]string, available-leading-len(body))...)
-	} else {
-		rows = append(rows, body...)
-		rows = append(rows, make([]string, max(0, available-len(body)))...)
-	}
+	rows = append(rows, body...)
+	rows = append(rows, make([]string, max(0, available-len(body)))...)
 	rows = append(rows, screen.Footer...)
 	rows = fitRows(rows, height)
 	for i := range rows {

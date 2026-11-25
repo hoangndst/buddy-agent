@@ -137,10 +137,10 @@ func TestConversationTUIUsesAndRestoresRealPTY(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline = time.Now().Add(2 * time.Second)
-	for !strings.Contains(outputText(), "Buddy Agent · idle · /") && time.Now().Before(deadline) {
+	for !strings.Contains(outputText(), "Your terminal coding companion") && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !strings.Contains(outputText(), "Buddy Agent · idle · /") {
+	if !strings.Contains(outputText(), "Your terminal coding companion") {
 		t.Fatalf("resize did not render the compact layout: %q", outputText())
 	}
 	if _, err := master.Write([]byte{3}); err != nil {
