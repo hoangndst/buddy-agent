@@ -43,7 +43,7 @@ func TestMascotVariantsAndNoColorFallback(t *testing.T) {
 		size MascotSize
 		rows int
 		cols int
-	}{{MascotWelcome, 8, 16}, {MascotCompact, 12, 24}, {MascotLarge, 24, 48}} {
+	}{{MascotWelcome, 15, 32}, {MascotCompact, 11, 24}, {MascotLarge, 19, 40}} {
 		art := RenderMascot(tc.size)
 		if len(art) != tc.rows {
 			t.Fatalf("mascot rows = %d, want %d", len(art), tc.rows)
@@ -63,12 +63,26 @@ func TestMascotVariantsAndNoColorFallback(t *testing.T) {
 	}
 }
 
+func TestMascotSpriteRowsAreRectangular(t *testing.T) {
+	for _, sprite := range []string{mascotSprite24, mascotSprite32, mascotSprite40} {
+		rows := strings.Split(sprite, "\n")
+		if len(rows)%2 != 0 {
+			t.Errorf("sprite has odd pixel height %d", len(rows))
+		}
+		for row, pixels := range rows {
+			if len(pixels) != len(rows[0]) {
+				t.Errorf("sprite row %d width = %d, want %d", row, len(pixels), len(rows[0]))
+			}
+		}
+	}
+}
+
 func TestWelcomeResizeAndNarrowFallback(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	for _, tc := range []struct {
 		width, height int
 		wantMascot    bool
-	}{{160, 40, true}, {100, 24, true}, {60, 18, false}, {40, 12, false}} {
+	}{{160, 40, true}, {100, 24, true}, {80, 18, false}, {60, 18, false}, {40, 12, false}} {
 		rows := RenderWelcome(Welcome{Width: tc.width, Height: tc.height, Workspace: "/workspace/buddy", Version: "dev"})
 		joined := strings.Join(rows, "\n")
 		if strings.Contains(joined, "▀") != tc.wantMascot {

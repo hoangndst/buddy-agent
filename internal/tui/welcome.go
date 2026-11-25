@@ -31,11 +31,15 @@ func RenderWelcome(w Welcome) []string {
 	if status == "" {
 		status = "Connected"
 	}
-	if width < 70 || w.Height < 16 {
+	if width < 70 || w.Height < 19 {
 		return compactWelcome(width, model, workspace, w.GitBranch, version, status)
 	}
 
-	art := RenderMascot(MascotWelcome)
+	mascotSize := MascotWelcome
+	if w.Height < 23 {
+		mascotSize = MascotCompact
+	}
+	art := RenderMascot(mascotSize)
 	leftWidth := min(52, max(34, width/3))
 	rightWidth := width - leftWidth - 7
 	if rightWidth < 24 {
