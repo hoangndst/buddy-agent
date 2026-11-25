@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestFormatFileHyperlink(t *testing.T) {
@@ -60,6 +62,24 @@ func TestFormatFileHyperlink(t *testing.T) {
 			t.Fatalf("expected escaped file URI, got %q", got)
 		}
 	})
+}
+
+func TestHyperlinkAtFindsRenderedMarkdownLink(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
+	rendered, err := RenderMarkdown("[Open Buddy](https://example.com/docs)", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.Split(strings.TrimLeft(rendered, "\n"), "\n")[0]
+	plain := ansi.Strip(line)
+	column := strings.Index(plain, "Open Buddy") + 2
+	if got := hyperlinkAt(line, column); got != "https://example.com/docs" {
+		t.Fatalf("link at column %d = %q, want URL; output %q", column, got, line)
+	}
+	if got := hyperlinkAt(line, strings.Index(plain, "Open Buddy")-1); got != "" {
+		t.Fatalf("column outside link unexpectedly matched %q", got)
+	}
 }
 
 func TestStripHyperlinks(t *testing.T) {

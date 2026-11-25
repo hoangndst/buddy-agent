@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +64,11 @@ type conversationTUI struct {
 	outputPageIndex        int
 	inspectionGeneration   uint64
 	outputLoading          bool
+}
+
+type linkOpenedMsg struct {
+	url string
+	err error
 }
 
 type pendingApprovalRequest struct {
@@ -241,6 +248,7 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 		{Name: "/interrupt", Description: "Stop the active turn"},
 		{Name: "/queue", Description: "Queue a prompt", ArgsHint: "<prompt>"},
 		{Name: "/copy", Description: "Copy the transcript"},
+		{Name: "/copy-last", Description: "Copy the latest response"},
 		{Name: "/diff", Description: "Review working-tree changes"},
 	} {
 		m.ui.Composer.Commands.Register(command)
@@ -547,6 +555,21 @@ func (m *conversationTUI) Init() tea.Cmd {
 func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.ensureUIModel()
 	switch msg := msg.(type) {
+	case linkOpenedMsg:
+		if msg.err != nil {
+			m.errorText = "Could not open link: " + msg.err.Error()
+		} else {
+			m.noticeText = "Opened link in browser."
+		}
+		return m, nil
+	case tea.MouseClickMsg:
+		if msg.Button == tea.MouseLeft {
+			if target := m.ui.HyperlinkAt(msg.Y, msg.X); target != "" {
+				return m, openExternalLink(target)
+			}
+		}
+		_, cmd := m.ui.Update(msg)
+		return m, cmd
 	case tea.WindowSizeMsg:
 		_, _ = m.ui.Update(msg)
 		m.clearCache()
@@ -861,6 +884,9 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+		if msg.String() == "alt+c" {
+			return m, m.copyLatestResponse()
+		}
 		if m.hasPendingApproval() {
 			_, cmd := m.ui.Update(msg)
 			return m, cmd
@@ -930,6 +956,9 @@ func (m *conversationTUI) handlePromptInput(input string) tea.Cmd {
 		m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockAssistantMessage, Role: "assistant", Header: "Buddy", Body: "Requested clipboard copy of full transcript.", CreatedAt: time.Now()})
 		return tea.SetClipboard(full.String())
 	}
+	if text == "/copy-last" {
+		return m.copyLatestResponse()
+	}
 	if text == "/quit" || text == "/exit" {
 		return tea.Quit
 	}
@@ -957,6 +986,49 @@ func (m *conversationTUI) handlePromptInput(input string) tea.Cmd {
 		return tui.EmitAction(tui.Action{Kind: tui.ActionSubmitPrompt, Prompt: strings.TrimSpace(strings.TrimPrefix(text, "/queue ")), Mode: string(persistence.SubmissionQueue)})
 	}
 	return tui.EmitAction(tui.Action{Kind: tui.ActionSubmitPrompt, Prompt: text, Mode: string(persistence.SubmissionQueue)})
+}
+
+func (m *conversationTUI) copyLatestResponse() tea.Cmd {
+	for i := len(m.ui.Transcript.Blocks) - 1; i >= 0; i-- {
+		block := m.ui.Transcript.Blocks[i]
+		if block.Kind == BlockAssistantMessage && block.Role != "reasoning" && !block.Streaming && strings.TrimSpace(block.Body) != "" {
+			m.noticeText = "Requested clipboard copy of latest response."
+			return tea.SetClipboard(block.Body)
+		}
+	}
+	m.noticeText = "No completed response to copy yet."
+	return nil
+}
+
+func openExternalLink(raw string) tea.Cmd {
+	parsed, err := url.Parse(raw)
+	scheme := ""
+	if parsed != nil {
+		scheme = strings.ToLower(parsed.Scheme)
+	}
+	if err != nil || parsed.User != nil || (scheme != "http" && scheme != "https" && scheme != "file") ||
+		((scheme == "http" || scheme == "https") && parsed.Hostname() == "") ||
+		(scheme == "file" && parsed.Host != "" && parsed.Host != "localhost") {
+		return func() tea.Msg { return linkOpenedMsg{url: raw, err: fmt.Errorf("unsupported link")} }
+	}
+	var command string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		command, args = "open", []string{"--", raw}
+	case "windows":
+		command, args = "rundll32", []string{"url.dll,FileProtocolHandler", raw}
+	default:
+		command, args = "xdg-open", []string{raw}
+	}
+	return func() tea.Msg {
+		cmd := exec.Command(command, args...)
+		if err := cmd.Start(); err != nil {
+			return linkOpenedMsg{url: raw, err: err}
+		}
+		go func() { _ = cmd.Wait() }()
+		return linkOpenedMsg{url: raw}
+	}
 }
 
 func (m *conversationTUI) View() tea.View {

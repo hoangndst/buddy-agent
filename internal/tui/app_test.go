@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestModelComposesPickerAndInspectionScreens(t *testing.T) {
@@ -65,6 +66,20 @@ func TestCtrlOTogglesAllActivityGroupsWithoutChangingComposer(t *testing.T) {
 		if block.Kind == BlockActivityGroup && !block.Collapsed {
 			t.Fatalf("second Ctrl+O did not collapse %q", block.ID)
 		}
+	}
+}
+
+func TestModelResolvesVisibleMarkdownLinkScreenCoordinates(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
+	m := NewModel(Header{})
+	m.Width, m.Height = 80, 12
+	m.SetScreenContent(ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
+	m.Transcript.Append(TranscriptBlock{ID: "answer", Kind: BlockAssistantMessage, Body: "[Open Buddy](https://example.com/docs)"}, m.Width)
+	plain := ansi.Strip(m.Transcript.WrappedLines(m.Transcript.Blocks[0], m.Width)[0])
+	column := strings.Index(plain, "Open Buddy") + 1
+	if got := m.HyperlinkAt(1, column); got != "https://example.com/docs" {
+		t.Fatalf("screen hyperlink = %q, want URL", got)
 	}
 }
 

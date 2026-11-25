@@ -295,6 +295,16 @@ func (m *Model) HasPicker() bool { return m.Picker != PickerNone }
 // HasInspection reports whether an output or diff inspector is active.
 func (m *Model) HasInspection() bool { return m.inspection.Kind != InspectionNone }
 
+// HyperlinkAt resolves a screen coordinate to a visible Markdown link.
+func (m *Model) HyperlinkAt(row, column int) string {
+	if m.HasPicker() || m.HasInspection() || m.HasPendingApproval() || m.screenContent == nil || m.screenContent.Body != nil {
+		return ""
+	}
+	headerRows, footerRows := len(m.screenContent.Header), len(m.screenContent.Footer)
+	bodyHeight := max(0, m.Height-headerRows-footerRows)
+	return m.Transcript.HyperlinkAt(row-headerRows, column, bodyHeight, m.Width)
+}
+
 // InspectionKind returns the currently active inspector type.
 func (m *Model) InspectionKind() InspectionKind { return m.inspection.Kind }
 

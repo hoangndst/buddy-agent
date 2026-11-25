@@ -266,3 +266,15 @@ func (t *Transcript) VisibleLines(height, width int) []string {
 	}
 	return lines
 }
+
+// HyperlinkAt returns a Markdown link at a row within the currently visible transcript.
+func (t *Transcript) HyperlinkAt(row, column, height, width int) string {
+	if row < 0 || column < 0 {
+		return ""
+	}
+	lines := t.VisibleLines(height, width)
+	if row >= len(lines) {
+		return ""
+	}
+	return hyperlinkAt(lines[row], column)
+}

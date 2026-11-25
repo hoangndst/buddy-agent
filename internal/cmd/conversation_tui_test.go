@@ -820,6 +820,20 @@ func TestConversationTUICopyCommandInAlternateScreen(t *testing.T) {
 	}
 }
 
+func TestCopyLatestResponseAndRejectUnsafeLinkSchemes(t *testing.T) {
+	model := &conversationTUI{ui: testTUIModel(80, 24)}
+	model.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "older answer"})
+	model.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "latest answer"})
+	_, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModAlt})
+	if cmd == nil || fmt.Sprint(cmd()) != "latest answer" {
+		t.Fatal("Alt+C did not copy the latest assistant answer")
+	}
+	msg, ok := openExternalLink("javascript:alert(1)")().(linkOpenedMsg)
+	if !ok || msg.err == nil {
+		t.Fatal("unsafe link scheme was not rejected")
+	}
+}
+
 func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
 	api := &conversationAPITestDouble{submissions: make(chan protocol.ConversationSubmitParams, 1)}
 	model := &conversationTUI{client: api, conversation: "conv-1", ui: testTUIModel(80, 24)}

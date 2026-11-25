@@ -7,9 +7,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
-var osc8Pattern = regexp.MustCompile(`\x1b\]8;;[^\x1b]*\x1b\\([^\x1b]*)\x1b\]8;;\x1b\\`)
+var osc8Pattern = regexp.MustCompile(`\x1b\]8;[^;]*;[^\x07\x1b]*(\x1b\\|\x07)([^\x07\x1b]*)\x1b\]8;;(\x1b\\|\x07)`)
+var osc8SegmentPattern = regexp.MustCompile(`\x1b\]8;[^;]*;([^\x07\x1b]*)(\x1b\\|\x07)(.*?)\x1b\]8;;(\x1b\\|\x07)`)
 
 // FormatFileHyperlink formats a file path and optional line number into an OSC 8 terminal hyperlink:
 // \x1b]8;;file:///absolute/path#L42\x1b\path:42\x1b]8;;\x1b\
@@ -58,7 +62,18 @@ func FormatWorkspaceFileHyperlink(workspace, path string, line int) string {
 
 // StripHyperlinks removes OSC 8 escape codes from formatted strings, returning pure text.
 func StripHyperlinks(s string) string {
-	return osc8Pattern.ReplaceAllString(s, "$1")
+	return osc8Pattern.ReplaceAllString(s, "$2")
+}
+
+func hyperlinkAt(line string, column int) string {
+	for _, match := range osc8SegmentPattern.FindAllStringSubmatchIndex(line, -1) {
+		start := lipgloss.Width(ansi.Strip(line[:match[0]]))
+		label := line[match[6]:match[7]]
+		if column >= start && column < start+lipgloss.Width(ansi.Strip(label)) {
+			return line[match[2]:match[3]]
+		}
+	}
+	return ""
 }
 
 func supportsHyperlinks() bool {
