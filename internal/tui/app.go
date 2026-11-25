@@ -562,6 +562,8 @@ func (m *Model) reduce(event Event) tea.Cmd {
 			return nil
 		}
 		a := *event.Activity
+		a.Tool = cleanText(a.Tool)
+		a.Path = cleanText(a.Path)
 		kind := BlockToolActivity
 		if a.ParentIdentity != "" {
 			kind = BlockSubagentActivity
@@ -589,6 +591,8 @@ func (m *Model) reduce(event Event) tea.Cmd {
 			return nil
 		}
 		activity := *event.Activity
+		activity.Tool = cleanText(activity.Tool)
+		activity.Path = cleanText(activity.Path)
 		matched := false
 		for i := len(m.Transcript.Blocks) - 1; i >= 0; i-- {
 			block := m.Transcript.Blocks[i]

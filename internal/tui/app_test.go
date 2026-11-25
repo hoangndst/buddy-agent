@@ -111,6 +111,39 @@ func TestModelMatchesActivityStartAndResult(t *testing.T) {
 	}
 }
 
+func TestModelSanitizesActivityToolAndPathBeforeFormatting(t *testing.T) {
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("NO_COLOR", "")
+	m := NewModel(Header{Workspace: "/work"})
+	activity := &Activity{
+		Identity: "turn\x001\x00call",
+		Tool:     "bash\x1b[31m",
+		Path:     "safe.go\x1b[31m",
+		Line:     9,
+	}
+	updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: activity})
+	if len(m.Transcript.Blocks) != 1 {
+		t.Fatalf("activity start was not recorded: %+v", m.Transcript.Blocks)
+	}
+	header := m.Transcript.Blocks[0].Header
+	if got := StripHyperlinks(header); got != "Running bash safe.go:9" {
+		t.Fatalf("sanitized activity header = %q", got)
+	}
+	if !strings.Contains(header, "file:///work/safe.go#L9") {
+		t.Fatalf("safe path lost its intended hyperlink: %q", header)
+	}
+	if strings.Contains(StripHyperlinks(header), "\x1b") {
+		t.Fatalf("terminal control sequence remained in activity header: %q", header)
+	}
+
+	completed := *activity
+	completed.ExitCode = new(int)
+	updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: "turn", Activity: &completed})
+	if got := StripHyperlinks(m.Transcript.Blocks[0].Header); got != "Done bash" {
+		t.Fatalf("completed tool header was not sanitized: %q", got)
+	}
+}
+
 func TestModelFinishesAndFailsStreamingWithoutStaleTail(t *testing.T) {
 	for _, kind := range []EventKind{EventTurnFinished, EventFailure} {
 		m := NewModel(Header{})
