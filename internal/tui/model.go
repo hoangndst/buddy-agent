@@ -131,6 +131,8 @@ type DiffView struct {
 // ScreenContent carries adapter-prepared transcript and footer rows into the UI compositor.
 type ScreenContent struct {
 	Header, Body, Footer []string
+	WelcomeStatus        string
+	Version              string
 }
 
 // PickerKind identifies a presentation-only choice flow.

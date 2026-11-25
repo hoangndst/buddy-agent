@@ -46,6 +46,33 @@ func TestModelSubmitsComposerInputAsNeutralAction(t *testing.T) {
 	}
 }
 
+func TestModelOwnsTranscriptActivityFocusAndActivation(t *testing.T) {
+	m := NewModel(Header{})
+	m.Width, m.Height = 60, 16
+	m.Transcript.Append(TranscriptBlock{ID: "first", Kind: BlockToolActivity, Header: "read_file", Collapsed: true, Activity: &Activity{Tool: "read_file"}}, m.Width)
+	m.Transcript.Append(TranscriptBlock{ID: "second", Kind: BlockToolActivity, Header: "bash", Collapsed: true, Activity: &Activity{Tool: "bash", OutputRef: "out-1"}}, m.Width)
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	if !m.TranscriptFocused || m.SelectedActivity != "first" {
+		t.Fatal("F6 did not focus the first activity")
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if m.SelectedActivity != "second" {
+		t.Fatal("Down did not select the next activity")
+	}
+	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter did not request activity output")
+	}
+	msg, ok := cmd().(ActionMsg)
+	if !ok || msg.Action.Kind != ActionOpenOutput || msg.Action.Ref != "out-1" {
+		t.Fatalf("unexpected activity action: %#v", msg)
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	if m.TranscriptFocused || !m.Composer.Editor.Focused() {
+		t.Fatal("F6 did not restore composer focus")
+	}
+}
+
 func updateEvent(m *Model, event Event) {
 	m.Update(event)
 }

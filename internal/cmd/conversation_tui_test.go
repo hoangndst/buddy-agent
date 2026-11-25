@@ -800,7 +800,7 @@ func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
 	model.appendBlock(TranscriptBlock{ID: "activity", TurnID: "turn-1", Kind: BlockToolActivity, Header: "✓ bash", Body: "preview", Collapsed: true, Activity: &tui.Activity{Tool: "bash", OutputRef: "out-1"}})
 	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyF6})
 	model = updated.(*conversationTUI)
-	if !model.transcriptFocused || model.selectedActivity != "activity" {
+	if !model.ui.TranscriptFocused || model.ui.SelectedActivity != "activity" {
 		t.Fatal("F6 did not focus the transcript activity")
 	}
 	updated, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -818,7 +818,7 @@ func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
 	}
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 	model = updated.(*conversationTUI)
-	if model.ui.HasInspection() || !model.transcriptFocused {
+	if model.ui.HasInspection() || !model.ui.TranscriptFocused {
 		t.Fatal("Escape did not return to transcript focus")
 	}
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyF6})
@@ -849,7 +849,7 @@ func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 		}
 		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
 		_, open := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-		if m.selectedActivity != activityID || open == nil {
+		if m.ui.SelectedActivity != activityID || open == nil {
 			t.Fatalf("%s sync lost the selectable output activity", stage)
 		}
 		updated, page := m.Update(open())
@@ -887,14 +887,14 @@ func TestConversationTUIDropsOutputWhenConversationOrWorkerChanges(t *testing.T)
 		m := &conversationTUI{client: &conversationAPITestDouble{syncResult: old}}
 		m.loadSync(old)
 		m.appendBlock(TranscriptBlock{ID: "activity", Kind: BlockToolActivity, Activity: &tui.Activity{OutputRef: "old-ref"}})
-		m.selectedActivity, m.outputLoading = "activity", true
+		m.ui.SelectedActivity, m.outputLoading = "activity", true
 		setTestOutputInspection(m, "old-ref", nil)
 		lateSync := m.syncConversation()
 		m.loadSync(&next)
 		m.Update(lateSync())
 		m.Update(outputPageMsg{generation: m.inspectionGeneration - 1, ref: "old-ref", err: errors.New("stale output error")})
 		if m.conversation != next.ConversationID || m.workerEpoch != next.WorkerEpoch || len(m.ui.Transcript.Blocks) != 0 ||
-			m.selectedActivity != "" || m.ui.HasInspection() || m.outputLoading || m.errorText != "" {
+			m.ui.SelectedActivity != "" || m.ui.HasInspection() || m.outputLoading || m.errorText != "" {
 			t.Fatalf("old output state leaked after switching to %s/%s", next.ConversationID, next.WorkerEpoch)
 		}
 	}
@@ -1113,12 +1113,12 @@ func TestConversationTUIGroupsSubagentActivities(t *testing.T) {
 	if !strings.Contains(expanded, "read_file") || strings.Contains(strings.Join(model.computeVisibleLines(), "\n"), "file contents") {
 		t.Fatalf("expanded grouping did not nest child activity: %q", expanded)
 	}
-	model.transcriptFocused = true
+	model.ui.TranscriptFocused = true
 	model.ui.Transcript.Blocks[0].Collapsed = false
-	model.selectedActivity = "parent"
-	model.selectActivity(1)
-	if model.selectedActivity != "child" {
-		t.Fatalf("expanded child was not selectable: %q", model.selectedActivity)
+	model.ui.SelectedActivity = "parent"
+	model.ui.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if model.ui.SelectedActivity != "child" {
+		t.Fatalf("expanded child was not selectable: %q", model.ui.SelectedActivity)
 	}
 	updated, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	model = updated.(*conversationTUI)
@@ -1133,7 +1133,8 @@ func TestConversationTUIGroupsSubagentActivities(t *testing.T) {
 }
 
 func TestConversationTUISelectionKeepsExpandedChildVisible(t *testing.T) {
-	m := &conversationTUI{ui: testTUIModel(40, 21), transcriptFocused: true, selectedActivity: "parent"}
+	m := &conversationTUI{ui: testTUIModel(40, 21)}
+	m.ui.TranscriptFocused, m.ui.SelectedActivity = true, "parent"
 	m.appendBlock(TranscriptBlock{ID: "parent", Kind: BlockToolActivity, Header: "subagent"})
 	for i := 1; i <= 20; i++ {
 		name := fmt.Sprintf("child-%02d", i)
@@ -1146,8 +1147,8 @@ func TestConversationTUISelectionKeepsExpandedChildVisible(t *testing.T) {
 		t.Helper()
 		want := fmt.Sprintf("child-%02d", step)
 		view := strings.Join(m.computeVisibleLines(), "\n")
-		if m.selectedActivity != want || !strings.Contains(view, "↳ "+want) {
-			t.Fatalf("selected child %q should be visible after navigation, selected=%q view=%q", want, m.selectedActivity, view)
+		if m.ui.SelectedActivity != want || !strings.Contains(view, "↳ "+want) {
+			t.Fatalf("selected child %q should be visible after navigation, selected=%q view=%q", want, m.ui.SelectedActivity, view)
 		}
 	}
 	for i := 1; i <= 20; i++ {
@@ -1551,7 +1552,7 @@ func TestConversationTUIEmptyAssistantRendering(t *testing.T) {
 		t.Fatalf("empty streaming assistant rendered %q", got)
 	}
 	model.state = "running"
-	if got := strings.Join(model.conversationLines(10), "\n"); !strings.Contains(got, "Working…") {
+	if got := model.View().Content; !strings.Contains(got, "Working…") {
 		t.Fatalf("empty running conversation rendered %q", got)
 	}
 }

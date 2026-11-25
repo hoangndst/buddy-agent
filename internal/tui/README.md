@@ -12,7 +12,8 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 - `Model` owns ordered pending approval presentation, argument editing, approval key handling, and resize behavior. It emits a choice bound to a UI generation; the command adapter validates that generation against the pending daemon request before constructing a response.
 - `Model` owns workspace and conversation picker state, cursor navigation, rendering, and local cancellation. Selection actions carry a picker kind, generation, and UI ID; the command adapter resolves them against current daemon results and discards canceled or stale list/resume responses.
 - `Model` owns output/diff inspector presentation, local scrolling, panning, file selection, and keyboard navigation. The command adapter retains output page offsets, protocol conversion, RPCs, and inspection generations used to reject stale responses.
-- `Model.View` composes picker and inspector overlays with adapter-supplied transcript/header/footer rows. `internal/cmd` remains the Bubble Tea runtime adapter and delegates the final frame to the TUI model.
+- `Model` owns transcript activity focus, activity selection, expand/inspect keys, and focus-aware scroll navigation. `internal/cmd` handles only resulting runtime actions and retains transcript rendering/cache integration during the remaining extraction.
+- `Model.View` renders the canonical visible transcript, welcome screen, picker, and inspector, and composes them with adapter-supplied header/footer rows. `internal/cmd` remains the Bubble Tea runtime adapter and delegates the final frame to the TUI model.
 - `InputHistoryRing` loads and stores prompt history at a caller-supplied path.
 - `SlashCommandRegistry` stores and matches composer commands; `Composer` owns its instance.
 - `Transcript` owns canonical blocks, reading offset, rendered-row caching, reflow, and visible-window selection; `TranscriptBlock` and `Activity` are UI-owned values.

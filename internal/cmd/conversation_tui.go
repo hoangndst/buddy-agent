@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -58,8 +57,6 @@ type conversationTUI struct {
 	conversations          []protocol.ConversationSummary
 	selectedWorkspace      string
 	loadWorkspaceMCPConfig func(string) (*mcp.Config, error)
-	transcriptFocused      bool
-	selectedActivity       string
 	outputPageStarts       []int64
 	outputPageIndex        int
 	inspectionGeneration   uint64
@@ -179,7 +176,6 @@ type gitBranchMsg struct {
 }
 
 var (
-	uiMutedStyle = lipgloss.NewStyle().Foreground(tui.ThemeColor("#62656D", "#9297A3"))
 	uiUserStyle  = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#27609B", "#78B9EF"))
 	uiBuddyStyle = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#A94721", "#EFA276"))
 )
@@ -874,50 +870,6 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			_, cmd := m.ui.Update(msg)
 			return m, cmd
 		}
-		if msg.String() == "f6" && !m.ui.HasPicker() {
-			m.transcriptFocused = !m.transcriptFocused
-			if m.transcriptFocused {
-				m.ui.Composer.Editor.Blur()
-				m.selectActivity(0)
-			} else {
-				m.ui.Composer.Editor.Focus()
-				m.invalidateActivityCache(m.selectedActivity)
-			}
-			return m, nil
-		}
-		if m.transcriptFocused {
-			switch msg.String() {
-			case "up":
-				m.selectActivity(-1)
-				return m, nil
-			case "down":
-				m.selectActivity(1)
-				return m, nil
-			case "enter":
-				for _, block := range m.ui.Transcript.Blocks {
-					if block.ID != m.selectedActivity {
-						continue
-					}
-					if block.Activity != nil && block.Activity.OutputRef != "" {
-						return m, tui.EmitAction(tui.Action{Kind: tui.ActionOpenOutput, Ref: block.Activity.OutputRef})
-					}
-					for i := range m.ui.Transcript.Blocks {
-						if m.ui.Transcript.Blocks[i].ID == block.ID {
-							m.updateBlock(i, func(current *TranscriptBlock) { current.Collapsed = !current.Collapsed })
-							break
-						}
-					}
-					return m, nil
-				}
-			case "pgup":
-				m.ui.Transcript.ScrollOffset += max(1, m.ui.Height/2)
-				return m, nil
-			case "pgdown":
-				m.ui.Transcript.ScrollOffset = max(0, m.ui.Transcript.ScrollOffset-max(1, m.ui.Height/2))
-				return m, nil
-			}
-			return m, nil
-		}
 		_, cmd := m.ui.Update(msg)
 		return m, cmd
 	case tea.PasteMsg:
@@ -1017,12 +969,14 @@ func (m *conversationTUI) View() tea.View {
 		header = m.headerLines(standard)
 	}
 	footer := m.renderBottom(emergency, standard)
-	available := max(0, height-len(header)-len(footer))
-	body := m.conversationLines(available)
-	if len(body) > available {
-		body = body[len(body)-available:]
+	status := "Connected"
+	if m.standalone {
+		status = "Standalone"
 	}
-	m.ui.SetScreenContent(tui.ScreenContent{Header: header, Body: body, Footer: footer})
+	if m.errorText != "" {
+		status = "Needs attention"
+	}
+	m.ui.SetScreenContent(tui.ScreenContent{Header: header, Footer: footer, WelcomeStatus: status, Version: tui.BuildVersion()})
 	return m.ui.View()
 }
 
@@ -1031,58 +985,6 @@ func (m *conversationTUI) headerLines(standard bool) []string {
 		Width: m.ui.Width, Model: terminalText(m.startParams.Model), Workspace: terminalText(m.workspace),
 		GitBranch: terminalText(m.gitBranch), State: terminalText(m.state), Standard: standard,
 	})
-}
-
-func (m *conversationTUI) conversationLines(available int) []string {
-	if available <= 0 {
-		return nil
-	}
-	var lines []string
-	if len(m.ui.Transcript.Blocks) > 0 {
-		lines = m.computeVisibleLines()
-	}
-	if len(lines) == 0 && len(m.ui.Transcript.Blocks) == 0 && m.ui.StreamingText() == "" {
-		if m.state == "running" {
-			lines = []string{uiMutedStyle.Render("Working…")}
-		} else {
-			status := "Connected"
-			if m.standalone {
-				status = "Standalone"
-			}
-			if m.errorText != "" {
-				status = "Needs attention"
-			}
-			lines = tui.RenderWelcome(tui.Welcome{
-				Width: m.ui.Width, Height: available, Model: m.startParams.Model,
-				Workspace: m.workspace, GitBranch: m.gitBranch, Version: conversationBuildVersion(), Status: status,
-			})
-		}
-	}
-	if m.ui.StreamingText() != "" && m.ui.ActiveBlockID() == "" {
-		lines = append(lines, uiBuddyStyle.Render("Buddy"))
-		if rendered, err := tui.RenderMarkdown(terminalText(m.ui.StreamingText()), max(1, m.ui.Width-4)); err == nil {
-			lines = append(lines, strings.Split(rendered, "\n")...)
-		} else {
-			lines = append(lines, strings.Split(terminalText(m.ui.StreamingText()), "\n")...)
-		}
-	}
-	return lines
-}
-
-func conversationBuildVersion() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
-		return "dev"
-	}
-	if strings.HasPrefix(info.Main.Version, "v0.0.0-") {
-		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" && len(setting.Value) >= 7 {
-				return "dev+" + setting.Value[:7]
-			}
-		}
-		return "dev"
-	}
-	return info.Main.Version
 }
 
 func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
@@ -1110,7 +1012,7 @@ func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
 		PendingApproval: m.hasPendingApproval(), ApprovalView: approvalView, ApprovalKeys: approvalKeys,
 		Queued: queued, Steering: steering, Error: renderedError,
 		HasError: m.errorText != "", Completion: m.completionLines(), Composer: composer,
-		State: m.state, Standalone: m.standalone, TranscriptFocused: m.transcriptFocused,
+		State: m.state, Standalone: m.standalone, TranscriptFocused: m.ui.TranscriptFocused,
 	})
 }
 
@@ -1145,58 +1047,6 @@ func (m *conversationTUI) loadGitBranch() tea.Cmd {
 			return gitBranchMsg{workspace: workspace}
 		}
 		return gitBranchMsg{workspace: workspace, branch: strings.TrimSpace(string(branch))}
-	}
-}
-
-func (m *conversationTUI) selectActivity(delta int) {
-	activities := make([]string, 0)
-	for _, block := range m.ui.Transcript.Blocks {
-		if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity {
-			continue
-		}
-		if block.ParentID == "" || parentActivityExpanded(block, m.ui.Transcript.Blocks) {
-			activities = append(activities, block.ID)
-		}
-	}
-	if len(activities) == 0 {
-		m.selectedActivity = ""
-		return
-	}
-	index := 0
-	for i, id := range activities {
-		if id == m.selectedActivity {
-			index = i
-			break
-		}
-	}
-	index = max(0, min(len(activities)-1, index+delta))
-	previous := m.selectedActivity
-	m.selectedActivity = activities[index]
-	if previous != m.selectedActivity {
-		m.invalidateActivityCache(previous)
-	}
-	m.invalidateActivityCache(m.selectedActivity)
-	selectedParent := m.ui.Transcript.Blocks[m.blockIndex(m.selectedActivity)].ParentID
-	selectedBlock := m.selectedActivity
-	if selectedParent != "" {
-		selectedBlock = selectedParent
-	}
-	rowsAfter := 0
-	for i := len(m.ui.Transcript.Blocks) - 1; i >= 0; i-- {
-		block := m.ui.Transcript.Blocks[i]
-		count := m.getBlockLineCount(block, m.ui.Width)
-		if block.ID == selectedBlock {
-			row := count / 2
-			if selectedParent != "" {
-				rendered, childOffset := m.renderBlock(block, m.ui.Width)
-				if childOffset >= 0 {
-					row = len(tui.WrapLines(rendered[:childOffset], m.ui.Width))
-				}
-			}
-			m.ui.Transcript.ScrollOffset = max(0, rowsAfter+count-row-m.viewportHeight()/2)
-			break
-		}
-		rowsAfter += count
 	}
 }
 
@@ -1411,7 +1261,7 @@ func (m *conversationTUI) resolvePendingApproval(requestID string, generation ui
 	copy(m.pendingApprovals[index:], m.pendingApprovals[index+1:])
 	m.pendingApprovals = m.pendingApprovals[:len(m.pendingApprovals)-1]
 	_, _ = m.ui.Update(tui.Event{Kind: tui.EventApprovalResolved, ApprovalGeneration: generation})
-	if !m.hasPendingApproval() && !m.transcriptFocused {
+	if !m.hasPendingApproval() && !m.ui.TranscriptFocused {
 		m.ui.Composer.Editor.Focus()
 	}
 	return true
@@ -1441,9 +1291,9 @@ func (m *conversationTUI) setPendingApprovals(requests []protocol.PermissionRequ
 	}
 	m.pendingApprovals = next
 	_, _ = m.ui.Update(tui.Event{Kind: tui.EventApprovalSnapshot, Approvals: visible})
-	if m.hasPendingApproval() && !m.transcriptFocused {
+	if m.hasPendingApproval() && !m.ui.TranscriptFocused {
 		m.ui.Composer.Editor.Blur()
-	} else if wasPending && !m.hasPendingApproval() && !m.transcriptFocused {
+	} else if wasPending && !m.hasPendingApproval() && !m.ui.TranscriptFocused {
 		m.ui.Composer.Editor.Focus()
 	}
 }
@@ -1489,7 +1339,7 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			activitiesByTurn[block.TurnID] = append(activitiesByTurn[block.TurnID], block)
 		}
 	} else {
-		m.selectedActivity = ""
+		m.ui.SelectedActivity = ""
 		m.inspectionGeneration++
 		m.outputPageStarts, m.outputPageIndex, m.outputLoading = nil, 0, false
 		_, _ = m.ui.Update(tui.Event{Kind: tui.EventInspectionClosed})
@@ -1649,25 +1499,10 @@ func (m *conversationTUI) syncUIRenderState() {
 	m.ui.Metadata.Workspace = m.workspace
 	m.ui.Metadata.GitBranch = m.gitBranch
 	m.ui.State = m.state
-	m.ui.Transcript.SetRenderState(m.ui.StreamingText(), m.selectedActivity, m.transcriptFocused)
+	m.ui.Transcript.SetRenderState(m.ui.StreamingText(), m.ui.SelectedActivity, m.ui.TranscriptFocused)
 }
 
 func (m *conversationTUI) clearCache() { m.ensureUIModel(); m.ui.Transcript.ClearCache() }
-
-func (m *conversationTUI) invalidateBlockCache(blockID string) {
-	m.ensureUIModel()
-	m.ui.Transcript.Invalidate(blockID)
-}
-
-func (m *conversationTUI) invalidateActivityCache(blockID string) {
-	m.ensureUIModel()
-	if index := m.blockIndex(blockID); index >= 0 {
-		m.invalidateBlockCache(blockID)
-		if parentID := m.ui.Transcript.Blocks[index].ParentID; parentID != "" {
-			m.invalidateBlockCache(parentID)
-		}
-	}
-}
 
 func (m *conversationTUI) appendBlock(block TranscriptBlock) {
 	m.ensureUIModel()
@@ -1676,23 +1511,6 @@ func (m *conversationTUI) appendBlock(block TranscriptBlock) {
 	}
 	m.setTranscriptRenderState()
 	m.ui.Transcript.Append(block, m.ui.Width)
-}
-
-func (m *conversationTUI) blockIndex(id string) int {
-	m.ensureUIModel()
-	return m.ui.Transcript.Index(id)
-}
-
-func (m *conversationTUI) updateBlock(index int, update func(*TranscriptBlock)) {
-	m.ensureUIModel()
-	m.setTranscriptRenderState()
-	m.ui.Transcript.Update(index, update, m.ui.Width)
-}
-
-func (m *conversationTUI) getBlockLineCount(block TranscriptBlock, width int) int {
-	m.ensureUIModel()
-	m.setTranscriptRenderState()
-	return m.ui.Transcript.LineCount(block, width)
 }
 
 func (m *conversationTUI) getWrappedLines(block TranscriptBlock, width int) []string {
@@ -1704,21 +1522,12 @@ func (m *conversationTUI) getWrappedLines(block TranscriptBlock, width int) []st
 func (m *conversationTUI) renderBlock(block TranscriptBlock, width int) (string, int) {
 	m.ensureUIModel()
 	m.setTranscriptRenderState()
-	return tui.RenderBlock(block, m.ui.Transcript.Blocks, width, m.ui.StreamingText(), m.selectedActivity, m.transcriptFocused)
+	return tui.RenderBlock(block, m.ui.Transcript.Blocks, width, m.ui.StreamingText(), m.ui.SelectedActivity, m.ui.TranscriptFocused)
 }
 
 func (m *conversationTUI) setTranscriptRenderState() {
 	m.ensureUIModel()
-	m.ui.Transcript.SetRenderState(m.ui.StreamingText(), m.selectedActivity, m.transcriptFocused)
-}
-
-func parentActivityExpanded(block TranscriptBlock, blocks []TranscriptBlock) bool {
-	for _, parent := range blocks {
-		if parent.ID == block.ParentID {
-			return !parent.Collapsed
-		}
-	}
-	return false
+	m.ui.Transcript.SetRenderState(m.ui.StreamingText(), m.ui.SelectedActivity, m.ui.TranscriptFocused)
 }
 
 func terminalText(value string) string {

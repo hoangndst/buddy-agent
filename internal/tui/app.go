@@ -25,14 +25,16 @@ type Model struct {
 	Metadata      Header
 	State         string
 
-	deltaBuffer   strings.Builder
-	tickerActive  bool
-	activeBlockID string
-	streamingText string
-	blockSequence uint64
-	approvalModal *ApprovalModal
-	inspection    inspectionState
-	screenContent *ScreenContent
+	deltaBuffer       strings.Builder
+	tickerActive      bool
+	activeBlockID     string
+	streamingText     string
+	blockSequence     uint64
+	approvalModal     *ApprovalModal
+	inspection        inspectionState
+	screenContent     *ScreenContent
+	TranscriptFocused bool
+	SelectedActivity  string
 }
 
 // NewModel creates conversation presentation state for one terminal session.
@@ -122,6 +124,32 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.HasInspection() {
 			return m.updateInspectionKey(msg)
+		}
+		if msg.String() == "f6" {
+			m.TranscriptFocused = !m.TranscriptFocused
+			if m.TranscriptFocused {
+				m.Composer.Editor.Blur()
+				m.selectActivity(0)
+			} else {
+				m.Composer.Editor.Focus()
+				m.invalidateActivity(m.SelectedActivity)
+			}
+			return m, nil
+		}
+		if m.TranscriptFocused {
+			switch msg.String() {
+			case "up":
+				m.selectActivity(-1)
+			case "down":
+				m.selectActivity(1)
+			case "enter":
+				return m, m.activateSelectedActivity()
+			case "pgup":
+				m.Transcript.ScrollOffset += max(1, m.Height/2)
+			case "pgdown":
+				m.Transcript.ScrollOffset = max(0, m.Transcript.ScrollOffset-max(1, m.Height/2))
+			}
+			return m, nil
 		}
 		if m.Composer.CompletionKind() != "" {
 			switch msg.String() {
@@ -218,10 +246,25 @@ func (m *Model) View() tea.View {
 		} else if m.HasInspection() && !m.HasPendingApproval() {
 			footer = nil
 			body = m.InspectionView(max(0, m.Height-len(content.Header)))
+		} else if content.Body == nil {
+			available := max(0, m.Height-len(content.Header)-len(footer))
+			if len(m.Transcript.Blocks) == 0 && m.streamingText == "" {
+				if m.State == "running" {
+					body = []string{mutedStyle.Render("Working…")}
+				} else {
+					status := content.WelcomeStatus
+					if status == "" {
+						status = "Connected"
+					}
+					body = RenderWelcome(Welcome{Width: m.Width, Height: available, Model: m.Metadata.Model, Workspace: m.Metadata.Workspace, GitBranch: m.Metadata.GitBranch, Version: content.Version, Status: status})
+				}
+			} else {
+				body = m.Transcript.VisibleLines(available, m.Width)
+			}
 		}
 		return RenderScreen(Screen{Width: m.Width, Height: m.Height, Header: content.Header, Body: body, Footer: footer})
 	}
-	m.Transcript.SetRenderState(m.streamingText, "", false)
+	m.Transcript.SetRenderState(m.streamingText, m.SelectedActivity, m.TranscriptFocused)
 	body := m.Transcript.VisibleLines(max(0, m.Height-2), m.Width)
 	return RenderScreen(Screen{
 		Width: m.Width, Height: m.Height,
@@ -258,6 +301,112 @@ func (m *Model) InspectionRef() string { return m.inspection.Ref }
 
 // CurrentOutputPage returns the output page currently displayed by the model.
 func (m *Model) CurrentOutputPage() *OutputPage { return m.inspection.Output }
+
+func (m *Model) selectActivity(delta int) {
+	activities := make([]string, 0)
+	for _, block := range m.Transcript.Blocks {
+		if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity {
+			continue
+		}
+		if block.ParentID == "" || parentActivityIsExpanded(block, m.Transcript.Blocks) {
+			activities = append(activities, block.ID)
+		}
+	}
+	if len(activities) == 0 {
+		m.invalidateActivity(m.SelectedActivity)
+		m.SelectedActivity = ""
+		m.Transcript.SetRenderState(m.streamingText, "", true)
+		return
+	}
+	index := 0
+	for i, id := range activities {
+		if id == m.SelectedActivity {
+			index = i
+			break
+		}
+	}
+	previous := m.SelectedActivity
+	m.SelectedActivity = activities[max(0, min(len(activities)-1, index+delta))]
+	m.invalidateActivity(previous)
+	m.invalidateActivity(m.SelectedActivity)
+	m.Transcript.SetRenderState(m.streamingText, m.SelectedActivity, true)
+	selected := m.Transcript.Index(m.SelectedActivity)
+	if selected < 0 {
+		return
+	}
+	selectedParent := m.Transcript.Blocks[selected].ParentID
+	target := m.SelectedActivity
+	if selectedParent != "" {
+		target = selectedParent
+	}
+	viewportHeight := max(1, m.Height-len(m.screenContentHeader())-len(m.screenContentFooter()))
+	rowsAfter := 0
+	for i := len(m.Transcript.Blocks) - 1; i >= 0; i-- {
+		block := m.Transcript.Blocks[i]
+		count := m.Transcript.LineCount(block, m.Width)
+		if block.ID == target {
+			row := count / 2
+			if selectedParent != "" {
+				rendered, childOffset := RenderBlock(block, m.Transcript.Blocks, m.Width, m.streamingText, m.SelectedActivity, true)
+				if childOffset >= 0 {
+					row = len(WrapLines(rendered[:childOffset], m.Width))
+				}
+			}
+			m.Transcript.ScrollOffset = max(0, rowsAfter+count-row-viewportHeight/2)
+			break
+		}
+		rowsAfter += count
+	}
+}
+
+func (m *Model) screenContentHeader() []string {
+	if m.screenContent == nil {
+		return nil
+	}
+	return m.screenContent.Header
+}
+func (m *Model) screenContentFooter() []string {
+	if m.screenContent == nil {
+		return nil
+	}
+	return m.screenContent.Footer
+}
+
+func (m *Model) invalidateActivity(id string) {
+	if id == "" {
+		return
+	}
+	if index := m.Transcript.Index(id); index >= 0 {
+		m.Transcript.Invalidate(id)
+		if parent := m.Transcript.Blocks[index].ParentID; parent != "" {
+			m.Transcript.Invalidate(parent)
+		}
+	}
+}
+
+func parentActivityIsExpanded(block TranscriptBlock, blocks []TranscriptBlock) bool {
+	for _, parent := range blocks {
+		if parent.ID == block.ParentID {
+			return !parent.Collapsed
+		}
+	}
+	return false
+}
+
+func (m *Model) activateSelectedActivity() tea.Cmd {
+	m.Transcript.SetRenderState(m.streamingText, m.SelectedActivity, m.TranscriptFocused)
+	for index, block := range m.Transcript.Blocks {
+		if block.ID != m.SelectedActivity {
+			continue
+		}
+		if block.Activity != nil && block.Activity.OutputRef != "" {
+			return EmitAction(Action{Kind: ActionOpenOutput, Ref: block.Activity.OutputRef})
+		}
+		m.Transcript.Update(index, func(current *TranscriptBlock) { current.Collapsed = !current.Collapsed }, m.Width)
+		return nil
+	}
+	return nil
+}
 
 // InspectionView renders the active inspector within the supplied row budget.
 func (m *Model) InspectionView(height int) []string { return m.inspection.view(m.Width, height) }
