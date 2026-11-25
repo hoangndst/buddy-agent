@@ -1,11 +1,29 @@
 package tui
 
 import (
+	"runtime/debug"
 	"strings"
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 )
+
+// BuildVersion returns the linked application version or a short local revision.
+func BuildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return "dev"
+	}
+	if strings.HasPrefix(info.Main.Version, "v0.0.0-") {
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" && len(setting.Value) >= 7 {
+				return "dev+" + setting.Value[:7]
+			}
+		}
+		return "dev"
+	}
+	return info.Main.Version
+}
 
 // Welcome contains the display metadata shown before a conversation has content.
 type Welcome struct {

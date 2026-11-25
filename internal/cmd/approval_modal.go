@@ -4,21 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 
-	tea "charm.land/bubbletea/v2"
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	"github.com/hoangndst/buddy-agent/internal/tui"
 )
 
-func newApprovalModalState(args map[string]any, width, height int) *tui.ApprovalModal {
-	data, _ := json.MarshalIndent(args, "", "  ")
-	return tui.NewApprovalModal(string(data), width, height)
-}
-
-func approvalViewRequest(request protocol.PermissionRequestNotification) tui.ApprovalRequest {
+func approvalViewRequest(request protocol.PermissionRequestNotification, generation uint64) tui.ApprovalRequest {
 	arguments, _ := json.MarshalIndent(request.Arguments, "", "  ")
 	return tui.ApprovalRequest{
 		Tool: request.Tool, TurnID: request.TurnID, ArgumentsJSON: string(arguments),
-		AllowSession: request.Tool == "bash" || supportsSessionToolApproval(request.Tool),
+		AllowSession: request.Tool == "bash" || supportsSessionToolApproval(request.Tool), Generation: generation,
 	}
 }
 
@@ -50,16 +44,18 @@ func approvalProtocolParams(choice tui.ApprovalChoice) (*protocol.PermissionResp
 	return params, nil
 }
 
-func approvalKeyResult(modal *tui.ApprovalModal, msg tea.KeyPressMsg, request protocol.PermissionRequestNotification) (*protocol.PermissionRespondParams, bool, tea.Cmd, error) {
-	choice, done, cmd := modal.HandleKey(msg, approvalViewRequest(request))
-	if !done || choice == nil {
-		return nil, false, cmd, nil
+func approvalParamsForRequest(choice tui.ApprovalChoice, request protocol.PermissionRequestNotification) (*protocol.PermissionRespondParams, error) {
+	if choice.Decision == tui.ApprovalAllowSession && request.Tool != "bash" && !supportsSessionToolApproval(request.Tool) {
+		return nil, fmt.Errorf("session approval is not supported for tool %q", request.Tool)
 	}
-	params, err := approvalProtocolParams(*choice)
-	if err == nil && choice.Decision == tui.ApprovalAllowSession && request.Tool == "bash" {
+	params, err := approvalProtocolParams(choice)
+	if err != nil {
+		return nil, err
+	}
+	if choice.Decision == tui.ApprovalAllowSession && request.Tool == "bash" {
 		params.CommandPattern, _ = request.Arguments["command"].(string)
 	}
-	return params, err == nil, cmd, err
+	return params, nil
 }
 
 func supportsSessionToolApproval(tool string) bool {

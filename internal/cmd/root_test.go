@@ -77,6 +77,9 @@ func TestRootCmd_REPLExit(t *testing.T) {
 	if !strings.Contains(outBuf.String(), "=== buddy-agent conversation ready ===") {
 		t.Errorf("expected ready message, got: %s", outBuf.String())
 	}
+	if strings.Contains(outBuf.String(), "\x1b[") {
+		t.Errorf("redirected conversation output contains terminal controls: %q", outBuf.String())
+	}
 }
 
 func TestFormatToolPreview(t *testing.T) {

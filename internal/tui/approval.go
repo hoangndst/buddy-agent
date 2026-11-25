@@ -16,6 +16,7 @@ import (
 type ApprovalRequest struct {
 	Tool, TurnID, ArgumentsJSON string
 	AllowSession                bool
+	Generation                  uint64
 }
 
 // ApprovalDecision is the user's selected approval action.

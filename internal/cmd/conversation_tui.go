@@ -11,13 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
-	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -47,49 +45,27 @@ type conversationTUI struct {
 	state                  string
 	workerEpoch            string
 	lastSequence           uint64
-	transcript             tui.Transcript
-	deltaBuffer            strings.Builder
-	tickerActive           bool
-	activeBlockID          string
-	streamingText          string
-	pendingApproval        *protocol.PermissionRequestNotification
-	approvalModal          *tui.ApprovalModal
+	ui                     *tui.Model
+	pendingApprovals       []pendingApprovalRequest
+	approvalGeneration     uint64
+	pickerGeneration       uint64
+	resumeGeneration       uint64
 	queued                 []string
 	steers                 []string
-	textarea               textarea.Model
-	history                *tui.InputHistoryRing
-	slashCommands          tui.SlashCommandRegistry
-	completionKind         string
-	commandMatches         []tui.SlashCommand
-	fileMatches            []string
-	completionCursor       int
-	completionStart        int
-	completionEnd          int
-	width                  int
-	height                 int
 	errorText              string
-	choosing               string
-	choices                []string
-	cursor                 int
 	workspaces             []protocol.ConversationWorkspace
 	conversations          []protocol.ConversationSummary
 	selectedWorkspace      string
 	loadWorkspaceMCPConfig func(string) (*mcp.Config, error)
-	transcriptFocused      bool
-	selectedActivity       string
-	outputRef              string
-	outputPage             *protocol.OutputReadResult
 	outputPageStarts       []int64
 	outputPageIndex        int
-	outputLineScroll       int
+	inspectionGeneration   uint64
 	outputLoading          bool
-	diffView               *protocol.DiffInspectResult
-	diffLoading            bool
-	diffRequestGeneration  uint64
-	diffSelected           int
-	diffFileOpen           bool
-	diffScroll             int
-	inspectionColumn       int
+}
+
+type pendingApprovalRequest struct {
+	request    protocol.PermissionRequestNotification
+	generation uint64
 }
 
 // BlockKind is kept as an alias for the command adapter's transcript tests.
@@ -110,8 +86,6 @@ const (
 
 // TranscriptBlock is the canonical rendered conversation entry.
 type TranscriptBlock = tui.TranscriptBlock
-
-type renderTickMsg time.Time
 
 type conversationAPI interface {
 	Capabilities() (*protocol.DaemonCapabilitiesResult, error)
@@ -151,23 +125,31 @@ type pendingStartSubmission struct {
 type conversationEventMsg protocol.SessionEventNotification
 type permissionRequestMsg protocol.PermissionRequestNotification
 type permissionRespondedMsg struct {
-	requestID string
-	err       error
+	requestID  string
+	generation uint64
+	err        error
 }
 type conversationResumeListMsg struct {
+	generation uint64
 	workspaces []protocol.ConversationWorkspace
 	err        error
 }
 type conversationListMsg struct {
+	generation    uint64
 	conversations []protocol.ConversationSummary
 	err           error
 }
 type conversationResumedMsg struct {
-	result          *protocol.ConversationSyncResult
-	workspace       string
-	mcpConfig       *mcp.Config
-	updateMCPConfig bool
-	err             error
+	pickerGeneration     uint64
+	resumeGeneration     uint64
+	sourceConversationID string
+	sourceWorkerEpoch    string
+	result               *protocol.ConversationSyncResult
+	workspace            string
+	databasePath         string
+	mcpConfig            *mcp.Config
+	updateMCPConfig      bool
+	err                  error
 }
 type conversationSyncMsg struct {
 	result          *protocol.ConversationSyncResult
@@ -175,10 +157,11 @@ type conversationSyncMsg struct {
 	err             error
 }
 type outputPageMsg struct {
-	ref    string
-	start  int64
-	result *protocol.OutputReadResult
-	err    error
+	generation uint64
+	ref        string
+	start      int64
+	result     *protocol.OutputReadResult
+	err        error
 }
 type diffInspectMsg struct {
 	generation uint64
@@ -193,8 +176,6 @@ type gitBranchMsg struct {
 }
 
 var (
-	uiTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#A94721", "#EFA276"))
-	uiMutedStyle = lipgloss.NewStyle().Foreground(tui.ThemeColor("#62656D", "#9297A3"))
 	uiUserStyle  = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#27609B", "#78B9EF"))
 	uiBuddyStyle = lipgloss.NewStyle().Bold(true).Foreground(tui.ThemeColor("#A94721", "#EFA276"))
 )
@@ -227,7 +208,6 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 	if !containsConversationMethods(capabilities.Methods) {
 		return fmt.Errorf("this daemon does not support M9 conversations; restart it when its current work is safe to stop, then retry")
 	}
-	input := newConversationComposer()
 	historyPath := os.Getenv("BUDDY_HISTORY_FILE")
 	if historyPath == "" {
 		home, homeErr := os.UserHomeDir()
@@ -237,6 +217,8 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 		historyPath = filepath.Join(home, ".buddy", "history.jsonl")
 	}
 	history, historyErr := tui.NewInputHistoryRing(historyPath)
+	uiModel := tui.NewModel(tui.Header{Model: params.Model, Workspace: workspace})
+	uiModel.Composer.History = history
 	m := &conversationTUI{
 		ctx:          ctx,
 		client:       api,
@@ -245,10 +227,7 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 		databasePath: params.DBPath,
 		standalone:   standalone,
 		state:        "ready",
-		textarea:     input,
-		history:      history,
-		width:        80,
-		height:       24,
+		ui:           uiModel,
 	}
 	for _, command := range []tui.SlashCommand{
 		{Name: "/help", Description: "Show available commands"},
@@ -261,7 +240,7 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 		{Name: "/copy", Description: "Copy the transcript"},
 		{Name: "/diff", Description: "Review working-tree changes"},
 	} {
-		m.slashCommands.Register(command)
+		m.ui.Composer.Commands.Register(command)
 	}
 	if historyErr != nil {
 		m.errorText = fmt.Sprintf("load prompt history: %v", historyErr)
@@ -293,9 +272,7 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 			return fmt.Errorf("sync resumed conversation: %w", syncErr)
 		}
 	}
-	program := tea.NewProgram(m, tea.WithContext(ctx), tea.WithInput(f.IOStreams.In), tea.WithOutput(f.IOStreams.Out))
-	_, err = program.Run()
-	return err
+	return tui.Run(ctx, m, f.IOStreams.In, f.IOStreams.Out)
 }
 
 func isInteractive(stream any) bool {
@@ -557,6 +534,7 @@ func isConversationNotFound(err error) bool {
 }
 
 func (m *conversationTUI) Init() tea.Cmd {
+	m.ensureUIModel()
 	if m.conversation != "" {
 		return tea.Batch(textarea.Blink, m.loadGitBranch(), m.watchEvent(), m.watchPermission())
 	}
@@ -564,66 +542,102 @@ func (m *conversationTUI) Init() tea.Cmd {
 }
 
 func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	m.ensureUIModel()
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		if m.width != msg.Width {
-			m.inspectionColumn = 0
-		}
-		m.width, m.height = msg.Width, msg.Height
-		func() {
-			defer func() { _ = recover() }()
-			m.textarea.SetWidth(max(1, msg.Width-4))
-			m.resizeComposer()
-		}()
-		if m.approvalModal != nil {
-			m.approvalModal.Resize(msg.Width, msg.Height)
-		}
+		_, _ = m.ui.Update(msg)
 		m.clearCache()
-		if m.activeBlockID != "" {
-			for _, b := range m.transcript.Blocks {
-				if b.ID == m.activeBlockID {
-					_ = m.getWrappedLines(b, m.width)
+		if m.ui.ActiveBlockID() != "" {
+			for _, b := range m.ui.Transcript.Blocks {
+				if b.ID == m.ui.ActiveBlockID() {
+					_ = m.getWrappedLines(b, m.ui.Width)
 					break
 				}
 			}
 		}
 		visible := m.computeVisibleBlocks()
 		for _, b := range visible {
-			_ = m.getWrappedLines(b, m.width)
+			_ = m.getWrappedLines(b, m.ui.Width)
 		}
 	case tea.MouseWheelMsg:
-		switch msg.Button {
-		case tea.MouseWheelUp:
-			m.transcript.ScrollOffset += 3
-		case tea.MouseWheelDown:
-			m.transcript.ScrollOffset = max(0, m.transcript.ScrollOffset-3)
-		}
+		_, _ = m.ui.Update(msg)
 		return m, nil
 	case gitBranchMsg:
 		if msg.workspace == m.workspace {
 			m.gitBranch = msg.branch
 		}
-	case renderTickMsg:
-		if m.deltaBuffer.Len() > 0 {
-			flushed := m.deltaBuffer.String()
-			m.deltaBuffer.Reset()
-			// Measure the active block before publishing the new streaming fallback.
-			if m.activeBlockID != "" {
-				for i := range m.transcript.Blocks {
-					if m.transcript.Blocks[i].ID == m.activeBlockID {
-						m.updateBlock(i, func(block *TranscriptBlock) { block.Body += flushed })
-						break
+	case tui.FlushMsg:
+		_, cmd := m.ui.Update(msg)
+		m.syncUIRenderState()
+		return m, cmd
+	case tui.ActionMsg:
+		switch msg.Action.Kind {
+		case tui.ActionSubmitPrompt:
+			if msg.Action.Mode == "" {
+				return m, m.handlePromptInput(msg.Action.Prompt)
+			}
+			m.pickerGeneration++
+			mode := persistence.SubmissionQueue
+			if msg.Action.Mode == string(persistence.SubmissionSteer) {
+				mode = persistence.SubmissionSteer
+			}
+			return m, m.submit(msg.Action.Prompt, mode)
+		case tui.ActionInterruptTurn:
+			return m, m.interruptTurn()
+		case tui.ActionOpenOutput:
+			m.inspectionGeneration++
+			m.outputPageStarts, m.outputPageIndex, m.outputLoading = []int64{0}, 0, true
+			_, _ = m.ui.Update(tui.Event{Kind: tui.EventInspectionStart, InspectionKind: tui.InspectionOutput, InspectionGeneration: m.inspectionGeneration, InspectionRef: msg.Action.Ref})
+			m.ui.Composer.Editor.Blur()
+			return m, m.readOutputPage(msg.Action.Ref, 0, m.inspectionGeneration)
+		case tui.ActionChangeOutputPage:
+			if m.ui.HasInspection() && msg.Action.InspectionGeneration == m.inspectionGeneration {
+				return m, m.changeOutputPage(msg.Action.PageDelta)
+			}
+		case tui.ActionCloseInspection:
+			if msg.Action.InspectionGeneration == m.inspectionGeneration {
+				m.inspectionGeneration++
+				m.outputPageStarts, m.outputPageIndex, m.outputLoading = nil, 0, false
+			}
+		case tui.ActionPermissionChoice:
+			request := m.approvalForGeneration(msg.Action.ApprovalGeneration)
+			if request == nil {
+				return m, m.syncConversation()
+			}
+			params, err := approvalParamsForRequest(msg.Action.ApprovalChoice, request.request)
+			if err != nil {
+				m.errorText = err.Error()
+				return m, nil
+			}
+			return m, m.respondPermission(request, *params)
+		case tui.ActionSelectChoice:
+			if m.ui.Picker != msg.Action.PickerKind || msg.Action.PickerGeneration == 0 || msg.Action.PickerGeneration != m.pickerGeneration {
+				return m, nil
+			}
+			generation := m.nextPickerGeneration()
+			_, _ = m.ui.Update(tui.Event{Kind: tui.EventPickerGeneration, PickerGeneration: generation})
+			switch msg.Action.PickerKind {
+			case tui.PickerWorkspace:
+				for _, workspace := range m.workspaces {
+					if workspace.WorkspaceDir == msg.Action.ChoiceID {
+						m.selectedWorkspace = workspace.WorkspaceDir
+						return m, m.listConversations(m.selectedWorkspace, generation)
+					}
+				}
+			case tui.PickerConversation:
+				for _, conversation := range m.conversations {
+					if conversation.ConversationID == msg.Action.ChoiceID {
+						return m, m.resumeSelected(conversation, generation, m.nextResumeGeneration())
 					}
 				}
 			}
-			m.streamingText += flushed
+			return m, nil
+		case tui.ActionCancelPicker:
+			if msg.Action.PickerKind != tui.PickerNone && msg.Action.PickerGeneration != 0 && msg.Action.PickerGeneration == m.pickerGeneration {
+				m.pickerGeneration++
+			}
+			return m, nil
 		}
-		if m.tickerActive && (m.state == "running" || m.activeBlockID != "" || m.deltaBuffer.Len() > 0) {
-			return m, tea.Tick(33*time.Millisecond, func(t time.Time) tea.Msg {
-				return renderTickMsg(t)
-			})
-		}
-		m.tickerActive = false
 		return m, nil
 	case conversationStartedMsg:
 		if msg.err != nil {
@@ -641,6 +655,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingStart = nil
 			return m, nil
 		}
+		m.nextResumeGeneration()
 		m.conversation = msg.result.ConversationID
 		m.state = "running"
 		cmds := []tea.Cmd{m.syncConversation(), m.watchPermission()}
@@ -684,242 +699,38 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Sequence > 0 {
 			m.lastSequence = msg.Sequence
 		}
-		switch msg.Type {
-		case string(agent.EventFinished):
-			m.state = "idle"
-			m.tickerActive = false
-			m.deltaBuffer.Reset()
-			m.activeBlockID = ""
-			return m, m.syncConversation()
-		case string(agent.EventError):
-			m.state = "idle"
-			m.streamingText = ""
-			m.tickerActive = false
-			m.deltaBuffer.Reset()
-			m.activeBlockID = ""
-			m.errorText = msg.Content
-			return m, m.syncConversation()
-		case string(agent.EventTextDelta):
-			m.deltaBuffer.WriteString(msg.Content)
-			if m.activeBlockID == "" {
-				block := TranscriptBlock{
-					ID:        newConversationID("block"),
-					TurnID:    msg.TurnID,
-					Kind:      BlockAssistantMessage,
-					Role:      "assistant",
-					Header:    "Buddy",
-					Body:      "",
-					Streaming: true,
-					CreatedAt: time.Now(),
-				}
-				m.appendBlock(block)
-				m.activeBlockID = block.ID
-			}
-			if !m.tickerActive {
-				m.tickerActive = true
-				return m, tea.Batch(
-					m.watchEvent(),
-					tea.Tick(33*time.Millisecond, func(t time.Time) tea.Msg {
-						return renderTickMsg(t)
-					}),
-				)
-			}
+		event, ok := tuiEventFromProtocol(protocol.SessionEventNotification(msg))
+		if !ok {
 			return m, m.watchEvent()
-		case string(agent.EventToolCall):
-			tool := "tool"
-			kind := BlockToolActivity
-			activity := activityFromEvent(msg.Data, msg.TurnID)
-			if msg.Data != nil {
-				if activity.Tool != "" {
-					tool = terminalText(activity.Tool)
-				}
-				if activity.Path != "" {
-					tool += " " + tui.FormatWorkspaceFileHyperlink(m.workspace, terminalText(activity.Path), activity.Line)
-				}
-				if activity.ParentIdentity != "" {
-					kind = BlockSubagentActivity
-				}
-			}
-			block := TranscriptBlock{
-				ID:        newConversationID("block"),
-				TurnID:    msg.TurnID,
-				Kind:      kind,
-				Role:      "tool",
-				Header:    "Running " + tool,
-				Body:      "",
-				CreatedAt: time.Now(),
-				Activity:  activity,
-			}
-			if kind == BlockSubagentActivity {
-				block.Collapsed = true
-				parentKey := activity.ParentIdentity
-				for _, candidate := range m.transcript.Blocks {
-					if activityIdentity(candidate) == parentKey && parentKey != "" {
-						block.ParentID = candidate.ID
-						for i := range m.transcript.Blocks {
-							if m.transcript.Blocks[i].ID == candidate.ID {
-								m.updateBlock(i, func(parent *TranscriptBlock) { parent.Collapsed = true })
-								break
-							}
-						}
-						break
-					}
-				}
-				if block.ParentID == "" {
-					block.Header = "Detached child · " + block.Header
-				}
-			}
-			m.appendBlock(block)
-		case string(agent.EventToolResult):
-			result := msg.Content
-			if msg.Data != nil {
-				if toolResult, ok := msg.Data["tool_result"].(string); ok && toolResult != "" {
-					result = toolResult
-				}
-			}
-			activity := activityFromEvent(msg.Data, msg.TurnID)
-			key := activity.Identity
-			matched := false
-			for i := len(m.transcript.Blocks) - 1; i >= 0; i-- {
-				if m.transcript.Blocks[i].TurnID == msg.TurnID && activityIdentity(m.transcript.Blocks[i]) == key && key != "" {
-					m.updateBlock(i, func(block *TranscriptBlock) {
-						block.Body = result
-						block.Activity = activity
-						block.Completed = true
-						name := terminalText(activity.Tool)
-						exitCode := 0
-						if activity.ExitCode != nil {
-							exitCode = *activity.ExitCode
-						}
-						if name != "" {
-							mark := "Done"
-							if exitCode != 0 {
-								mark = "Failed"
-							}
-							duration := ""
-							if activity.Elapsed > 0 {
-								duration = "  ·  " + activity.Elapsed.Round(100*time.Millisecond).String()
-							}
-							block.Header = mark + " " + name + duration
-						}
-						block.Collapsed = true
-					})
-					matched = true
-					break
-				}
-			}
-			if result != "" && !matched {
-				block := TranscriptBlock{ID: newConversationID("block"), TurnID: msg.TurnID, Kind: BlockToolActivity, Role: "tool", Header: "Result", Body: result, CreatedAt: time.Now(), Collapsed: len(result) > 500, Completed: true, Activity: activity}
-				if msg.Data != nil {
-					if activity.OutputRef != "" {
-						block.Collapsed = true
-					}
-					if activity.ParentIdentity != "" {
-						block.Kind = BlockSubagentActivity
-						name := activity.Tool
-						if name == "" {
-							name = "tool"
-						}
-						block.Header = terminalText(name)
-						for i := range m.transcript.Blocks {
-							if activityIdentity(m.transcript.Blocks[i]) == activity.ParentIdentity && activity.ParentIdentity != "" {
-								block.ParentID = m.transcript.Blocks[i].ID
-								m.updateBlock(i, func(parent *TranscriptBlock) { parent.Collapsed = true })
-								break
-							}
-						}
-						if block.ParentID == "" {
-							block.Header = "Detached child · " + block.Header
-						}
-					}
-				}
-				m.appendBlock(block)
-			}
-		case string(agent.EventReasoning):
-			if msg.Content != "" {
-				block := TranscriptBlock{
-					ID:        newConversationID("block"),
-					TurnID:    msg.TurnID,
-					Kind:      BlockAssistantMessage,
-					Role:      "reasoning",
-					Header:    "Reasoning",
-					Body:      msg.Content,
-					CreatedAt: time.Now(),
-					Activity:  activityFromEvent(msg.Data, msg.TurnID),
-				}
-				m.appendBlock(block)
-			}
-		case string(agent.EventTextComplete):
-			if m.deltaBuffer.Len() > 0 {
-				flushed := m.deltaBuffer.String()
-				m.deltaBuffer.Reset()
-				m.streamingText += flushed
-			}
-			m.tickerActive = false
-			content := msg.Content
-			if content == "" {
-				content = m.streamingText
-			}
-			m.streamingText = ""
-			if m.activeBlockID != "" {
-				for i := range m.transcript.Blocks {
-					if m.transcript.Blocks[i].ID == m.activeBlockID {
-						m.updateBlock(i, func(block *TranscriptBlock) {
-							block.Streaming = false
-							if content != "" {
-								block.Body = content
-							}
-						})
-						break
-					}
-				}
-				m.activeBlockID = ""
-			} else if content != "" {
-				block := TranscriptBlock{
-					ID:        newConversationID("block"),
-					TurnID:    msg.TurnID,
-					Kind:      BlockAssistantMessage,
-					Role:      "assistant",
-					Header:    "Buddy",
-					Body:      content,
-					CreatedAt: time.Now(),
-					Activity:  activityFromEvent(msg.Data, msg.TurnID),
-				}
-				m.appendBlock(block)
-			}
-		case string(agent.EventCompactionStart):
-			block := TranscriptBlock{
-				ID:        newConversationID("block"),
-				TurnID:    msg.TurnID,
-				Kind:      BlockSystemStatus,
-				Role:      "system",
-				Header:    "System",
-				Body:      "Compacting conversation context…",
-				CreatedAt: time.Now(),
-			}
-			m.appendBlock(block)
+		}
+		if event.Kind == tui.EventTurnFinished || event.Kind == tui.EventFailure {
+			m.state = "idle"
+		}
+		if event.Kind == tui.EventFailure {
+			m.errorText = event.Text
+		}
+		_, renderCmd := m.ui.Update(event)
+		m.syncUIRenderState()
+		if event.Kind == tui.EventTurnFinished || event.Kind == tui.EventFailure {
+			return m, tea.Batch(renderCmd, m.syncConversation())
+		}
+		if event.Kind == tui.EventAssistantDelta {
+			return m, tea.Batch(renderCmd, m.watchEvent())
 		}
 		return m, m.watchEvent()
 	case permissionRequestMsg:
 		if msg.ConversationID == m.conversation && msg.TurnID != "" && msg.RequestID != "" {
 			request := protocol.PermissionRequestNotification(msg)
-			m.pendingApproval = &request
-			m.approvalModal = newApprovalModalState(request.Arguments, m.width, m.height)
-			if !m.transcriptFocused {
-				m.textarea.Blur()
-			}
+			m.addPendingApproval(request)
 			m.state = "awaiting_approval"
 		}
 		return m, m.watchPermission()
 	case permissionRespondedMsg:
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
-		} else if m.pendingApproval != nil && m.pendingApproval.RequestID == msg.requestID {
-			m.pendingApproval = nil
-			m.approvalModal = nil
-			if !m.transcriptFocused {
-				m.textarea.Focus()
-			}
+		} else if m.resolvePendingApproval(msg.requestID, msg.generation) {
+			return m, m.syncConversation()
+		} else {
 			return m, m.syncConversation()
 		}
 		return m, nil
@@ -931,51 +742,70 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.watchEvent()
 		}
 		m.state = "restoring"
-		return m, m.resumeEvictedConversation()
+		return m, m.resumeEvictedConversation(m.nextResumeGeneration(), m.conversation, m.workerEpoch)
 	case conversationResumeListMsg:
+		if msg.generation == 0 || msg.generation != m.pickerGeneration {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
-			m.choosing = ""
+			_, _ = m.ui.Update(tui.Event{Kind: tui.EventPickerClosed})
 			return m, nil
 		}
 		m.workspaces = msg.workspaces
 		if len(msg.workspaces) == 0 {
 			m.errorText = "No saved conversations are available. Submit a prompt to start one."
-			m.choosing = ""
+			_, _ = m.ui.Update(tui.Event{Kind: tui.EventPickerClosed})
 			return m, nil
 		}
-		m.choices = make([]string, len(msg.workspaces))
+		choices := make([]tui.Choice, len(msg.workspaces))
 		for i, workspace := range msg.workspaces {
-			m.choices[i] = workspace.WorkspaceDir
+			choices[i] = tui.Choice{ID: workspace.WorkspaceDir, Label: workspace.WorkspaceDir}
 		}
-		m.cursor, m.choosing = 0, "workspace"
+		_, _ = m.ui.Update(tui.Event{Kind: tui.EventPickerSnapshot, PickerKind: tui.PickerWorkspace, PickerGeneration: msg.generation, Choices: choices})
 	case conversationListMsg:
+		if msg.generation == 0 || msg.generation != m.pickerGeneration || m.ui.Picker != tui.PickerWorkspace {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
-			m.choosing = ""
+			_, _ = m.ui.Update(tui.Event{Kind: tui.EventPickerClosed})
 			return m, nil
 		}
 		m.conversations = msg.conversations
 		if len(msg.conversations) == 0 {
 			m.errorText = "No saved conversations in this project."
-			m.choosing = ""
+			_, _ = m.ui.Update(tui.Event{Kind: tui.EventPickerClosed})
 			return m, nil
 		}
-		m.choices = make([]string, len(msg.conversations))
+		choices := make([]tui.Choice, len(msg.conversations))
 		for i, conversation := range msg.conversations {
-			m.choices[i] = conversation.Task + "  ·  " + conversation.ConversationID
+			choices[i] = tui.Choice{ID: conversation.ConversationID, Label: conversation.Task + "  ·  " + conversation.ConversationID}
 		}
-		m.cursor, m.choosing = 0, "conversation"
+		_, _ = m.ui.Update(tui.Event{Kind: tui.EventPickerSnapshot, PickerKind: tui.PickerConversation, PickerGeneration: msg.generation, Choices: choices})
 	case conversationResumedMsg:
+		if (msg.resumeGeneration != 0 && msg.resumeGeneration != m.resumeGeneration) ||
+			(msg.sourceConversationID != "" && msg.sourceConversationID != m.conversation) ||
+			(msg.sourceWorkerEpoch != "" && msg.sourceWorkerEpoch != m.workerEpoch) ||
+			(msg.pickerGeneration != 0 && (msg.pickerGeneration != m.pickerGeneration || m.ui.Picker != tui.PickerConversation)) {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
-			m.choosing = ""
+			if msg.pickerGeneration != 0 {
+				_, _ = m.ui.Update(tui.Event{Kind: tui.EventPickerClosed})
+			}
 			return m, nil
 		}
-		m.choosing = ""
+		if msg.pickerGeneration != 0 {
+			_, _ = m.ui.Update(tui.Event{Kind: tui.EventPickerClosed})
+		}
 		if msg.workspace != "" {
 			m.workspace = msg.workspace
 			m.startParams.WorkspaceDir = msg.workspace
+		}
+		if msg.databasePath != "" {
+			m.databasePath = msg.databasePath
 		}
 		if msg.updateMCPConfig {
 			m.startParams.MCPConfig = msg.mcpConfig
@@ -996,599 +826,163 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.watchEvent()
 		}
 	case outputPageMsg:
-		if m.outputRef == "" || msg.ref != m.outputRef {
+		if msg.generation != m.inspectionGeneration || !m.ui.HasInspection() || msg.ref != m.ui.InspectionRef() || m.ui.InspectionKind() != tui.InspectionOutput {
 			return m, nil
 		}
 		m.outputLoading = false
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
+			_, _ = m.ui.Update(tui.Event{Kind: tui.EventInspectionFailure, InspectionGeneration: msg.generation, InspectionError: msg.err.Error()})
 			return m, nil
 		}
 		pageIndex := indexInt64(m.outputPageStarts, msg.start)
-		if pageIndex != m.outputPageIndex {
-			m.outputLineScroll = 0
-			m.inspectionColumn = 0
-		}
-		m.outputPage = msg.result
 		m.outputPageIndex = pageIndex
+		var page *tui.OutputPage
+		if msg.result != nil {
+			page = &tui.OutputPage{Data: msg.result.Data, Offset: msg.start, TotalBytes: msg.result.TotalBytes, NextOffset: msg.result.NextOffset, HasMore: msg.result.HasMore, Truncated: msg.result.Truncated}
+		}
+		_, _ = m.ui.Update(tui.Event{Kind: tui.EventOutputPage, InspectionGeneration: msg.generation, OutputPage: page})
 		return m, nil
 	case diffInspectMsg:
-		if msg.generation != m.diffRequestGeneration {
+		if msg.generation != m.inspectionGeneration || !m.ui.HasInspection() || m.ui.InspectionKind() != tui.InspectionDiff {
 			return m, nil
 		}
-		m.diffLoading = false
 		if msg.err != nil {
 			m.errorText = msg.err.Error()
+			_, _ = m.ui.Update(tui.Event{Kind: tui.EventInspectionFailure, InspectionGeneration: msg.generation, InspectionError: msg.err.Error()})
 			return m, nil
 		}
-		m.diffView, m.diffSelected, m.diffFileOpen, m.diffScroll = msg.result, 0, false, 0
+		_, _ = m.ui.Update(tui.Event{Kind: tui.EventDiffResult, InspectionGeneration: msg.generation, DiffView: toTUIDiffView(msg.result)})
 		return m, nil
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
-		if m.pendingApproval != nil {
-			if m.approvalModal == nil {
-				m.approvalModal = newApprovalModalState(m.pendingApproval.Arguments, m.width, m.height)
-			}
-			response, done, cmd, err := approvalKeyResult(m.approvalModal, msg, *m.pendingApproval)
-			if err != nil {
-				m.errorText = err.Error()
-				return m, nil
-			}
-			if done {
-				response.RequestID = m.pendingApproval.RequestID
-				response.ConversationID = m.pendingApproval.ConversationID
-				response.TurnID = m.pendingApproval.TurnID
-				return m, m.respondPermission(*response)
-			}
+		if m.hasPendingApproval() {
+			_, cmd := m.ui.Update(msg)
 			return m, cmd
 		}
-		if m.diffLoading && m.diffView == nil {
-			if msg.String() == "esc" {
-				m.diffLoading = false
-				m.diffRequestGeneration++
-			}
-			return m, nil
+		if m.ui.HasPicker() {
+			_, cmd := m.ui.Update(msg)
+			return m, cmd
 		}
-		if m.diffView != nil {
-			switch msg.String() {
-			case "esc":
-				if m.diffFileOpen {
-					m.diffFileOpen = false
-					m.diffScroll = 0
-				} else {
-					m.diffView = nil
-				}
-				return m, nil
-			case "up", "k":
-				if m.diffFileOpen {
-					m.diffScroll = max(0, m.diffScroll-1)
-				} else if m.diffSelected > 0 {
-					m.diffSelected--
-				}
-				return m, nil
-			case "down", "j":
-				if m.diffFileOpen {
-					lastLine := strings.Count(m.diffView.Files[m.diffSelected].Diff, "\n")
-					m.diffScroll = min(lastLine, m.diffScroll+1)
-				} else if m.diffSelected+1 < len(m.diffView.Files) {
-					m.diffSelected++
-				}
-				return m, nil
-			case "enter":
-				if !m.diffFileOpen && len(m.diffView.Files) > 0 {
-					m.diffFileOpen = true
-					m.inspectionColumn = 0
-				}
-				return m, nil
-			case "left", "right":
-				if m.diffFileOpen {
-					m.panInspection(m.diffView.Files[m.diffSelected].Diff, msg.String() == "right")
-				}
-				return m, nil
-			case "pgup":
-				if m.diffFileOpen {
-					m.moveDiffHunk(-1)
-				}
-				return m, nil
-			case "pgdown":
-				if m.diffFileOpen {
-					m.moveDiffHunk(1)
-				}
-				return m, nil
-			}
-			return m, nil
+		if m.ui.HasInspection() {
+			_, cmd := m.ui.Update(msg)
+			return m, cmd
 		}
-		if m.outputRef != "" {
-			switch msg.String() {
-			case "esc":
-				m.outputRef, m.outputPage = "", nil
-				m.clearCache()
-				return m, nil
-			case "pgup":
-				return m, m.changeOutputPage(-1)
-			case "pgdown":
-				return m, m.changeOutputPage(1)
-			case "left", "right":
-				if m.outputPage != nil {
-					m.panInspection(m.outputPage.Data, msg.String() == "right")
-				}
-				return m, nil
-			case "up":
-				m.outputLineScroll = max(0, m.outputLineScroll-1)
-				return m, nil
-			case "down":
-				if m.outputPage != nil {
-					lines := strings.Split(m.outputPage.Data, "\n")
-					m.outputLineScroll = min(max(0, len(lines)-1), m.outputLineScroll+1)
-				}
-				return m, nil
-			}
-			return m, nil
-		}
-		if msg.String() == "f6" && m.choosing == "" {
-			m.transcriptFocused = !m.transcriptFocused
-			if m.transcriptFocused {
-				m.textarea.Blur()
-				m.selectActivity(0)
-			} else {
-				m.textarea.Focus()
-				m.invalidateActivityCache(m.selectedActivity)
-			}
-			return m, nil
-		}
-		if m.transcriptFocused {
-			switch msg.String() {
-			case "up":
-				m.selectActivity(-1)
-				return m, nil
-			case "down":
-				m.selectActivity(1)
-				return m, nil
-			case "enter":
-				for _, block := range m.transcript.Blocks {
-					if block.ID != m.selectedActivity {
-						continue
-					}
-					if block.Activity != nil && block.Activity.OutputRef != "" {
-						m.outputRef, m.outputPageStarts, m.outputPageIndex = block.Activity.OutputRef, []int64{0}, 0
-						m.outputLineScroll = 0
-						m.inspectionColumn = 0
-						m.outputLoading = true
-						m.textarea.Blur()
-						return m, m.readOutputPage(block.Activity.OutputRef, 0)
-					}
-					for i := range m.transcript.Blocks {
-						if m.transcript.Blocks[i].ID == block.ID {
-							m.updateBlock(i, func(current *TranscriptBlock) { current.Collapsed = !current.Collapsed })
-							break
-						}
-					}
-					return m, nil
-				}
-			case "pgup":
-				m.transcript.ScrollOffset += max(1, m.height/2)
-				return m, nil
-			case "pgdown":
-				m.transcript.ScrollOffset = max(0, m.transcript.ScrollOffset-max(1, m.height/2))
-				return m, nil
-			}
-			return m, nil
-		}
-		if m.completionKind != "" {
-			switch msg.String() {
-			case "esc":
-				m.completionKind = ""
-				return m, nil
-			case "up", "down":
-				items := m.completionCount()
-				if items > 0 {
-					step := -1
-					if msg.String() == "down" {
-						step = 1
-					}
-					m.completionCursor = (m.completionCursor + step + items) % items
-				}
-				return m, nil
-			case "tab", "enter":
-				if m.completionCount() > 0 {
-					isEnter := msg.String() == "enter"
-					if m.completionKind == "file" {
-						m.replaceCompletion(m.fileMatches[m.completionCursor])
-						m.completionKind = ""
-						return m, nil
-					}
-					command := m.commandMatches[m.completionCursor]
-					suffix := ""
-					if command.ArgsHint != "" {
-						suffix = " "
-					}
-					m.replaceCompletion(command.Name + suffix)
-					m.completionKind = ""
-					if !isEnter || suffix != "" {
-						return m, nil
-					}
-				}
-			}
-		}
-		if m.choosing == "" && m.history != nil {
-			switch msg.String() {
-			case "ctrl+p":
-				if prompt, ok := m.history.Previous(m.textarea.Value()); ok {
-					m.textarea.SetValue(prompt)
-					m.textarea.CursorEnd()
-					m.clearCompletion()
-				}
-				return m, nil
-			case "ctrl+n":
-				if prompt, ok := m.history.Next(); ok {
-					m.textarea.SetValue(prompt)
-					m.textarea.CursorEnd()
-					m.clearCompletion()
-				}
-				return m, nil
-			case "up":
-				lineInfo := m.textarea.LineInfo()
-				if m.textarea.Line() == 0 && lineInfo.RowOffset == 0 {
-					if prompt, ok := m.history.Previous(m.textarea.Value()); ok {
-						m.textarea.SetValue(prompt)
-						m.textarea.CursorEnd()
-						m.clearCompletion()
-						return m, nil
-					}
-				}
-			case "down":
-				lineInfo := m.textarea.LineInfo()
-				if m.textarea.Line() == m.textarea.LineCount()-1 && lineInfo.RowOffset+1 >= lineInfo.Height {
-					if prompt, ok := m.history.Next(); ok {
-						m.textarea.SetValue(prompt)
-						m.textarea.CursorEnd()
-						m.clearCompletion()
-						return m, nil
-					}
-				}
-			}
-		}
-		if m.choosing == "" {
-			switch msg.String() {
-			case "pgup":
-				m.transcript.ScrollOffset += max(1, m.height/2)
-				return m, nil
-			case "pgdown":
-				m.transcript.ScrollOffset = max(0, m.transcript.ScrollOffset-max(1, m.height/2))
-				return m, nil
-			case "end":
-				m.transcript.ScrollOffset = 0
-				return m, nil
-			}
-		}
-		if m.choosing != "" {
-			switch msg.String() {
-			case "up", "k":
-				if m.cursor > 0 {
-					m.cursor--
-				}
-			case "down", "j":
-				if m.cursor+1 < len(m.choices) {
-					m.cursor++
-				}
-			case "esc":
-				m.choosing = ""
-			case "enter":
-				if len(m.choices) == 0 {
-					return m, nil
-				}
-				if m.choosing == "workspace" {
-					m.selectedWorkspace = m.workspaces[m.cursor].WorkspaceDir
-					return m, m.listConversations(m.selectedWorkspace)
-				}
-				conversation := m.conversations[m.cursor]
-				m.workspace, m.databasePath = m.selectedWorkspace, conversation.DBPath
-				return m, m.resumeSelected(conversation)
-			}
-			return m, nil
-		}
-		if msg.String() == "enter" {
-			text := strings.TrimSpace(m.textarea.Value())
-			if text == "" {
-				return m, nil
-			}
-			m.textarea.Reset()
-			m.errorText = ""
-			if m.history != nil {
-				if err := m.history.Add(text); err != nil {
-					m.errorText = fmt.Sprintf("save prompt history: %v", err)
-				}
-				m.history.Reset()
-			}
-			if text == "/resume" {
-				return m, m.listWorkspaces()
-			}
-			if text == "/help" {
-				var help strings.Builder
-				for _, command := range m.slashCommands.Commands() {
-					help.WriteString(command.Name + " " + command.ArgsHint + "  " + command.Description + "\n")
-				}
-				m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockSystemStatus, Role: "system", Header: "Help", Body: strings.TrimSpace(help.String()), CreatedAt: time.Now()})
-				return m, nil
-			}
-			if text == "/diff" {
-				if m.conversation == "" {
-					m.errorText = "Start or resume a conversation before opening /diff."
-					return m, nil
-				}
-				return m, m.inspectDiff()
-			}
-			if text == "/interrupt" {
-				if m.conversation == "" {
-					m.errorText = "No active conversation."
-					return m, nil
-				}
-				return m, func() tea.Msg {
-					result, err := m.client.SyncConversation(protocol.ConversationSyncParams{ConversationID: m.conversation})
-					if err != nil {
-						return errorMessage(err)
-					}
-					if result.ActiveTurnID == "" {
-						return errorMessage(fmt.Errorf("no active turn to interrupt"))
-					}
-					_, err = m.client.InterruptTurn(protocol.TurnInterruptParams{ConversationID: m.conversation, TurnID: result.ActiveTurnID})
-					return errorMessage(err)
-				}
-			}
-			if text == "/copy" {
-				var full strings.Builder
-				for _, block := range m.transcript.Blocks {
-					if full.Len() > 0 {
-						full.WriteString("\n\n")
-					}
-					full.WriteString(block.Body)
-				}
-				const status = "Requested clipboard copy of full transcript."
-				m.appendBlock(TranscriptBlock{
-					ID:        newConversationID("block"),
-					Kind:      BlockAssistantMessage,
-					Role:      "assistant",
-					Header:    "Buddy",
-					Body:      status,
-					CreatedAt: time.Now(),
-				})
-				return m, tea.SetClipboard(full.String())
-			}
-			if text == "/quit" || text == "/exit" {
-				return m, tea.Quit
-			}
-			if text == "/clear" {
-				var retained []TranscriptBlock
-				if m.activeBlockID != "" {
-					for _, block := range m.transcript.Blocks {
-						if block.ID == m.activeBlockID {
-							retained = append(retained, block)
-							break
-						}
-					}
-					if len(retained) == 0 {
-						m.activeBlockID = ""
-					}
-				}
-				m.transcript.Replace(retained)
-				m.transcript.ScrollOffset = 0
-				return m, nil
-			}
-			if strings.HasPrefix(text, "/steer ") {
-				return m, m.submit(strings.TrimSpace(strings.TrimPrefix(text, "/steer ")), persistence.SubmissionSteer)
-			}
-			if strings.HasPrefix(text, "/queue ") {
-				return m, m.submit(strings.TrimSpace(strings.TrimPrefix(text, "/queue ")), persistence.SubmissionQueue)
-			}
-			return m, m.submit(text, persistence.SubmissionQueue)
-		}
+		_, cmd := m.ui.Update(msg)
+		return m, cmd
 	case tea.PasteMsg:
-		if m.pendingApproval != nil && m.approvalModal != nil && m.approvalModal.Editing() {
-			return m, m.approvalModal.UpdateEditor(msg)
-		}
+		_, cmd := m.ui.Update(msg)
+		return m, cmd
 	}
-	var cmd tea.Cmd
-	beforeValue := m.textarea.Value()
-	beforeLine := m.textarea.Line()
-	beforeLineInfo := m.textarea.LineInfo()
-	m.textarea, cmd = m.textarea.Update(msg)
-	m.resizeComposer()
-	if beforeValue != m.textarea.Value() || beforeLine != m.textarea.Line() || beforeLineInfo != m.textarea.LineInfo() {
-		m.updateCompletion()
-	}
+	_, cmd := m.ui.Update(msg)
 	return m, cmd
 }
 
-func (m *conversationTUI) completionCount() int {
-	if m.completionKind == "file" {
-		return len(m.fileMatches)
+func (m *conversationTUI) handlePromptInput(input string) tea.Cmd {
+	text := strings.TrimSpace(input)
+	if text == "" {
+		return nil
 	}
-	return len(m.commandMatches)
-}
-
-func (m *conversationTUI) clearCompletion() {
-	m.completionKind = ""
-	m.commandMatches = nil
-	m.fileMatches = nil
-	m.completionCursor = 0
-	m.completionStart = 0
-	m.completionEnd = 0
-}
-
-func (m *conversationTUI) replaceCompletion(value string) {
-	text := m.textarea.Value()
-	if m.completionStart <= m.completionEnd && m.completionEnd <= len(text) {
-		m.textarea.SetValue(text[:m.completionStart] + value + text[m.completionEnd:])
-		m.textarea.CursorEnd()
+	m.errorText = ""
+	if err := m.ui.Composer.AddHistory(text); err != nil {
+		m.errorText = fmt.Sprintf("save prompt history: %v", err)
 	}
-}
-
-func (m *conversationTUI) updateCompletion() {
-	text := m.textarea.Value()
-	line := m.textarea.Line()
-	lines := strings.Split(text, "\n")
-	if line >= len(lines) {
-		m.completionKind = ""
-		return
+	if text == "/resume" {
+		return m.listWorkspaces(m.nextPickerGeneration())
 	}
-	current := lines[line]
-	runes := []rune(current)
-	lineInfo := m.textarea.LineInfo()
-	cursor := min(len(runes), lineInfo.StartColumn+lineInfo.ColumnOffset)
-	start, end := cursor, cursor
-	for start > 0 && runes[start-1] != ' ' && runes[start-1] != '\t' {
-		start--
-	}
-	for end < len(runes) && runes[end] != ' ' && runes[end] != '\t' {
-		end++
-	}
-	word := string(runes[start:cursor])
-	lineStart := 0
-	for i := 0; i < line; i++ {
-		lineStart += len(lines[i]) + 1
-	}
-	m.completionStart = lineStart + len(string(runes[:start]))
-	m.completionEnd = lineStart + len(string(runes[:end]))
-	m.completionCursor = 0
-	if strings.HasPrefix(word, "/") {
-		m.commandMatches = m.slashCommands.Match(word)
-		m.fileMatches = nil
-		m.completionKind = "command"
-		if len(m.commandMatches) == 0 {
-			m.completionKind = ""
+	m.pickerGeneration++
+	if text == "/help" {
+		var help strings.Builder
+		for _, command := range m.ui.Composer.Commands.Commands() {
+			help.WriteString(command.Name + " " + command.ArgsHint + "  " + command.Description + "\n")
 		}
-		return
+		m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockSystemStatus, Role: "system", Header: "Help", Body: strings.TrimSpace(help.String()), CreatedAt: time.Now()})
+		return nil
 	}
-	if strings.HasPrefix(word, "@") {
-		m.fileMatches = nil
-		entries, err := os.ReadDir(m.workspace)
-		if err != nil {
-			m.completionKind = ""
-			return
+	if text == "/diff" {
+		if m.conversation == "" {
+			m.errorText = "Start or resume a conversation before opening /diff."
+			return nil
 		}
-		prefix := strings.TrimPrefix(word, "@")
-		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), prefix) && len(m.fileMatches) < 50 {
-				m.fileMatches = append(m.fileMatches, entry.Name())
+		return m.inspectDiff()
+	}
+	if text == "/interrupt" {
+		if m.conversation == "" {
+			m.errorText = "No active conversation."
+			return nil
+		}
+		return tui.EmitAction(tui.Action{Kind: tui.ActionInterruptTurn})
+	}
+	if text == "/copy" {
+		var full strings.Builder
+		for _, block := range m.ui.Transcript.Blocks {
+			if full.Len() > 0 {
+				full.WriteString("\n\n")
+			}
+			full.WriteString(block.Body)
+		}
+		m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockAssistantMessage, Role: "assistant", Header: "Buddy", Body: "Requested clipboard copy of full transcript.", CreatedAt: time.Now()})
+		return tea.SetClipboard(full.String())
+	}
+	if text == "/quit" || text == "/exit" {
+		return tea.Quit
+	}
+	if text == "/clear" {
+		var retained []TranscriptBlock
+		if m.ui.ActiveBlockID() != "" {
+			for _, block := range m.ui.Transcript.Blocks {
+				if block.ID == m.ui.ActiveBlockID() {
+					retained = append(retained, block)
+					break
+				}
+			}
+			if len(retained) == 0 {
+				m.ui.ClearActiveBlock()
 			}
 		}
-		m.commandMatches = nil
-		m.completionKind = "file"
-		if len(m.fileMatches) == 0 {
-			m.completionKind = ""
-		}
-		return
+		m.ui.Transcript.Replace(retained)
+		m.ui.Transcript.ScrollOffset = 0
+		return nil
 	}
-	m.completionKind = ""
+	if strings.HasPrefix(text, "/steer ") {
+		return tui.EmitAction(tui.Action{Kind: tui.ActionSubmitPrompt, Prompt: strings.TrimSpace(strings.TrimPrefix(text, "/steer ")), Mode: string(persistence.SubmissionSteer)})
+	}
+	if strings.HasPrefix(text, "/queue ") {
+		return tui.EmitAction(tui.Action{Kind: tui.ActionSubmitPrompt, Prompt: strings.TrimSpace(strings.TrimPrefix(text, "/queue ")), Mode: string(persistence.SubmissionQueue)})
+	}
+	return tui.EmitAction(tui.Action{Kind: tui.ActionSubmitPrompt, Prompt: text, Mode: string(persistence.SubmissionQueue)})
 }
 
 func (m *conversationTUI) View() tea.View {
-	width, height := max(1, m.width), max(1, m.height)
+	m.ensureUIModel()
+	width, height := max(1, m.ui.Width), max(1, m.ui.Height)
 	emergency := width < 40 || height < 12
 	standard := width >= 80 && height >= 24
-	var header, body, footer []string
-	welcomeScreen := m.choosing == "" && m.pendingApproval == nil && m.diffView == nil && !m.diffLoading &&
-		m.outputRef == "" && len(m.transcript.Blocks) == 0 && m.streamingText == "" && m.state != "running"
+	var header []string
+	welcomeScreen := !m.ui.HasPicker() && !m.ui.HasInspection() && !m.hasPendingApproval() &&
+		len(m.ui.Transcript.Blocks) == 0 && m.ui.StreamingText() == "" && m.state != "running"
 	if !emergency && !welcomeScreen {
 		header = m.headerLines(standard)
 	}
-	if m.choosing != "" && m.pendingApproval == nil {
-		footerRows := 0
-		if !emergency {
-			footerRows = 1
-		}
-		body = m.renderChooser(height - len(header) - footerRows)
-		if footerRows == 1 {
-			footer = []string{uiMutedStyle.Render("↑/↓ select · Enter choose · Esc back")}
-		}
-	} else if m.pendingApproval == nil && (m.diffView != nil || m.diffLoading || m.outputRef != "") {
-		available := max(0, height-len(header))
-		inspection := m.renderDiffView(available)
-		if m.diffView == nil && !m.diffLoading {
-			inspection = m.renderOutputView(available)
-		}
-		body = strings.Split(strings.TrimSuffix(inspection, "\n"), "\n")
-	} else {
-		footer = m.renderBottom(emergency, standard)
-		available := max(0, height-len(header)-len(footer))
-		transcript := m.conversationLines(available)
-		if len(transcript) > available {
-			transcript = transcript[len(transcript)-available:]
-		}
-		body = transcript
+	footer := m.renderBottom(emergency, standard)
+	status := "Connected"
+	if m.standalone {
+		status = "Standalone"
 	}
-	return tui.RenderScreen(tui.Screen{
-		Width: width, Height: height, Header: header, Body: body, Footer: footer,
-	})
+	if m.errorText != "" {
+		status = "Needs attention"
+	}
+	m.ui.SetScreenContent(tui.ScreenContent{Header: header, Footer: footer, WelcomeStatus: status, Version: tui.BuildVersion()})
+	return m.ui.View()
 }
 
 func (m *conversationTUI) headerLines(standard bool) []string {
 	return tui.RenderHeader(tui.Header{
-		Width: m.width, Model: terminalText(m.startParams.Model), Workspace: terminalText(m.workspace),
+		Width: m.ui.Width, Model: terminalText(m.startParams.Model), Workspace: terminalText(m.workspace),
 		GitBranch: terminalText(m.gitBranch), State: terminalText(m.state), Standard: standard,
 	})
-}
-
-func (m *conversationTUI) renderChooser(height int) []string {
-	label := "Choose a project"
-	if m.choosing == "conversation" {
-		label = "Choose a conversation"
-	}
-	return tui.RenderChoiceList(tui.ChoiceList{Label: label, Items: m.choices, Cursor: m.cursor, Height: height})
-}
-
-func (m *conversationTUI) conversationLines(available int) []string {
-	if available <= 0 {
-		return nil
-	}
-	var lines []string
-	if len(m.transcript.Blocks) > 0 {
-		lines = m.computeVisibleLines()
-	}
-	if len(lines) == 0 && len(m.transcript.Blocks) == 0 && m.streamingText == "" {
-		if m.state == "running" {
-			lines = []string{uiMutedStyle.Render("Working…")}
-		} else {
-			status := "Connected"
-			if m.standalone {
-				status = "Standalone"
-			}
-			if m.errorText != "" {
-				status = "Needs attention"
-			}
-			lines = tui.RenderWelcome(tui.Welcome{
-				Width: m.width, Height: available, Model: m.startParams.Model,
-				Workspace: m.workspace, GitBranch: m.gitBranch, Version: conversationBuildVersion(), Status: status,
-			})
-		}
-	}
-	if m.streamingText != "" && m.activeBlockID == "" {
-		lines = append(lines, uiBuddyStyle.Render("Buddy"))
-		if rendered, err := tui.RenderMarkdown(terminalText(m.streamingText), max(1, m.width-4)); err == nil {
-			lines = append(lines, strings.Split(rendered, "\n")...)
-		} else {
-			lines = append(lines, strings.Split(terminalText(m.streamingText), "\n")...)
-		}
-	}
-	return lines
-}
-
-func conversationBuildVersion() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
-		return "dev"
-	}
-	if strings.HasPrefix(info.Main.Version, "v0.0.0-") {
-		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" && len(setting.Value) >= 7 {
-				return "dev+" + setting.Value[:7]
-			}
-		}
-		return "dev"
-	}
-	return info.Main.Version
 }
 
 func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
@@ -1601,14 +995,10 @@ func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
 		}
 	}
 	var approvalView, approvalKeys string
-	if request := m.pendingApproval; request != nil {
-		approvalKeys = m.approvalActions(*request)
-		modalHeight := min(max(2, m.height/2), max(2, m.height))
-		if m.approvalModal != nil {
-			approvalView = m.approvalModal.View(approvalViewRequest(*request), m.width, modalHeight)
-		} else {
-			approvalView = "Resize terminal to decide"
-		}
+	if m.hasPendingApproval() {
+		approvalKeys = m.ui.ApprovalActionRow()
+		modalHeight := min(max(2, m.ui.Height/2), max(2, m.ui.Height))
+		approvalView = m.ui.ApprovalView(modalHeight)
 	}
 	composer := m.renderTextarea()
 	var renderedError string
@@ -1616,214 +1006,16 @@ func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
 		renderedError = errStyle.Render(terminalText(m.errorText))
 	}
 	return tui.RenderFooter(tui.Footer{
-		Width: m.width, Height: m.height, Emergency: emergency, Standard: standard,
-		PendingApproval: m.pendingApproval != nil, ApprovalView: approvalView, ApprovalKeys: approvalKeys,
+		Width: m.ui.Width, Height: m.ui.Height, Emergency: emergency, Standard: standard,
+		PendingApproval: m.hasPendingApproval(), ApprovalView: approvalView, ApprovalKeys: approvalKeys,
 		Queued: queued, Steering: steering, Error: renderedError,
 		HasError: m.errorText != "", Completion: m.completionLines(), Composer: composer,
-		State: m.state, Standalone: m.standalone, TranscriptFocused: m.transcriptFocused,
+		State: m.state, Standalone: m.standalone, TranscriptFocused: m.ui.TranscriptFocused,
 	})
-}
-
-func (m *conversationTUI) approvalActions(request protocol.PermissionRequestNotification) string {
-	if m.approvalModal == nil {
-		return "Resize terminal to decide"
-	}
-	return m.approvalModal.ActionRow(approvalViewRequest(request), max(1, m.width))
 }
 
 func (m *conversationTUI) completionLines() []string {
-	return tui.RenderCompletion(tui.CompletionView{
-		Kind: m.completionKind, Commands: m.commandMatches, Files: m.fileMatches,
-		Cursor: m.completionCursor, Start: m.completionWindowStart(), Rows: m.completionRows(),
-	})
-}
-
-func (m *conversationTUI) renderOutputView(height int) string {
-	var header, notices strings.Builder
-	var lines []string
-	header.WriteString(uiTitleStyle.Render("Tool output") + "  ·  " + uiMutedStyle.Render(m.outputRef) + "\n")
-	if m.outputLoading {
-		header.WriteString("Loading output page…\n")
-	} else if m.outputPage != nil {
-		byteStart := int64(0)
-		if m.outputPageIndex < len(m.outputPageStarts) {
-			byteStart = m.outputPageStarts[m.outputPageIndex]
-		}
-		end := byteStart + int64(len(m.outputPage.Data))
-		byteRange := "No output bytes"
-		if end > byteStart {
-			byteRange = fmt.Sprintf("Bytes %d–%d of %d", byteStart+1, end, m.outputPage.TotalBytes)
-		}
-		header.WriteString(uiMutedStyle.Render(byteRange) + "\n\n")
-		lines = strings.Split(m.outputPage.Data, "\n")
-		if m.outputPage.Truncated {
-			notices.WriteString(errStyle.Render("Output capped at 1 MiB; rerun the command with narrower output.") + "\n")
-		}
-		if !m.outputPage.HasMore {
-			notices.WriteString(uiMutedStyle.Render("End of available output") + "\n")
-		}
-	}
-	top, footer, rows := m.inspectionLayout(height, header.String(), notices.String(), "↑/↓ scroll · ←/→ pan · PageUp/PageDown pages · Esc returns to activity")
-	var b strings.Builder
-	b.WriteString(top)
-	m.writeInspectionLines(&b, lines, m.outputLineScroll, rows)
-	b.WriteString(footer)
-	return b.String()
-}
-
-func (m *conversationTUI) renderDiffView(height int) string {
-	var header, notices strings.Builder
-	header.WriteString(uiTitleStyle.Render("Working tree diff") + "  ·  " + uiMutedStyle.Render("/diff") + "\n")
-	var files []protocol.DiffFileEntry
-	if m.diffView != nil && !m.diffLoading {
-		files = m.diffView.Files
-	}
-	if m.diffLoading {
-		header.WriteString("Inspecting Git changes…\n")
-	} else if len(files) == 0 {
-		header.WriteString("No changed files found.\n")
-	} else if !m.diffFileOpen {
-		header.WriteString(fmt.Sprintf("%d files  ·  +%d  −%d\n\n", m.diffView.Stats.FilesChanged, m.diffView.Stats.Additions, m.diffView.Stats.Deletions))
-	} else {
-		f := files[m.diffSelected]
-		header.WriteString(terminalText(f.Path) + "  ·  " + diffAttributionLabel(f) + "\n")
-		if notice := diffFileNotice(f); notice != "" {
-			header.WriteString(uiMutedStyle.Render(notice) + "\n")
-		}
-	}
-	if m.diffView != nil && !m.diffLoading {
-		if m.diffView.Warning != "" {
-			notices.WriteString(errStyle.Render(terminalText(m.diffView.Warning)) + "\n")
-		}
-		if m.diffView.OmittedPaths > 0 {
-			notices.WriteString(uiMutedStyle.Render(fmt.Sprintf("%d paths omitted because they could not be represented or read safely", m.diffView.OmittedPaths)) + "\n")
-		}
-		if m.diffView.Truncated {
-			notices.WriteString(errStyle.Render("Diff output was capped to fit the safe response limit.") + "\n")
-		}
-	}
-	hint := "↑/↓ files · Enter open · Esc close"
-	if m.diffLoading {
-		hint = "Esc close"
-	} else if m.diffFileOpen {
-		hint = "↑/↓ scroll · ←/→ pan · PageUp/PageDown hunks · Esc file list"
-	}
-	top, footer, rows := m.inspectionLayout(height, header.String(), notices.String(), hint)
-	var b strings.Builder
-	b.WriteString(top)
-	if len(files) > 0 && m.diffFileOpen {
-		m.writeInspectionLines(&b, strings.Split(files[m.diffSelected].Diff, "\n"), m.diffScroll, rows)
-	} else if len(files) > 0 {
-		start := max(0, min(m.diffSelected-rows+1, len(files)-rows))
-		for i := start; i < min(len(files), start+rows); i++ {
-			f := files[i]
-			marker := "  "
-			if i == m.diffSelected {
-				marker = "› "
-			}
-			path := strings.ReplaceAll(f.Path, "\n", " ")
-			line := fmt.Sprintf("%s%s %-18s %s", marker, inspectionText(path), diffAttributionLabel(f), diffFileNotice(f))
-			b.WriteString(ansi.Truncate(line, max(1, m.width), "…") + "\n")
-		}
-	}
-	b.WriteString(footer)
-	return b.String()
-}
-
-func (m *conversationTUI) inspectionLayout(height int, header, notices, hint string) (string, string, int) {
-	if m.errorText != "" {
-		notices += errStyle.Render(terminalText(m.errorText)) + "\n"
-	}
-	controls := tui.WrapLines(uiMutedStyle.Render(hint), m.width)
-	if len(controls) > height {
-		controls = tui.WrapLines(uiMutedStyle.Render("Esc close"), m.width)
-	}
-	controls = controls[:min(len(controls), max(0, height))]
-	headerRows := tui.WrapLines(strings.TrimSuffix(header, "\n"), m.width)
-	headerRows = headerRows[:min(len(headerRows), max(0, height-len(controls)))]
-	noticeRows := tui.WrapLines(notices, m.width)
-	noticeRows = noticeRows[:min(len(noticeRows), max(0, height-len(controls)-len(headerRows)))]
-	rows := max(0, height-len(headerRows)-len(noticeRows)-len(controls))
-	return strings.Join(append(headerRows, ""), "\n"), strings.Join(append(noticeRows, controls...), "\n"), rows
-}
-
-func (m *conversationTUI) writeInspectionLines(b *strings.Builder, lines []string, offset, rows int) {
-	start := min(offset, max(0, len(lines)-1))
-	for _, line := range lines[start:min(len(lines), start+rows)] {
-		b.WriteString(m.inspectionLine(line) + "\n")
-	}
-}
-
-func inspectionText(line string) string {
-	return strings.ReplaceAll(terminalText(line), "\t", "    ")
-}
-
-func (m *conversationTUI) inspectionLine(line string) string {
-	return ansi.Cut(inspectionText(line), m.inspectionColumn, m.inspectionColumn+max(1, m.width))
-}
-
-func (m *conversationTUI) panInspection(content string, right bool) {
-	step := max(1, m.width/2)
-	if !right {
-		m.inspectionColumn = max(0, m.inspectionColumn-step)
-		return
-	}
-	longest := 0
-	for line := range strings.SplitSeq(content, "\n") {
-		longest = max(longest, ansi.StringWidth(inspectionText(line)))
-	}
-	m.inspectionColumn = min(max(0, longest-max(1, m.width)), m.inspectionColumn+step)
-}
-
-func diffAttributionLabel(f protocol.DiffFileEntry) string {
-	if f.AttributionUnknown {
-		return "Unknown"
-	}
-	if f.IsBuddyEdit && f.WasDirtyAtStart {
-		return "Buddy + pre-existing"
-	}
-	if f.IsBuddyEdit {
-		return "Buddy edit"
-	}
-	if f.WasDirtyAtStart {
-		return "Pre-existing"
-	}
-	return "Unknown"
-}
-
-func diffFileNotice(f protocol.DiffFileEntry) string {
-	var values []string
-	if f.IsBinary {
-		values = append(values, "binary omitted")
-	}
-	if f.Truncated {
-		values = append(values, "truncated")
-	}
-	return strings.Join(values, ", ")
-}
-
-func (m *conversationTUI) moveDiffHunk(direction int) {
-	if m.diffView == nil || m.diffSelected >= len(m.diffView.Files) {
-		return
-	}
-	lines := strings.Split(m.diffView.Files[m.diffSelected].Diff, "\n")
-	if direction > 0 {
-		for i := m.diffScroll + 1; i < len(lines); i++ {
-			if strings.HasPrefix(lines[i], "@@") {
-				m.diffScroll = i
-				return
-			}
-		}
-		m.diffScroll = min(len(lines)-1, m.diffScroll+max(1, m.height/2))
-		return
-	}
-	for i := m.diffScroll - 1; i >= 0; i-- {
-		if strings.HasPrefix(lines[i], "@@") {
-			m.diffScroll = i
-			return
-		}
-	}
-	m.diffScroll = max(0, m.diffScroll-max(1, m.height/2))
+	return m.ui.Composer.CompletionView(m.completionRows())
 }
 
 func (m *conversationTUI) start(prompt string) tea.Cmd {
@@ -1856,63 +1048,11 @@ func (m *conversationTUI) loadGitBranch() tea.Cmd {
 	}
 }
 
-func (m *conversationTUI) selectActivity(delta int) {
-	activities := make([]string, 0)
-	for _, block := range m.transcript.Blocks {
-		if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity {
-			continue
-		}
-		if block.ParentID == "" || parentActivityExpanded(block, m.transcript.Blocks) {
-			activities = append(activities, block.ID)
-		}
-	}
-	if len(activities) == 0 {
-		m.selectedActivity = ""
-		return
-	}
-	index := 0
-	for i, id := range activities {
-		if id == m.selectedActivity {
-			index = i
-			break
-		}
-	}
-	index = max(0, min(len(activities)-1, index+delta))
-	previous := m.selectedActivity
-	m.selectedActivity = activities[index]
-	if previous != m.selectedActivity {
-		m.invalidateActivityCache(previous)
-	}
-	m.invalidateActivityCache(m.selectedActivity)
-	selectedParent := m.transcript.Blocks[m.blockIndex(m.selectedActivity)].ParentID
-	selectedBlock := m.selectedActivity
-	if selectedParent != "" {
-		selectedBlock = selectedParent
-	}
-	rowsAfter := 0
-	for i := len(m.transcript.Blocks) - 1; i >= 0; i-- {
-		block := m.transcript.Blocks[i]
-		count := m.getBlockLineCount(block, m.width)
-		if block.ID == selectedBlock {
-			row := count / 2
-			if selectedParent != "" {
-				rendered, childOffset := m.renderBlock(block, m.width)
-				if childOffset >= 0 {
-					row = len(tui.WrapLines(rendered[:childOffset], m.width))
-				}
-			}
-			m.transcript.ScrollOffset = max(0, rowsAfter+count-row-m.viewportHeight()/2)
-			break
-		}
-		rowsAfter += count
-	}
-}
-
-func (m *conversationTUI) readOutputPage(ref string, offset int64) tea.Cmd {
+func (m *conversationTUI) readOutputPage(ref string, offset int64, generation uint64) tea.Cmd {
 	conversationID := m.conversation
 	return func() tea.Msg {
 		result, err := m.client.ReadOutput(protocol.OutputReadParams{ConversationID: conversationID, OutputRef: ref, Offset: offset})
-		return outputPageMsg{ref: ref, start: offset, result: result, err: err}
+		return outputPageMsg{generation: generation, ref: ref, start: offset, result: result, err: err}
 	}
 }
 
@@ -1926,13 +1066,16 @@ func (m *conversationTUI) changeOutputPage(delta int) tea.Cmd {
 	}
 	if index < len(m.outputPageStarts) {
 		m.outputLoading = true
-		return m.readOutputPage(m.outputRef, m.outputPageStarts[index])
+		_, _ = m.ui.Update(tui.Event{Kind: tui.EventInspectionPageLoading, InspectionGeneration: m.inspectionGeneration})
+		return m.readOutputPage(m.ui.InspectionRef(), m.outputPageStarts[index], m.inspectionGeneration)
 	}
-	if delta > 0 && m.outputPage != nil && m.outputPage.HasMore {
-		offset := m.outputPage.NextOffset
+	page := m.ui.CurrentOutputPage()
+	if delta > 0 && page != nil && page.HasMore {
+		offset := page.NextOffset
 		m.outputPageStarts = append(m.outputPageStarts, offset)
 		m.outputLoading = true
-		return m.readOutputPage(m.outputRef, offset)
+		_, _ = m.ui.Update(tui.Event{Kind: tui.EventInspectionPageLoading, InspectionGeneration: m.inspectionGeneration})
+		return m.readOutputPage(m.ui.InspectionRef(), offset, m.inspectionGeneration)
 	}
 	return nil
 }
@@ -1947,14 +1090,27 @@ func indexInt64(values []int64, value int64) int {
 }
 
 func (m *conversationTUI) inspectDiff() tea.Cmd {
+	m.ensureUIModel()
 	conversationID := m.conversation
-	m.diffRequestGeneration++
-	generation := m.diffRequestGeneration
-	m.diffLoading = true
+	m.inspectionGeneration++
+	generation := m.inspectionGeneration
+	_, _ = m.ui.Update(tui.Event{Kind: tui.EventInspectionStart, InspectionKind: tui.InspectionDiff, InspectionGeneration: generation})
 	return func() tea.Msg {
 		result, err := m.client.InspectDiff(protocol.DiffInspectParams{ConversationID: conversationID})
 		return diffInspectMsg{generation: generation, result: result, err: err}
 	}
+}
+
+func toTUIDiffView(result *protocol.DiffInspectResult) *tui.DiffView {
+	if result == nil {
+		return &tui.DiffView{}
+	}
+	view := &tui.DiffView{Stats: tui.DiffStats{FilesChanged: result.Stats.FilesChanged, Additions: result.Stats.Additions, Deletions: result.Stats.Deletions}, Warning: result.Warning, OmittedPaths: result.OmittedPaths, Truncated: result.Truncated}
+	view.Files = make([]tui.DiffFile, len(result.Files))
+	for i, file := range result.Files {
+		view.Files[i] = tui.DiffFile{Path: file.Path, Diff: file.Diff, WasDirtyAtStart: file.WasDirtyAtStart, IsBuddyEdit: file.IsBuddyEdit, AttributionUnknown: file.AttributionUnknown, IsBinary: file.IsBinary, Truncated: file.Truncated}
+	}
+	return view
 }
 
 func (m *conversationTUI) submit(prompt string, mode persistence.SubmissionMode) tea.Cmd {
@@ -1977,6 +1133,23 @@ func (m *conversationTUI) submit(prompt string, mode persistence.SubmissionMode)
 	return func() tea.Msg {
 		result, err := m.client.SubmitConversation(params)
 		return conversationSubmittedMsg{result: result, prompt: prompt, mode: mode, err: err}
+	}
+}
+
+func (m *conversationTUI) interruptTurn() tea.Cmd {
+	if m.conversation == "" {
+		return func() tea.Msg { return errorMessage(fmt.Errorf("no active conversation")) }
+	}
+	return func() tea.Msg {
+		result, err := m.client.SyncConversation(protocol.ConversationSyncParams{ConversationID: m.conversation})
+		if err != nil {
+			return errorMessage(err)
+		}
+		if result.ActiveTurnID == "" {
+			return errorMessage(fmt.Errorf("no active turn to interrupt"))
+		}
+		_, err = m.client.InterruptTurn(protocol.TurnInterruptParams{ConversationID: m.conversation, TurnID: result.ActiveTurnID})
+		return errorMessage(err)
 	}
 }
 
@@ -2025,15 +1198,114 @@ func (m *conversationTUI) watchPermission() tea.Cmd {
 	}
 }
 
-func (m *conversationTUI) respondPermission(params protocol.PermissionRespondParams) tea.Cmd {
-	request := m.pendingApproval
+func (m *conversationTUI) hasPendingApproval() bool {
+	return len(m.pendingApprovals) > 0
+}
+
+func (m *conversationTUI) activeApproval() *pendingApprovalRequest {
+	if len(m.pendingApprovals) == 0 {
+		return nil
+	}
+	return &m.pendingApprovals[0]
+}
+
+func (m *conversationTUI) approvalForGeneration(generation uint64) *pendingApprovalRequest {
+	active := m.activeApproval()
+	if active == nil || generation == 0 || active.generation != generation {
+		return nil
+	}
+	return active
+}
+
+func (m *conversationTUI) addPendingApproval(request protocol.PermissionRequestNotification) {
+	index := -1
+	for i := range m.pendingApprovals {
+		if m.pendingApprovals[i].request.RequestID == request.RequestID {
+			index = i
+			break
+		}
+	}
+	var generation uint64
+	if index >= 0 && m.pendingApprovals[index].request.ConversationID == request.ConversationID && m.pendingApprovals[index].request.TurnID == request.TurnID {
+		m.pendingApprovals[index].request = request
+	} else {
+		m.approvalGeneration++
+		generation = m.approvalGeneration
+		pending := pendingApprovalRequest{request: request, generation: generation}
+		if index >= 0 {
+			m.pendingApprovals[index] = pending
+		} else {
+			m.pendingApprovals = append(m.pendingApprovals, pending)
+		}
+	}
+	requests := make([]protocol.PermissionRequestNotification, len(m.pendingApprovals))
+	for i := range m.pendingApprovals {
+		requests[i] = m.pendingApprovals[i].request
+	}
+	m.setPendingApprovals(requests)
+}
+
+func (m *conversationTUI) resolvePendingApproval(requestID string, generation uint64) bool {
+	index := -1
+	for i, pending := range m.pendingApprovals {
+		if pending.request.RequestID == requestID && pending.generation == generation {
+			index = i
+			continue
+		}
+	}
+	if index < 0 {
+		return false
+	}
+	copy(m.pendingApprovals[index:], m.pendingApprovals[index+1:])
+	m.pendingApprovals = m.pendingApprovals[:len(m.pendingApprovals)-1]
+	_, _ = m.ui.Update(tui.Event{Kind: tui.EventApprovalResolved, ApprovalGeneration: generation})
+	if !m.hasPendingApproval() && !m.ui.TranscriptFocused {
+		m.ui.Composer.Editor.Focus()
+	}
+	return true
+}
+
+func (m *conversationTUI) setPendingApprovals(requests []protocol.PermissionRequestNotification) {
+	wasPending := m.hasPendingApproval()
+	type approvalIdentity struct{ requestID, conversationID, turnID string }
+	previous := make(map[approvalIdentity]uint64, len(m.pendingApprovals))
+	for _, pending := range m.pendingApprovals {
+		request := pending.request
+		previous[approvalIdentity{request.RequestID, request.ConversationID, request.TurnID}] = pending.generation
+	}
+	next := make([]pendingApprovalRequest, 0, len(requests))
+	visible := make([]tui.ApprovalRequest, 0, len(requests))
+	for _, request := range requests {
+		if request.RequestID == "" || request.ConversationID == "" || request.TurnID == "" {
+			continue
+		}
+		generation := previous[approvalIdentity{request.RequestID, request.ConversationID, request.TurnID}]
+		if generation == 0 {
+			m.approvalGeneration++
+			generation = m.approvalGeneration
+		}
+		next = append(next, pendingApprovalRequest{request: request, generation: generation})
+		visible = append(visible, approvalViewRequest(request, generation))
+	}
+	m.pendingApprovals = next
+	_, _ = m.ui.Update(tui.Event{Kind: tui.EventApprovalSnapshot, Approvals: visible})
+	if m.hasPendingApproval() && !m.ui.TranscriptFocused {
+		m.ui.Composer.Editor.Blur()
+	} else if wasPending && !m.hasPendingApproval() && !m.ui.TranscriptFocused {
+		m.ui.Composer.Editor.Focus()
+	}
+}
+
+func (m *conversationTUI) respondPermission(request *pendingApprovalRequest, params protocol.PermissionRespondParams) tea.Cmd {
 	if request == nil {
 		return nil
 	}
-	params.RequestID, params.ConversationID, params.TurnID = request.RequestID, request.ConversationID, request.TurnID
+	requestID := request.request.RequestID
+	generation := request.generation
+	params.RequestID, params.ConversationID, params.TurnID = request.request.RequestID, request.request.ConversationID, request.request.TurnID
 	return func() tea.Msg {
 		err := m.client.RespondConversationPermissionParams(params)
-		return permissionRespondedMsg{requestID: request.RequestID, err: err}
+		return permissionRespondedMsg{requestID: requestID, generation: generation, err: err}
 	}
 }
 
@@ -2046,20 +1318,16 @@ func (m *conversationTUI) syncConversation() tea.Cmd {
 }
 
 func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
-	hadPendingApproval := m.pendingApproval != nil
-	m.streamingText = ""
-	m.deltaBuffer.Reset()
-	m.tickerActive = false
-	m.activeBlockID = ""
-	m.pendingApproval = nil
-	m.approvalModal = nil
+	m.ensureUIModel()
+	m.ui.ResetStreaming()
 	if result == nil {
+		m.setPendingApprovals(nil)
 		return
 	}
 	activitiesByTurn := make(map[string][]TranscriptBlock)
 	var activityTurns []string
 	if m.conversation == result.ConversationID && m.workerEpoch == result.WorkerEpoch {
-		for _, block := range m.transcript.Blocks {
+		for _, block := range m.ui.Transcript.Blocks {
 			if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity {
 				continue
 			}
@@ -2069,7 +1337,10 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			activitiesByTurn[block.TurnID] = append(activitiesByTurn[block.TurnID], block)
 		}
 	} else {
-		m.selectedActivity, m.outputRef, m.outputPage, m.outputLoading = "", "", nil, false
+		m.ui.SelectedActivity = ""
+		m.inspectionGeneration++
+		m.outputPageStarts, m.outputPageIndex, m.outputLoading = nil, 0, false
+		_, _ = m.ui.Update(tui.Event{Kind: tui.EventInspectionClosed})
 	}
 	m.conversation, m.state = result.ConversationID, result.State
 	m.workerEpoch = result.WorkerEpoch
@@ -2078,16 +1349,7 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	} else if strings.HasPrefix(m.errorText, "Execution is paused: ") {
 		m.errorText = ""
 	}
-	if len(result.PendingApprovals) > 0 {
-		request := result.PendingApprovals[0]
-		m.pendingApproval = &request
-		m.approvalModal = newApprovalModalState(request.Arguments, m.width, m.height)
-		if !m.transcriptFocused {
-			m.textarea.Blur()
-		}
-	} else if hadPendingApproval && !m.transcriptFocused {
-		m.textarea.Focus()
-	}
+	m.setPendingApprovals(result.PendingApprovals)
 	m.lastSequence = result.EventWatermark
 	restoredBlocks := make([]TranscriptBlock, 0, len(result.Transcript))
 	m.queued, m.steers = nil, nil
@@ -2147,55 +1409,23 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			restoredBlocks = append(restoredBlocks, activitiesByTurn[turnID]...)
 		}
 	}
-	m.transcript.Replace(restoredBlocks)
+	_, _ = m.ui.Update(tui.Event{Kind: tui.EventSnapshot, Blocks: restoredBlocks})
+	m.syncUIRenderState()
 }
 
 func (m *conversationTUI) renderTextarea() string {
 	defer func() {
 		_ = recover()
 	}()
-	return m.textarea.View()
-}
-
-func newConversationComposer() textarea.Model {
-	input := textarea.New()
-	input.ShowLineNumbers = false
-	input.Placeholder = "Ask Buddy anything…"
-	input.SetHeight(1)
-	input.SetStyles(textarea.DefaultStyles(true))
-	input.Prompt = "› "
-	input.SetVirtualCursor(true)
-	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"), key.WithHelp("shift+enter", "new line"))
-	input.Focus()
-	return input
-}
-
-func (m *conversationTUI) resizeComposer() {
-	maxRows := 5
-	if m.width < 80 || m.height < 24 {
-		maxRows = 3
-	}
-	if m.width < 40 || m.height < 12 {
-		maxRows = 1
-	}
-	rows := 1
-	if strings.TrimSpace(m.textarea.Value()) != "" {
-		width := max(1, m.textarea.Width())
-		rows = 0
-		for _, line := range strings.Split(m.textarea.Value(), "\n") {
-			rows += max(1, (ansi.StringWidth(line)+width-1)/width)
-		}
-		rows = min(maxRows, max(1, rows))
-	}
-	m.textarea.SetHeight(rows)
+	return m.ui.Composer.Editor.View()
 }
 
 func (m *conversationTUI) viewportHeight() int {
-	return max(0, m.height-m.viewportOverhead()-m.completionRows())
+	return max(0, m.ui.Height-m.viewportOverhead()-m.completionRows())
 }
 
 func (m *conversationTUI) viewportOverhead() int {
-	width, height := max(1, m.width), max(1, m.height)
+	width, height := max(1, m.ui.Width), max(1, m.ui.Height)
 	emergency := width < 40 || height < 12
 	standard := width >= 80 && height >= 24
 	headerHeight := 0
@@ -2205,7 +1435,7 @@ func (m *conversationTUI) viewportOverhead() int {
 			headerHeight = 2
 		}
 	}
-	composerHeight := max(1, m.textarea.Height())
+	composerHeight := max(1, m.ui.Composer.Editor.Height())
 	if standard && width >= 40 {
 		composerHeight += 2
 	}
@@ -2214,32 +1444,25 @@ func (m *conversationTUI) viewportOverhead() int {
 		footerHeight = 1
 	}
 	overhead := headerHeight + footerHeight
-	if m.pendingApproval != nil && emergency {
+	if m.hasPendingApproval() && emergency {
 		if height <= 1 {
 			return 1
 		}
 		modalHeight := min(max(2, height/2), max(2, height))
-		if m.approvalModal != nil {
-			return lipgloss.Height(m.approvalModal.View(approvalViewRequest(*m.pendingApproval), width, modalHeight))
-		}
-		return 1
+		return lipgloss.Height(m.ui.ApprovalView(modalHeight))
 	}
-	if m.pendingApproval == nil || !emergency {
+	if !m.hasPendingApproval() || !emergency {
 		overhead += composerHeight
 	}
 	if len(m.queued)+len(m.steers)+len(m.pendingStart) > 0 {
 		overhead++
 	}
-	if m.pendingApproval != nil {
+	if m.hasPendingApproval() {
 		if height <= 1 {
 			overhead++
 		} else {
 			modalHeight := min(max(2, height/2), max(2, height))
-			if m.approvalModal != nil {
-				overhead += lipgloss.Height(m.approvalModal.View(approvalViewRequest(*m.pendingApproval), width, modalHeight))
-			} else {
-				overhead++
-			}
+			overhead += lipgloss.Height(m.ui.ApprovalView(modalHeight))
 		}
 	}
 	if m.errorText != "" {
@@ -2249,73 +1472,60 @@ func (m *conversationTUI) viewportOverhead() int {
 }
 
 func (m *conversationTUI) completionRows() int {
-	if m.completionKind == "" {
+	if m.ui.Composer.CompletionKind() == "" {
 		return 0
 	}
-	return min(8, min(m.completionCount(), max(0, m.height-m.viewportOverhead()-4)))
+	return min(8, min(m.ui.Composer.CompletionCount(), max(0, m.ui.Height-m.viewportOverhead()-4)))
 }
 
-func (m *conversationTUI) completionWindowStart() int {
-	rows := m.completionRows()
-	return min(max(0, m.completionCursor-rows+1), max(0, m.completionCount()-rows))
-}
-
-func (m *conversationTUI) clearCache() { m.transcript.ClearCache() }
-
-func (m *conversationTUI) invalidateBlockCache(blockID string) {
-	m.transcript.Invalidate(blockID)
-}
-
-func (m *conversationTUI) invalidateActivityCache(blockID string) {
-	if index := m.blockIndex(blockID); index >= 0 {
-		m.invalidateBlockCache(blockID)
-		if parentID := m.transcript.Blocks[index].ParentID; parentID != "" {
-			m.invalidateBlockCache(parentID)
-		}
+func (m *conversationTUI) ensureUIModel() {
+	if m.ui == nil {
+		m.ui = tui.NewModel(tui.Header{Model: m.startParams.Model, Workspace: m.workspace})
 	}
+	if m.ui.Composer == nil {
+		m.ui.Composer = tui.NewComposer(nil)
+	}
+	m.ui.Metadata.Model = m.startParams.Model
+	m.ui.Metadata.Workspace = m.workspace
+	m.ui.Metadata.GitBranch = m.gitBranch
+	m.ui.State = m.state
 }
+
+func (m *conversationTUI) syncUIRenderState() {
+	m.ensureUIModel()
+	m.ui.Metadata.Model = m.startParams.Model
+	m.ui.Metadata.Workspace = m.workspace
+	m.ui.Metadata.GitBranch = m.gitBranch
+	m.ui.State = m.state
+	m.ui.Transcript.SetRenderState(m.ui.StreamingText(), m.ui.SelectedActivity, m.ui.TranscriptFocused)
+}
+
+func (m *conversationTUI) clearCache() { m.ensureUIModel(); m.ui.Transcript.ClearCache() }
 
 func (m *conversationTUI) appendBlock(block TranscriptBlock) {
+	m.ensureUIModel()
 	if block.ID == "" {
 		block.ID = newConversationID("block")
 	}
 	m.setTranscriptRenderState()
-	m.transcript.Append(block, m.width)
-}
-
-func (m *conversationTUI) blockIndex(id string) int { return m.transcript.Index(id) }
-
-func (m *conversationTUI) updateBlock(index int, update func(*TranscriptBlock)) {
-	m.setTranscriptRenderState()
-	m.transcript.Update(index, update, m.width)
-}
-
-func (m *conversationTUI) getBlockLineCount(block TranscriptBlock, width int) int {
-	m.setTranscriptRenderState()
-	return m.transcript.LineCount(block, width)
+	m.ui.Transcript.Append(block, m.ui.Width)
 }
 
 func (m *conversationTUI) getWrappedLines(block TranscriptBlock, width int) []string {
+	m.ensureUIModel()
 	m.setTranscriptRenderState()
-	return m.transcript.WrappedLines(block, width)
+	return m.ui.Transcript.WrappedLines(block, width)
 }
 
 func (m *conversationTUI) renderBlock(block TranscriptBlock, width int) (string, int) {
+	m.ensureUIModel()
 	m.setTranscriptRenderState()
-	return tui.RenderBlock(block, m.transcript.Blocks, width, m.streamingText, m.selectedActivity, m.transcriptFocused)
+	return tui.RenderBlock(block, m.ui.Transcript.Blocks, width, m.ui.StreamingText(), m.ui.SelectedActivity, m.ui.TranscriptFocused)
 }
 
 func (m *conversationTUI) setTranscriptRenderState() {
-	m.transcript.SetRenderState(m.streamingText, m.selectedActivity, m.transcriptFocused)
-}
-
-func parentActivityExpanded(block TranscriptBlock, blocks []TranscriptBlock) bool {
-	for _, parent := range blocks {
-		if parent.ID == block.ParentID {
-			return !parent.Collapsed
-		}
-	}
-	return false
+	m.ensureUIModel()
+	m.ui.Transcript.SetRenderState(m.ui.StreamingText(), m.ui.SelectedActivity, m.ui.TranscriptFocused)
 }
 
 func terminalText(value string) string {
@@ -2328,6 +1538,36 @@ func terminalText(value string) string {
 	}, value)
 }
 
+func tuiEventFromProtocol(msg protocol.SessionEventNotification) (tui.Event, bool) {
+	event := tui.Event{TurnID: msg.TurnID, At: time.Now()}
+	switch msg.Type {
+	case string(agent.EventFinished):
+		event.Kind = tui.EventTurnFinished
+	case string(agent.EventError):
+		event.Kind, event.Text = tui.EventFailure, msg.Content
+	case string(agent.EventTextDelta):
+		event.Kind, event.Text = tui.EventAssistantDelta, msg.Content
+	case string(agent.EventToolCall):
+		event.Kind, event.Activity = tui.EventActivityStarted, activityFromEvent(msg.Data, msg.TurnID)
+	case string(agent.EventToolResult):
+		event.Kind, event.Activity, event.Text = tui.EventActivityCompleted, activityFromEvent(msg.Data, msg.TurnID), msg.Content
+		if msg.Data != nil {
+			if result, ok := msg.Data["tool_result"].(string); ok && result != "" {
+				event.Text = result
+			}
+		}
+	case string(agent.EventReasoning):
+		event.Kind, event.Text, event.Activity = tui.EventReasoning, msg.Content, activityFromEvent(msg.Data, msg.TurnID)
+	case string(agent.EventTextComplete):
+		event.Kind, event.Text, event.Activity = tui.EventAssistantComplete, msg.Content, activityFromEvent(msg.Data, msg.TurnID)
+	case string(agent.EventCompactionStart):
+		event.Kind, event.Text = tui.EventCompactionStatus, "Compacting conversation context…"
+	default:
+		return tui.Event{}, false
+	}
+	return event, true
+}
+
 func activityDataKey(data map[string]any) string {
 	if data == nil {
 		return ""
@@ -2337,13 +1577,6 @@ func activityDataKey(data map[string]any) string {
 		return ""
 	}
 	return activityIdentityKey(id)
-}
-
-func activityIdentity(block TranscriptBlock) string {
-	if block.Activity == nil {
-		return ""
-	}
-	return block.Activity.Identity
 }
 
 func activityFromEvent(data map[string]any, _ string) *tui.Activity {
@@ -2401,36 +1634,48 @@ func activityIdentityKey(id map[string]any) string {
 }
 
 func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {
+	m.ensureUIModel()
 	m.setTranscriptRenderState()
-	return m.transcript.VisibleBlocks(m.viewportHeight(), m.width)
+	return m.ui.Transcript.VisibleBlocks(m.viewportHeight(), m.ui.Width)
 }
 
 func (m *conversationTUI) computeVisibleLines() []string {
+	m.ensureUIModel()
 	m.setTranscriptRenderState()
-	return m.transcript.VisibleLines(m.viewportHeight(), m.width)
+	return m.ui.Transcript.VisibleLines(m.viewportHeight(), m.ui.Width)
 }
 
-func (m *conversationTUI) listWorkspaces() tea.Cmd {
+func (m *conversationTUI) nextPickerGeneration() uint64 {
+	m.pickerGeneration++
+	return m.pickerGeneration
+}
+
+func (m *conversationTUI) nextResumeGeneration() uint64 {
+	m.resumeGeneration++
+	return m.resumeGeneration
+}
+
+func (m *conversationTUI) listWorkspaces(generation uint64) tea.Cmd {
 	return func() tea.Msg {
 		result, err := m.client.ListConversationWorkspaces(50)
 		if err != nil {
-			return conversationResumeListMsg{err: err}
+			return conversationResumeListMsg{generation: generation, err: err}
 		}
-		return conversationResumeListMsg{workspaces: result.Workspaces}
+		return conversationResumeListMsg{generation: generation, workspaces: result.Workspaces}
 	}
 }
 
-func (m *conversationTUI) listConversations(workspace string) tea.Cmd {
+func (m *conversationTUI) listConversations(workspace string, generation uint64) tea.Cmd {
 	return func() tea.Msg {
 		result, err := m.client.ListConversations(protocol.ConversationListParams{WorkspaceDir: workspace, Limit: 50})
 		if err != nil {
-			return conversationListMsg{err: err}
+			return conversationListMsg{generation: generation, err: err}
 		}
-		return conversationListMsg{conversations: result.Conversations}
+		return conversationListMsg{generation: generation, conversations: result.Conversations}
 	}
 }
 
-func (m *conversationTUI) resumeSelected(selected protocol.ConversationSummary) tea.Cmd {
+func (m *conversationTUI) resumeSelected(selected protocol.ConversationSummary, pickerGeneration, resumeGeneration uint64) tea.Cmd {
 	workspace := m.selectedWorkspace
 	startParams := m.startParams
 	loadMCPConfig := m.loadWorkspaceMCPConfig
@@ -2438,18 +1683,21 @@ func (m *conversationTUI) resumeSelected(selected protocol.ConversationSummary) 
 	return func() tea.Msg {
 		resumeParams, mcpConfig, err := conversationResumeParamsForWorkspace(workspace, selected.ConversationID, selected.DBPath, startParams, loadMCPConfig)
 		if err != nil {
-			return conversationResumedMsg{err: err}
+			return conversationResumedMsg{pickerGeneration: pickerGeneration, resumeGeneration: resumeGeneration, err: err}
 		}
 		_, err = api.ResumeConversation(resumeParams)
 		if err != nil {
-			return conversationResumedMsg{err: err}
+			return conversationResumedMsg{pickerGeneration: pickerGeneration, resumeGeneration: resumeGeneration, err: err}
 		}
 		result, err := readConversationSnapshot(api, selected.ConversationID)
-		return conversationResumedMsg{result: result, workspace: workspace, mcpConfig: mcpConfig, updateMCPConfig: true, err: err}
+		return conversationResumedMsg{
+			pickerGeneration: pickerGeneration, resumeGeneration: resumeGeneration, result: result,
+			workspace: workspace, databasePath: selected.DBPath, mcpConfig: mcpConfig, updateMCPConfig: true, err: err,
+		}
 	}
 }
 
-func (m *conversationTUI) resumeEvictedConversation() tea.Cmd {
+func (m *conversationTUI) resumeEvictedConversation(resumeGeneration uint64, sourceConversationID, sourceWorkerEpoch string) tea.Cmd {
 	workspace, conversationID, databasePath := m.workspace, m.conversation, m.databasePath
 	startParams := m.startParams
 	api := m.client
@@ -2458,10 +1706,13 @@ func (m *conversationTUI) resumeEvictedConversation() tea.Cmd {
 		resumeParams.DBPath = databasePath
 		_, err := api.ResumeConversation(resumeParams)
 		if err != nil {
-			return conversationResumedMsg{err: err}
+			return conversationResumedMsg{resumeGeneration: resumeGeneration, sourceConversationID: sourceConversationID, sourceWorkerEpoch: sourceWorkerEpoch, err: err}
 		}
 		result, err := readConversationSnapshot(api, conversationID)
-		return conversationResumedMsg{result: result, workspace: workspace, mcpConfig: startParams.MCPConfig, updateMCPConfig: true, err: err}
+		return conversationResumedMsg{
+			resumeGeneration: resumeGeneration, sourceConversationID: sourceConversationID, sourceWorkerEpoch: sourceWorkerEpoch, result: result,
+			workspace: workspace, databasePath: databasePath, mcpConfig: startParams.MCPConfig, updateMCPConfig: true, err: err,
+		}
 	}
 }
 
