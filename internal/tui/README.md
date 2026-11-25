@@ -8,8 +8,9 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 
 - `Run` owns Bubble Tea startup, terminal cleanup, and context/input/output wiring for the interactive view.
 - `Model` owns canonical transcript blocks, stream reduction, terminal dimensions, transcript scrolling, and display metadata. It reduces protocol-neutral `Event` values; `Action` and `ActionMsg` define the runtime-intent contract used by the command adapter.
+- `Composer` owns the textarea, sizing, prompt history navigation, slash-command matching, and workspace-bounded file completion. The command adapter retains key precedence and sends submitted prompts to the daemon.
 - `InputHistoryRing` loads and stores prompt history at a caller-supplied path.
-- `SlashCommandRegistry` stores and matches composer commands.
+- `SlashCommandRegistry` stores and matches composer commands; `Composer` owns its instance.
 - `Transcript` owns canonical blocks, reading offset, rendered-row caching, reflow, and visible-window selection; `TranscriptBlock` and `Activity` are UI-owned values.
 - `RenderMarkdown` converts source Markdown to terminal output, and `WrapLines` wraps rendered terminal text by display-cell width.
 - `RenderMascot` draws small welcome, compact, or large Unicode half-block pixel art from the checked-in SVG palette; `RenderWelcome` adapts the welcome panel to terminal dimensions and color settings.
@@ -29,12 +30,12 @@ This package owns terminal-facing helpers and presentation state for Buddy's int
 - Transcript bodies retain source Markdown; activity values contain only allowlisted display metadata.
 - The command adapter may map protocol events into transcript blocks, but transcript layout and cache behavior stay in this package.
 - Protocol ordering, stale-event rejection, sync generations, RPCs, and permission policy stay in `internal/cmd`; events passed to `Model` contain no protocol values or arbitrary maps.
-- Composer, picker, approval, and inspection orchestration still live in the command adapter during this migration; their remaining state and event handling are follow-up work.
+- Picker, approval, and inspection state and event handling still live in the command adapter. The Bubble Tea root and key-precedence orchestration also remain there during this migration.
 - Permission policy and protocol response construction stay in `internal/cmd`.
 
 ## Side Effects
 
-- Prompt history reads and writes only the path supplied by the caller.
+- Prompt history reads and writes only the path supplied by the caller; `@` completion reads one directory level from the workspace path supplied by the caller and returns at most 50 matches.
 - Hyperlink formatting reads terminal-related environment variables and may read the current working directory when no workspace is supplied.
 - Markdown rendering reads terminal style environment variables and performs no file or network access.
 - No network, subprocess, daemon, or agent side effects.

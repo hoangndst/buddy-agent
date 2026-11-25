@@ -15,6 +15,7 @@ type FlushMsg struct{}
 // Runtime requests and protocol ordering remain in the command adapter.
 type Model struct {
 	Transcript    Transcript
+	Composer      *Composer
 	Width, Height int
 	Metadata      Header
 	State         string
@@ -28,7 +29,7 @@ type Model struct {
 
 // NewModel creates conversation presentation state for one terminal session.
 func NewModel(metadata Header) *Model {
-	return &Model{Metadata: metadata, Width: 80, Height: 24, State: "ready"}
+	return &Model{Metadata: metadata, Composer: NewComposer(nil), Width: 80, Height: 24, State: "ready"}
 }
 
 // StreamingText returns the accumulated text for the active response.
@@ -61,6 +62,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.Width, m.Height = msg.Width, msg.Height
+		if m.Composer != nil {
+			m.Composer.Resize(msg.Width, msg.Height)
+		}
 		m.Transcript.ClearCache()
 	case tea.MouseWheelMsg:
 		switch msg.Button {

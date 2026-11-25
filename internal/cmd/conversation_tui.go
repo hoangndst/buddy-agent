@@ -17,7 +17,6 @@ import (
 	"time"
 	"unicode"
 
-	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -52,15 +51,6 @@ type conversationTUI struct {
 	approvalModal          *tui.ApprovalModal
 	queued                 []string
 	steers                 []string
-	textarea               textarea.Model
-	history                *tui.InputHistoryRing
-	slashCommands          tui.SlashCommandRegistry
-	completionKind         string
-	commandMatches         []tui.SlashCommand
-	fileMatches            []string
-	completionCursor       int
-	completionStart        int
-	completionEnd          int
 	errorText              string
 	choosing               string
 	choices                []string
@@ -219,7 +209,6 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 	if !containsConversationMethods(capabilities.Methods) {
 		return fmt.Errorf("this daemon does not support M9 conversations; restart it when its current work is safe to stop, then retry")
 	}
-	input := newConversationComposer()
 	historyPath := os.Getenv("BUDDY_HISTORY_FILE")
 	if historyPath == "" {
 		home, homeErr := os.UserHomeDir()
@@ -229,6 +218,8 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 		historyPath = filepath.Join(home, ".buddy", "history.jsonl")
 	}
 	history, historyErr := tui.NewInputHistoryRing(historyPath)
+	uiModel := tui.NewModel(tui.Header{Model: params.Model, Workspace: workspace})
+	uiModel.Composer.History = history
 	m := &conversationTUI{
 		ctx:          ctx,
 		client:       api,
@@ -237,9 +228,7 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 		databasePath: params.DBPath,
 		standalone:   standalone,
 		state:        "ready",
-		ui:           tui.NewModel(tui.Header{Model: params.Model, Workspace: workspace}),
-		textarea:     input,
-		history:      history,
+		ui:           uiModel,
 	}
 	for _, command := range []tui.SlashCommand{
 		{Name: "/help", Description: "Show available commands"},
@@ -252,7 +241,7 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 		{Name: "/copy", Description: "Copy the transcript"},
 		{Name: "/diff", Description: "Review working-tree changes"},
 	} {
-		m.slashCommands.Register(command)
+		m.ui.Composer.Commands.Register(command)
 	}
 	if historyErr != nil {
 		m.errorText = fmt.Sprintf("load prompt history: %v", historyErr)
@@ -561,11 +550,6 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.inspectionColumn = 0
 		}
 		_, _ = m.ui.Update(msg)
-		func() {
-			defer func() { _ = recover() }()
-			m.textarea.SetWidth(max(1, msg.Width-4))
-			m.resizeComposer()
-		}()
 		if m.approvalModal != nil {
 			m.approvalModal.Resize(msg.Width, msg.Height)
 		}
@@ -606,7 +590,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tui.ActionOpenOutput:
 			m.outputRef, m.outputPageStarts, m.outputPageIndex = msg.Action.Ref, []int64{0}, 0
 			m.outputLineScroll, m.inspectionColumn, m.outputLoading = 0, 0, true
-			m.textarea.Blur()
+			m.ui.Composer.Editor.Blur()
 			return m, m.readOutputPage(msg.Action.Ref, 0)
 		}
 		return m, nil
@@ -694,7 +678,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingApproval = &request
 			m.approvalModal = newApprovalModalState(request.Arguments, m.ui.Width, m.ui.Height)
 			if !m.transcriptFocused {
-				m.textarea.Blur()
+				m.ui.Composer.Editor.Blur()
 			}
 			m.state = "awaiting_approval"
 		}
@@ -706,7 +690,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingApproval = nil
 			m.approvalModal = nil
 			if !m.transcriptFocused {
-				m.textarea.Focus()
+				m.ui.Composer.Editor.Focus()
 			}
 			return m, m.syncConversation()
 		}
@@ -918,10 +902,10 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "f6" && m.choosing == "" {
 			m.transcriptFocused = !m.transcriptFocused
 			if m.transcriptFocused {
-				m.textarea.Blur()
+				m.ui.Composer.Editor.Blur()
 				m.selectActivity(0)
 			} else {
-				m.textarea.Focus()
+				m.ui.Composer.Editor.Focus()
 				m.invalidateActivityCache(m.selectedActivity)
 			}
 			return m, nil
@@ -959,75 +943,53 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		if m.completionKind != "" {
+		if m.ui.Composer.CompletionKind() != "" {
 			switch msg.String() {
 			case "esc":
-				m.completionKind = ""
+				m.ui.Composer.ClearCompletion()
 				return m, nil
 			case "up", "down":
-				items := m.completionCount()
-				if items > 0 {
-					step := -1
-					if msg.String() == "down" {
-						step = 1
-					}
-					m.completionCursor = (m.completionCursor + step + items) % items
+				step := -1
+				if msg.String() == "down" {
+					step = 1
 				}
+				m.ui.Composer.MoveCompletion(step)
 				return m, nil
 			case "tab", "enter":
-				if m.completionCount() > 0 {
-					isEnter := msg.String() == "enter"
-					if m.completionKind == "file" {
-						m.replaceCompletion(m.fileMatches[m.completionCursor])
-						m.completionKind = ""
-						return m, nil
-					}
-					command := m.commandMatches[m.completionCursor]
-					suffix := ""
-					if command.ArgsHint != "" {
-						suffix = " "
-					}
-					m.replaceCompletion(command.Name + suffix)
-					m.completionKind = ""
-					if !isEnter || suffix != "" {
-						return m, nil
-					}
+				if m.ui.Composer.AcceptCompletion(msg.String() == "enter") {
+					return m, nil
 				}
 			}
 		}
-		if m.choosing == "" && m.history != nil {
+		if m.choosing == "" && m.ui.Composer.HasHistory() {
 			switch msg.String() {
 			case "ctrl+p":
-				if prompt, ok := m.history.Previous(m.textarea.Value()); ok {
-					m.textarea.SetValue(prompt)
-					m.textarea.CursorEnd()
-					m.clearCompletion()
+				if prompt, ok := m.ui.Composer.Previous(m.ui.Composer.Editor.Value()); ok {
+					m.ui.Composer.SetValue(prompt, m.ui.Width, m.ui.Height)
+					m.ui.Composer.ClearCompletion()
 				}
 				return m, nil
 			case "ctrl+n":
-				if prompt, ok := m.history.Next(); ok {
-					m.textarea.SetValue(prompt)
-					m.textarea.CursorEnd()
-					m.clearCompletion()
+				if prompt, ok := m.ui.Composer.Next(); ok {
+					m.ui.Composer.SetValue(prompt, m.ui.Width, m.ui.Height)
+					m.ui.Composer.ClearCompletion()
 				}
 				return m, nil
 			case "up":
-				lineInfo := m.textarea.LineInfo()
-				if m.textarea.Line() == 0 && lineInfo.RowOffset == 0 {
-					if prompt, ok := m.history.Previous(m.textarea.Value()); ok {
-						m.textarea.SetValue(prompt)
-						m.textarea.CursorEnd()
-						m.clearCompletion()
+				lineInfo := m.ui.Composer.Editor.LineInfo()
+				if m.ui.Composer.Editor.Line() == 0 && lineInfo.RowOffset == 0 {
+					if prompt, ok := m.ui.Composer.Previous(m.ui.Composer.Editor.Value()); ok {
+						m.ui.Composer.SetValue(prompt, m.ui.Width, m.ui.Height)
+						m.ui.Composer.ClearCompletion()
 						return m, nil
 					}
 				}
 			case "down":
-				lineInfo := m.textarea.LineInfo()
-				if m.textarea.Line() == m.textarea.LineCount()-1 && lineInfo.RowOffset+1 >= lineInfo.Height {
-					if prompt, ok := m.history.Next(); ok {
-						m.textarea.SetValue(prompt)
-						m.textarea.CursorEnd()
-						m.clearCompletion()
+				lineInfo := m.ui.Composer.Editor.LineInfo()
+				if m.ui.Composer.Editor.Line() == m.ui.Composer.Editor.LineCount()-1 && lineInfo.RowOffset+1 >= lineInfo.Height {
+					if prompt, ok := m.ui.Composer.Next(); ok {
+						m.ui.Composer.SetValue(prompt, m.ui.Width, m.ui.Height)
+						m.ui.Composer.ClearCompletion()
 						return m, nil
 					}
 				}
@@ -1073,24 +1035,21 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.String() == "enter" {
-			text := strings.TrimSpace(m.textarea.Value())
+			text := strings.TrimSpace(m.ui.Composer.Editor.Value())
 			if text == "" {
 				return m, nil
 			}
-			m.textarea.Reset()
+			m.ui.Composer.Reset(m.ui.Width, m.ui.Height)
 			m.errorText = ""
-			if m.history != nil {
-				if err := m.history.Add(text); err != nil {
-					m.errorText = fmt.Sprintf("save prompt history: %v", err)
-				}
-				m.history.Reset()
+			if err := m.ui.Composer.AddHistory(text); err != nil {
+				m.errorText = fmt.Sprintf("save prompt history: %v", err)
 			}
 			if text == "/resume" {
 				return m, m.listWorkspaces()
 			}
 			if text == "/help" {
 				var help strings.Builder
-				for _, command := range m.slashCommands.Commands() {
+				for _, command := range m.ui.Composer.Commands.Commands() {
 					help.WriteString(command.Name + " " + command.ArgsHint + "  " + command.Description + "\n")
 				}
 				m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockSystemStatus, Role: "system", Header: "Help", Body: strings.TrimSpace(help.String()), CreatedAt: time.Now()})
@@ -1162,99 +1121,8 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.approvalModal.UpdateEditor(msg)
 		}
 	}
-	var cmd tea.Cmd
-	beforeValue := m.textarea.Value()
-	beforeLine := m.textarea.Line()
-	beforeLineInfo := m.textarea.LineInfo()
-	m.textarea, cmd = m.textarea.Update(msg)
-	m.resizeComposer()
-	if beforeValue != m.textarea.Value() || beforeLine != m.textarea.Line() || beforeLineInfo != m.textarea.LineInfo() {
-		m.updateCompletion()
-	}
+	cmd := m.ui.Composer.Update(msg, m.ui.Width, m.ui.Height, m.workspace)
 	return m, cmd
-}
-
-func (m *conversationTUI) completionCount() int {
-	if m.completionKind == "file" {
-		return len(m.fileMatches)
-	}
-	return len(m.commandMatches)
-}
-
-func (m *conversationTUI) clearCompletion() {
-	m.completionKind = ""
-	m.commandMatches = nil
-	m.fileMatches = nil
-	m.completionCursor = 0
-	m.completionStart = 0
-	m.completionEnd = 0
-}
-
-func (m *conversationTUI) replaceCompletion(value string) {
-	text := m.textarea.Value()
-	if m.completionStart <= m.completionEnd && m.completionEnd <= len(text) {
-		m.textarea.SetValue(text[:m.completionStart] + value + text[m.completionEnd:])
-		m.textarea.CursorEnd()
-	}
-}
-
-func (m *conversationTUI) updateCompletion() {
-	text := m.textarea.Value()
-	line := m.textarea.Line()
-	lines := strings.Split(text, "\n")
-	if line >= len(lines) {
-		m.completionKind = ""
-		return
-	}
-	current := lines[line]
-	runes := []rune(current)
-	lineInfo := m.textarea.LineInfo()
-	cursor := min(len(runes), lineInfo.StartColumn+lineInfo.ColumnOffset)
-	start, end := cursor, cursor
-	for start > 0 && runes[start-1] != ' ' && runes[start-1] != '\t' {
-		start--
-	}
-	for end < len(runes) && runes[end] != ' ' && runes[end] != '\t' {
-		end++
-	}
-	word := string(runes[start:cursor])
-	lineStart := 0
-	for i := 0; i < line; i++ {
-		lineStart += len(lines[i]) + 1
-	}
-	m.completionStart = lineStart + len(string(runes[:start]))
-	m.completionEnd = lineStart + len(string(runes[:end]))
-	m.completionCursor = 0
-	if strings.HasPrefix(word, "/") {
-		m.commandMatches = m.slashCommands.Match(word)
-		m.fileMatches = nil
-		m.completionKind = "command"
-		if len(m.commandMatches) == 0 {
-			m.completionKind = ""
-		}
-		return
-	}
-	if strings.HasPrefix(word, "@") {
-		m.fileMatches = nil
-		entries, err := os.ReadDir(m.workspace)
-		if err != nil {
-			m.completionKind = ""
-			return
-		}
-		prefix := strings.TrimPrefix(word, "@")
-		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), prefix) && len(m.fileMatches) < 50 {
-				m.fileMatches = append(m.fileMatches, entry.Name())
-			}
-		}
-		m.commandMatches = nil
-		m.completionKind = "file"
-		if len(m.fileMatches) == 0 {
-			m.completionKind = ""
-		}
-		return
-	}
-	m.completionKind = ""
 }
 
 func (m *conversationTUI) View() tea.View {
@@ -1406,10 +1274,7 @@ func (m *conversationTUI) approvalActions(request protocol.PermissionRequestNoti
 }
 
 func (m *conversationTUI) completionLines() []string {
-	return tui.RenderCompletion(tui.CompletionView{
-		Kind: m.completionKind, Commands: m.commandMatches, Files: m.fileMatches,
-		Cursor: m.completionCursor, Start: m.completionWindowStart(), Rows: m.completionRows(),
-	})
+	return m.ui.Composer.CompletionView(m.completionRows())
 }
 
 func (m *conversationTUI) renderOutputView(height int) string {
@@ -1873,10 +1738,10 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 		m.pendingApproval = &request
 		m.approvalModal = newApprovalModalState(request.Arguments, m.ui.Width, m.ui.Height)
 		if !m.transcriptFocused {
-			m.textarea.Blur()
+			m.ui.Composer.Editor.Blur()
 		}
 	} else if hadPendingApproval && !m.transcriptFocused {
-		m.textarea.Focus()
+		m.ui.Composer.Editor.Focus()
 	}
 	m.lastSequence = result.EventWatermark
 	restoredBlocks := make([]TranscriptBlock, 0, len(result.Transcript))
@@ -1945,40 +1810,7 @@ func (m *conversationTUI) renderTextarea() string {
 	defer func() {
 		_ = recover()
 	}()
-	return m.textarea.View()
-}
-
-func newConversationComposer() textarea.Model {
-	input := textarea.New()
-	input.ShowLineNumbers = false
-	input.Placeholder = "Ask Buddy anything…"
-	input.SetHeight(1)
-	input.SetStyles(textarea.DefaultStyles(true))
-	input.Prompt = "› "
-	input.SetVirtualCursor(true)
-	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"), key.WithHelp("shift+enter", "new line"))
-	input.Focus()
-	return input
-}
-
-func (m *conversationTUI) resizeComposer() {
-	maxRows := 5
-	if m.ui.Width < 80 || m.ui.Height < 24 {
-		maxRows = 3
-	}
-	if m.ui.Width < 40 || m.ui.Height < 12 {
-		maxRows = 1
-	}
-	rows := 1
-	if strings.TrimSpace(m.textarea.Value()) != "" {
-		width := max(1, m.textarea.Width())
-		rows = 0
-		for _, line := range strings.Split(m.textarea.Value(), "\n") {
-			rows += max(1, (ansi.StringWidth(line)+width-1)/width)
-		}
-		rows = min(maxRows, max(1, rows))
-	}
-	m.textarea.SetHeight(rows)
+	return m.ui.Composer.Editor.View()
 }
 
 func (m *conversationTUI) viewportHeight() int {
@@ -1996,7 +1828,7 @@ func (m *conversationTUI) viewportOverhead() int {
 			headerHeight = 2
 		}
 	}
-	composerHeight := max(1, m.textarea.Height())
+	composerHeight := max(1, m.ui.Composer.Editor.Height())
 	if standard && width >= 40 {
 		composerHeight += 2
 	}
@@ -2040,20 +1872,18 @@ func (m *conversationTUI) viewportOverhead() int {
 }
 
 func (m *conversationTUI) completionRows() int {
-	if m.completionKind == "" {
+	if m.ui.Composer.CompletionKind() == "" {
 		return 0
 	}
-	return min(8, min(m.completionCount(), max(0, m.ui.Height-m.viewportOverhead()-4)))
-}
-
-func (m *conversationTUI) completionWindowStart() int {
-	rows := m.completionRows()
-	return min(max(0, m.completionCursor-rows+1), max(0, m.completionCount()-rows))
+	return min(8, min(m.ui.Composer.CompletionCount(), max(0, m.ui.Height-m.viewportOverhead()-4)))
 }
 
 func (m *conversationTUI) ensureUIModel() {
 	if m.ui == nil {
 		m.ui = tui.NewModel(tui.Header{Model: m.startParams.Model, Workspace: m.workspace})
+	}
+	if m.ui.Composer == nil {
+		m.ui.Composer = tui.NewComposer(nil)
 	}
 	m.ui.Metadata.Model = m.startParams.Model
 	m.ui.Metadata.Workspace = m.workspace
