@@ -1,42 +1,30 @@
-# buddy-agent
+<h1><img src="internal/tui/assets/buddy-favicon.svg" alt="Buddy corgi" width="40" style="vertical-align: middle;" /> buddy-agent</h1>
 
-A robust, self-evolving autonomous agent harness built in pure Go, supporting both local and cloud environments.
+Buddy Agent is a Go agent harness.
 
 ## Overview
 
-`buddy-agent` is an autonomous execution harness designed to run directly in your development environment. It pairs a deterministic ReAct (Reason + Act) loop with durable memory, dynamic skill acquisition, and sandboxed tool execution to perform multi-step engineering and operational workflows.
+Buddy runs as a command-line client backed by a local daemon. The daemon manages turns and tool execution, while the terminal UI handles conversation input, approvals, and session control.
 
-## Key Architecture
+## Features
 
-- **Autonomous ReAct Engine**: Deterministic reasoning and tool execution loop with configurable step budgets and live output streaming.
-- **Context Compaction & Episodic Anchoring**: Pure Go Three-Partition memory management ($P_1$ immutable system anchor, $P_2$ bounded episodic anchor with deterministic state tables, $P_3$ unpruned working tail), URL topology-aware context capacity ceilings (16k local loopbacks, 64k cloud endpoints), staged boundary micro-pruning, Tier 2 LLM distillation, deterministic Tier 3 fallback, and closed-loop reactive HTTP 400 self-healing recovery.
-- **Subprocess Safety & Process Groups**: Executes shell commands within isolated OS process groups (`Setpgid: true` on POSIX, Job Objects on Windows) with escalated dual-phase termination (`SIGTERM` -> 1.5s grace -> `SIGKILL` to negative PGID) and descendant liveness probing to eliminate orphan processes.
-- **Memory-Bounded Streaming Truncation**: Line-aware, streaming dual-buffer truncators (70% stdout / 30% stderr) with circular rolling tail ring buffers and delimiter-free UTF-8 rune fallback.
-- **Provider Agnostic**: OpenAI-compatible REST integration using official `openai-go` SDK supporting local inference runners and cloud providers.
-- **Durable Memory & Persona**: Context-aware memory layer using file-backed storage (`SOUL.md`, `MEMORY.md`, `USER.md`) alongside structured episodic records.
-- **Pure Go SQLite State Persistence & Crash Recovery**: Embedded pure Go SQLite trajectory ledger (`modernc.org/sqlite`) with dual connection pools, atomic turn persistence (`turns.tool_calls JSON`), secret redaction, and seamless session resumption (`buddy resume`).
-- **Conversation TUI**: Bubble Tea terminal conversations with durable multi-turn history, queued prompts by default, explicit `/steer`, project-scoped `/resume`, and `buddy --continue`.
-- **Self-Improving Skill System**: Dynamically captures discovered procedures and workflows into an extensible `skills/` library.
-- **Zero CGO**: Pure Go for fast, static single-binary compilation across platforms (`linux`, `darwin`, `windows`).
+- **Interactive terminal UI** for multi-turn conversations, approvals, slash commands, and reviewing working-tree changes.
+- **One-shot tasks** for running a prompt from the command line without opening an interactive session.
+- **Local daemon and session storage** so work can continue in the background and conversations can be resumed.
+- **OpenAI-compatible model endpoints**, including local runners such as Ollama and hosted providers.
+- **MCP and subagent support** for connecting external tools and delegating bounded tasks.
+- **Workspace memory and context management** using project files and persisted conversation state.
+- **Pure Go builds** for Linux, macOS, and Windows.
 
 ## Documentation
 
-Comprehensive system and developer documentation is available in [`docs/`](docs/):
-- [Documentation Index](docs/README.md): Overview and guide directory.
-- [CLI Reference](docs/cli.md): Commands, flags, and execution modes.
-- [System Architecture](docs/architecture.md): Decoupled daemon-client architecture and execution lifecycle.
-- [Daemon & IPC](docs/daemon.md): Background daemon, Unix domain socket wire protocol, and process isolation.
-- [Terminal User Interface](docs/terminal-ui.md): Interactive Bubble Tea conversation TUI, slash commands, approvals, and diff review.
-- [Configuration](docs/configuration.md): YAML configuration, environment variables, and model endpoints.
-- [Model Context Protocol (MCP)](docs/mcp.md): Stdio and SSE MCP server integration and process group security.
-- [Persistence & Compaction](docs/persistence.md): Pure Go SQLite trajectory storage and 3-partition memory compactor.
-- [Subagents](docs/subagents.md): Bounded subagent delegation, step budgets, and role constraints.
+See the [documentation](docs/README.md) for the CLI, configuration, architecture, terminal UI, daemon, persistence, MCP, and subagent guides.
 
 ## Getting Started
 
 ### Prerequisites
 - Go 1.25.4+
-- An OpenAI-compatible API endpoint (local runner or cloud provider)
+- An OpenAI-compatible API endpoint (local runner or provider)
 
 ### Setup
 
