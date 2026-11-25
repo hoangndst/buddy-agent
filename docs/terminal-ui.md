@@ -1,30 +1,36 @@
 # Terminal User Interface (TUI)
 
-Buddy Agent includes an interactive, full-screen terminal interface built with Charm's Bubble Tea and Lip Gloss. It manages multi-turn conversations, live text streaming, multiline prompt composition, and tool approvals.
+Buddy Agent includes an interactive, full-screen terminal interface built with Bubble Tea and Lip Gloss. It manages multi-turn conversations, live text streaming, prompt composition, grouped tool activity, and tool approvals. Completed assistant responses render Markdown and fenced code in the terminal. The interface uses a Buddy orange accent with colors adjusted for light and dark terminals.
+
+## Welcome Screen
+
+Before the first prompt, Buddy shows a framed welcome panel with its corgi mascot, model, workspace, build version, runtime status, starter guidance, and useful commands. The mascot is rendered from the checked-in Buddy SVG as Unicode half-block pixel art, so it works in SSH, tmux, Warp, and standard terminals without image protocols. Wide terminals use the larger artwork; compact terminals use a smaller variant, and narrow terminals omit the mascot to preserve room for the composer. `NO_COLOR` and monochrome terminals use shaded Unicode blocks instead of ANSI colors. The mascot appears only while the conversation has no transcript content.
 
 ## User Interface Layout
 
+At standard terminal sizes (80×24 or larger), Buddy uses a compact identity header, a scrollable conversation, a one-line composer that grows with multiline input, and a status footer:
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ buddy  ·  /path/to/project                                  │
-│ Conversation conv_…  ·  idle                                 │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│ > User prompt text...                                       │
-│                                                             │
-│ Assistant response formatted in width-aware Markdown.       │
-│ Syntax-highlighted code blocks, tables, and task lists.     │
-│                                                             │
-│ ⚙ bash: npm test  ·  18.4 KiB  ·  Enter to inspect         │
-│                                                             │
-├─────────────────────────────────────────────────────────────┤
-│ ┌─────────────────────────────────────────────────────────┐ │
-│ │ Type prompt, / for commands, @ for files                 │ │
-│ └─────────────────────────────────────────────────────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│ Enter send · Shift+Enter newline · /resume · Ctrl+C detach  │
-└─────────────────────────────────────────────────────────────┘
+Buddy Agent
+GPT-5.4 · /path/to/project · main
+
+You
+Please inspect the failing test.
+
+Buddy
+The failure comes from the updated renderer.
+
+✓ bash · 4.2s · Enter to expand
+
+› Ask Buddy anything…
+● Connected · ? shortcuts · / commands
 ```
+
+At compact sizes (40–79 columns or 12–23 rows), Buddy shortens the header and trims secondary hints. Below 40 columns or 12 rows, it hides optional metadata before the active interaction. If the terminal is only one row high, Buddy shows the composer or pending approval keys. Approval remains pending if the terminal is too narrow to show every available decision key; resize before responding.
+
+Workspace and conversation names may be shortened to fit. The transcript keeps its message order and scrolls independently from the composer; use the mouse wheel or PageUp/PageDown to inspect history. Tool calls and results appear in a single expandable activity row. Empty assistant messages do not create blank role labels. Activity status uses text and symbols as well as color, so state remains understandable without color. Context usage is shown only when the runtime provides it.
+
+Workspace and conversation pickers, `/diff`, and output inspection use the same header and contextual controls. They temporarily replace the conversation and composer while keeping the prompt draft in memory. Non-TTY execution continues to use the existing line-oriented or standalone path without alternate-screen controls.
 
 ## Core Interaction Patterns
 
@@ -39,7 +45,7 @@ Type `/` commands in the composer:
 * `/interrupt`: Cancel the currently executing turn immediately.
 * `/resume`: Open the project and conversation picker to switch sessions.
 * `/help`: Show available commands.
-* `/copy`: Copy the transcript text currently loaded in the client via OSC 52. Large transient tool results copy their bounded preview.
+* `/copy`: Request an OSC 52 clipboard copy of the transcript text currently loaded in the client. Large transient tool results copy their bounded preview; terminals may ignore clipboard requests.
 * `/diff`: Review changed files in the active conversation workspace, with labels for pre-existing changes and successful Buddy file-tool edits.
 * `/clear`: Clear the visible transcript viewport.
 * `/quit` or `/exit`: Detach from the session and leave background daemon tasks running.

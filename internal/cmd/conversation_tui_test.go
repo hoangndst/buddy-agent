@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/hoangndst/buddy-agent/internal/daemon/protocol"
 	"github.com/hoangndst/buddy-agent/internal/mcp"
 	"github.com/hoangndst/buddy-agent/internal/persistence"
+	"github.com/hoangndst/buddy-agent/internal/tui"
 )
 
 type conversationAPITestDouble struct {
@@ -409,11 +412,9 @@ func TestResumeDifferentWorkspaceClearsMCPConfigWithoutLoader(t *testing.T) {
 
 func TestConversationTUIRowVirtualization(t *testing.T) {
 	model := &conversationTUI{
-		textarea:       textarea.New(),
-		width:          80,
-		height:         24,
-		lineCountCache: make(map[string]int),
-		wrapCache:      make(map[string][]string),
+		textarea: textarea.New(),
+		width:    80,
+		height:   24,
 	}
 	// Append 30 distinct blocks
 	for i := 0; i < 30; i++ {
@@ -428,10 +429,10 @@ func TestConversationTUIRowVirtualization(t *testing.T) {
 	}
 
 	// At scrollOffset 0 (bottom of conversation)
-	model.scrollOffset = 0
+	model.transcript.ScrollOffset = 0
 	visible := model.computeVisibleBlocks()
-	if len(visible) == 0 || len(visible) >= len(model.blocks) {
-		t.Fatalf("expected visible subset of blocks, got %d of %d", len(visible), len(model.blocks))
+	if len(visible) == 0 || len(visible) >= len(model.transcript.Blocks) {
+		t.Fatalf("expected visible subset of blocks, got %d of %d", len(visible), len(model.transcript.Blocks))
 	}
 
 	// Verify block 0 is NOT visible at bottom
@@ -454,7 +455,7 @@ func TestConversationTUIRowVirtualization(t *testing.T) {
 	}
 
 	// Scroll to top
-	model.scrollOffset = 1000 // will be clamped to maxScroll
+	model.transcript.ScrollOffset = 1000 // will be clamped to maxScroll
 	visibleTop := model.computeVisibleBlocks()
 	if len(visibleTop) == 0 {
 		t.Fatal("expected visible blocks at top")
@@ -472,52 +473,70 @@ func TestConversationTUIRowVirtualization(t *testing.T) {
 	}
 }
 
-func TestConversationTUIWrapCacheInvalidation(t *testing.T) {
-	model := &conversationTUI{
-		textarea:       textarea.New(),
-		width:          80,
-		height:         24,
-		lineCountCache: make(map[string]int),
-		wrapCache:      make(map[string][]string),
+func TestConversationTUIWelcomeResizesToNarrowFallback(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	standard := &conversationTUI{textarea: textarea.New(), width: 80, height: 24, workspace: "/workspace/buddy", state: "ready"}
+	updated, _ := standard.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	standard = updated.(*conversationTUI)
+	standardView := ansi.Strip(standard.View().Content)
+	if !strings.Contains(standardView, "╭─ Buddy Agent") || !strings.Contains(standardView, "Tips for getting started") || !strings.Contains(standardView, "╰") {
+		t.Fatalf("standard welcome panel was clipped: %q", standardView)
 	}
-	model.appendBlock(TranscriptBlock{
-		ID:        "test-block-1",
-		Kind:      BlockAssistantMessage,
-		Role:      "assistant",
-		Header:    "Buddy",
-		Body:      "Short content for testing cache invalidation",
-		CreatedAt: time.Now(),
-	})
-
-	_ = model.computeVisibleBlocks()
-	key80 := "test-block-1:80"
-	if _, ok := model.lineCountCache[key80]; !ok {
-		t.Fatalf("expected lineCountCache to contain key %q", key80)
+	rows := strings.Split(standardView, "\n")
+	if len(rows) > 24 {
+		t.Fatalf("standard welcome has %d rows for a 24-row terminal", len(rows))
+	}
+	if !strings.HasPrefix(rows[0], "╭─ Buddy Agent") {
+		t.Fatalf("welcome panel should start at the top without a duplicate header: %q", rows[:min(3, len(rows))])
+	}
+	standard.appendBlock(TranscriptBlock{ID: "user-prompt", Kind: BlockUserMessage, Body: "Start a conversation"})
+	transcriptView := ansi.Strip(standard.View().Content)
+	if strings.Contains(transcriptView, "Welcome back!") || strings.Contains(transcriptView, "Tips for getting started") {
+		t.Fatalf("welcome panel remained after transcript content appeared: %q", transcriptView)
 	}
 
-	// Trigger window resize to width 120
+	model := &conversationTUI{textarea: textarea.New(), width: 160, height: 40, workspace: "/workspace/buddy", gitBranch: "main", state: "ready", startParams: protocol.ConversationStartParams{Model: "GPT-5.4"}}
+	wide := ansi.Strip(model.View().Content)
+	if !strings.Contains(wide, "▀") || !strings.Contains(wide, "GPT-5.4") || !strings.Contains(wide, "main") {
+		t.Fatalf("wide welcome missing mascot or project metadata: %q", wide)
+	}
+
+	updated, _ = model.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
+	model = updated.(*conversationTUI)
+	narrow := ansi.Strip(model.View().Content)
+	if strings.Contains(narrow, "▀") {
+		t.Fatalf("narrow welcome should hide the mascot: %q", narrow)
+	}
+	if lines := strings.Split(narrow, "\n"); len(lines) > 12 {
+		t.Fatalf("narrow welcome has %d rows for a 12-row terminal", len(lines))
+	}
+	for _, line := range strings.Split(narrow, "\n") {
+		if width := ansi.StringWidth(line); width > 40 {
+			t.Fatalf("narrow welcome line has width %d: %q", width, line)
+		}
+	}
+}
+
+func TestConversationTUIResizeReflowsTranscript(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	model.appendBlock(TranscriptBlock{ID: "test-block-1", Kind: BlockAssistantMessage, Body: "Short content for testing transcript resize and reflow."})
+	before := strings.Join(model.computeVisibleLines(), "\n")
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	model = updated.(*conversationTUI)
-
-	if _, ok := model.lineCountCache[key80]; ok {
-		t.Fatalf("old cache key %q should be cleared after resize", key80)
-	}
-	key120 := "test-block-1:120"
-	if _, ok := model.lineCountCache[key120]; !ok {
-		t.Fatalf("new cache key %q should be populated after resize", key120)
+	after := strings.Join(model.computeVisibleLines(), "\n")
+	if !strings.Contains(before, "Short content") || !strings.Contains(after, "Short content") {
+		t.Fatalf("resize lost transcript content\nbefore: %q\nafter: %q", before, after)
 	}
 }
 
 func TestConversationTUIStreamingDeltaCoalescingThreadSafe(t *testing.T) {
 	api := &conversationAPITestDouble{events: make(chan protocol.SessionEventNotification, 10)}
 	model := &conversationTUI{
-		client:         api,
-		conversation:   "conversation-1",
-		state:          "running",
-		width:          80,
-		height:         24,
-		lineCountCache: make(map[string]int),
-		wrapCache:      make(map[string][]string),
+		client:       api,
+		conversation: "conversation-1",
+		state:        "running",
+		width:        80,
+		height:       24,
 	}
 
 	// Deliver 100 token deltas in rapid succession
@@ -567,10 +586,10 @@ func TestConversationTUIStreamingDeltaCoalescingThreadSafe(t *testing.T) {
 	if model.streamingText != "" {
 		t.Fatalf("streamingText should be cleared after text complete, got: %q", model.streamingText)
 	}
-	if len(model.blocks) == 0 {
+	if len(model.transcript.Blocks) == 0 {
 		t.Fatal("expected completed transcript block")
 	}
-	lastBlock := model.blocks[len(model.blocks)-1]
+	lastBlock := model.transcript.Blocks[len(model.transcript.Blocks)-1]
 	if lastBlock.Streaming {
 		t.Fatal("completed block should not be marked streaming")
 	}
@@ -579,12 +598,10 @@ func TestConversationTUIStreamingDeltaCoalescingThreadSafe(t *testing.T) {
 	}
 }
 
-func TestConversationTUIMarkdownTableTruncation(t *testing.T) {
+func TestConversationTUIMarkdownTableRenderingKeepsSource(t *testing.T) {
 	model := &conversationTUI{
-		width:          80,
-		height:         24,
-		lineCountCache: make(map[string]int),
-		wrapCache:      make(map[string][]string),
+		width:  80,
+		height: 24,
 	}
 
 	// Generate table with 250 rows
@@ -605,8 +622,9 @@ func TestConversationTUIMarkdownTableTruncation(t *testing.T) {
 	}
 
 	rendered, _ := model.renderBlock(block, 80)
-	if !strings.Contains(rendered, "[... 50 rows omitted; use /copy to export full table]") {
-		t.Fatalf("rendered block should contain 200-row truncation badge: %s", rendered)
+	rendered = ansi.Strip(rendered)
+	if !strings.Contains(rendered, "Row 1") || !strings.Contains(rendered, "Row 250") {
+		t.Fatalf("rendered Markdown table should retain all rows: %s", rendered)
 	}
 	// Check that full markdown in memory is preserved
 	if strings.Count(block.Body, "Row ") != 250 {
@@ -616,15 +634,14 @@ func TestConversationTUIMarkdownTableTruncation(t *testing.T) {
 
 func TestConversationTUIToolEventHyperlink(t *testing.T) {
 	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("NO_COLOR", "")
 	api := &conversationAPITestDouble{events: make(chan protocol.SessionEventNotification, 10)}
 	model := &conversationTUI{
-		client:         api,
-		conversation:   "conversation-1",
-		workspace:      "/test/workspace",
-		width:          80,
-		height:         24,
-		lineCountCache: make(map[string]int),
-		wrapCache:      make(map[string][]string),
+		client:       api,
+		conversation: "conversation-1",
+		workspace:    "/test/workspace",
+		width:        80,
+		height:       24,
 	}
 
 	updated, _ := model.Update(conversationEventMsg{
@@ -639,10 +656,10 @@ func TestConversationTUIToolEventHyperlink(t *testing.T) {
 	})
 	model = updated.(*conversationTUI)
 
-	if len(model.blocks) == 0 {
+	if len(model.transcript.Blocks) == 0 {
 		t.Fatal("expected tool block created")
 	}
-	toolBlock := model.blocks[len(model.blocks)-1]
+	toolBlock := model.transcript.Blocks[len(model.transcript.Blocks)-1]
 	if !strings.Contains(toolBlock.Header, "Running read_file") {
 		t.Fatalf("toolBlock Header missing tool name: %s", toolBlock.Header)
 	}
@@ -654,43 +671,75 @@ func TestConversationTUIToolEventHyperlink(t *testing.T) {
 	}
 }
 
-func TestConversationTUICopyCommand(t *testing.T) {
+type terminalOutputFunc func([]byte) (int, error)
+
+func (f terminalOutputFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestConversationTUICopyCommandInAlternateScreen(t *testing.T) {
 	model := &conversationTUI{
-		textarea:       textarea.New(),
-		width:          80,
-		height:         24,
-		lineCountCache: make(map[string]int),
-		wrapCache:      make(map[string][]string),
+		textarea: textarea.New(),
+		width:    80,
+		height:   24,
 	}
-	model.appendBlock(TranscriptBlock{
-		ID:        "msg-1",
-		Kind:      BlockAssistantMessage,
-		Role:      "assistant",
-		Header:    "Buddy",
-		Body:      "Secret transcript content for clipboard copy",
-		CreatedAt: time.Now(),
-	})
-
+	model.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: "Hello"})
+	model.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "Hi there 👋"})
 	model.textarea.SetValue("/copy")
-	updated, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	model = updated.(*conversationTUI)
 
-	if cmd == nil {
-		t.Fatal("expected OSC 52 command returned on /copy")
+	altScreen, clipboard := make(chan struct{}), make(chan struct{})
+	enteredAltScreen := sync.OnceFunc(func() { close(altScreen) })
+	var clipboardOnce sync.Once
+	var clipboardOutput string
+	expected := ansi.SetClipboard(ansi.SystemClipboard, "Hello\n\nHi there 👋")
+	output := terminalOutputFunc(func(p []byte) (int, error) {
+		data := string(p)
+		if strings.Contains(data, ansi.SetModeAltScreenSaveCursor) {
+			enteredAltScreen()
+		}
+		if strings.Contains(data, expected) {
+			clipboardOnce.Do(func() {
+				clipboardOutput = data
+				close(clipboard)
+			})
+		}
+		return len(p), nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	program := tea.NewProgram(model, tea.WithContext(ctx), tea.WithInput(nil), tea.WithOutput(output),
+		tea.WithWindowSize(80, 24), tea.WithoutSignalHandler())
+	go func() {
+		select {
+		case <-altScreen:
+			program.Send(tea.KeyPressMsg{Code: tea.KeyEnter})
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-clipboard:
+			program.Quit()
+		case <-ctx.Done():
+		}
+	}()
+	if _, err := program.Run(); err != nil {
+		t.Fatalf("expected /copy to write OSC 52 while the alternate screen was active: %v", err)
 	}
-	if len(model.blocks) < 2 {
-		t.Fatal("expected notification block appended after /copy")
+	<-clipboard
+	if strings.Contains(clipboardOutput, ansi.InsertLine(1)) {
+		t.Fatalf("clipboard write inserted a terminal line: %q", clipboardOutput)
 	}
-	lastBlock := model.blocks[len(model.blocks)-1]
-	if !strings.Contains(lastBlock.Body, "Copied full transcript to clipboard") {
-		t.Fatalf("expected copy confirmation, got: %s", lastBlock.Body)
+	if len(model.transcript.Blocks) != 3 {
+		t.Fatalf("expected copy status block, got %d transcript blocks", len(model.transcript.Blocks))
+	}
+	lastBlock := model.transcript.Blocks[len(model.transcript.Blocks)-1]
+	if lastBlock.Body != "Requested clipboard copy of full transcript." {
+		t.Fatalf("unexpected clipboard status: %q", lastBlock.Body)
 	}
 }
 
 func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
 	api := &conversationAPITestDouble{submissions: make(chan protocol.ConversationSubmitParams, 1)}
 	model := &conversationTUI{client: api, conversation: "conv-1", textarea: textarea.New(), width: 80, height: 24}
-	model.appendBlock(TranscriptBlock{ID: "activity", TurnID: "turn-1", Kind: BlockToolActivity, Header: "✓ bash", Body: "preview", Collapsed: true, Data: map[string]any{"output_ref": "out-1"}})
+	model.appendBlock(TranscriptBlock{ID: "activity", TurnID: "turn-1", Kind: BlockToolActivity, Header: "✓ bash", Body: "preview", Collapsed: true, Activity: &tui.Activity{Tool: "bash", OutputRef: "out-1"}})
 	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyF6})
 	model = updated.(*conversationTUI)
 	if !model.transcriptFocused || model.selectedActivity != "activity" {
@@ -729,11 +778,11 @@ func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 		Data: map[string]any{"tool_name": "bash", "activity_id": activity}})
 	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 2, Type: string(agent.EventToolResult), Content: "preview",
 		Data: map[string]any{"tool_name": "bash", "activity_id": activity, "output_ref": "out-1"}})
-	activityID := m.blocks[1].ID
+	activityID := m.transcript.Blocks[1].ID
 	openOutput := func(stage string, wantBlocks int) {
 		t.Helper()
-		if len(m.blocks) != wantBlocks || m.blocks[1].ID != activityID || !m.blocks[1].Completed || m.blocks[2].Body != "first answer" {
-			t.Fatalf("%s sync did not reconcile the activity with its originating turn: %+v", stage, m.blocks)
+		if len(m.transcript.Blocks) != wantBlocks || m.transcript.Blocks[1].ID != activityID || !m.transcript.Blocks[1].Completed || m.transcript.Blocks[2].Body != "first answer" {
+			t.Fatalf("%s sync did not reconcile the activity with its originating turn: %+v", stage, m.transcript.Blocks)
 		}
 		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
 		_, open := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -769,13 +818,13 @@ func TestConversationTUIDropsOutputWhenConversationOrWorkerChanges(t *testing.T)
 		old := &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1"}
 		m := &conversationTUI{client: &conversationAPITestDouble{syncResult: old}}
 		m.loadSync(old)
-		m.appendBlock(TranscriptBlock{ID: "activity", Kind: BlockToolActivity, Data: map[string]any{"output_ref": "old-ref"}})
+		m.appendBlock(TranscriptBlock{ID: "activity", Kind: BlockToolActivity, Activity: &tui.Activity{OutputRef: "old-ref"}})
 		m.selectedActivity, m.outputRef, m.outputLoading = "activity", "old-ref", true
 		lateSync := m.syncConversation()
 		m.loadSync(&next)
 		m.Update(lateSync())
 		m.Update(outputPageMsg{ref: "old-ref", err: errors.New("stale output error")})
-		if m.conversation != next.ConversationID || m.workerEpoch != next.WorkerEpoch || len(m.blocks) != 0 ||
+		if m.conversation != next.ConversationID || m.workerEpoch != next.WorkerEpoch || len(m.transcript.Blocks) != 0 ||
 			m.selectedActivity != "" || m.outputRef != "" || m.outputLoading || m.errorText != "" {
 			t.Fatalf("old output state leaked after switching to %s/%s", next.ConversationID, next.WorkerEpoch)
 		}
@@ -981,9 +1030,9 @@ func TestConversationTUIEscapesUntrustedTerminalContent(t *testing.T) {
 
 func TestConversationTUIGroupsSubagentActivities(t *testing.T) {
 	model := &conversationTUI{width: 80, height: 24}
-	parent := TranscriptBlock{ID: "parent", Kind: BlockToolActivity, Header: "✓ invoke_subagent", Collapsed: true, Data: map[string]any{"tool_name": "invoke_subagent", "agent_name": "worker"}}
-	child := TranscriptBlock{ID: "child", ParentID: "parent", Kind: BlockSubagentActivity, Header: "✓ read_file", Body: "file contents", Collapsed: true, Completed: true, Data: map[string]any{"output_ref": "child-output"}}
-	model.blocks = []TranscriptBlock{parent, child}
+	parent := TranscriptBlock{ID: "parent", Kind: BlockToolActivity, Header: "✓ invoke_subagent", Collapsed: true, Activity: &tui.Activity{Tool: "invoke_subagent", AgentName: "worker"}}
+	child := TranscriptBlock{ID: "child", ParentID: "parent", Kind: BlockSubagentActivity, Header: "✓ read_file", Body: "file contents", Collapsed: true, Completed: true, Activity: &tui.Activity{Tool: "read_file", OutputRef: "child-output"}}
+	model.transcript.Blocks = []TranscriptBlock{parent, child}
 	collapsed, _ := model.renderBlock(parent, 80)
 	if !strings.Contains(collapsed, "[Subagent: worker (1 step completed)]") || strings.Contains(collapsed, "read_file") {
 		t.Fatalf("collapsed parent did not summarize child activity: %q", collapsed)
@@ -994,7 +1043,7 @@ func TestConversationTUIGroupsSubagentActivities(t *testing.T) {
 		t.Fatalf("expanded grouping did not nest child activity: %q", expanded)
 	}
 	model.transcriptFocused = true
-	model.blocks[0].Collapsed = false
+	model.transcript.Blocks[0].Collapsed = false
 	model.selectedActivity = "parent"
 	model.selectActivity(1)
 	if model.selectedActivity != "child" {
@@ -1049,8 +1098,8 @@ func TestConversationTUIResultOnlyChildIsDetached(t *testing.T) {
 		},
 	}))
 	model = updated.(*conversationTUI)
-	if len(model.blocks) != 1 || model.blocks[0].Kind != BlockSubagentActivity || !strings.HasPrefix(model.blocks[0].Header, "Detached child · ") {
-		t.Fatalf("result-only child was not rendered as detached: %+v", model.blocks)
+	if len(model.transcript.Blocks) != 1 || model.transcript.Blocks[0].Kind != BlockSubagentActivity || !strings.HasPrefix(model.transcript.Blocks[0].Header, "Detached child · ") {
+		t.Fatalf("result-only child was not rendered as detached: %+v", model.transcript.Blocks)
 	}
 }
 
@@ -1087,11 +1136,9 @@ func TestConversationTUINestedActivityRefreshesCachedParent(t *testing.T) {
 
 func TestConversationTUILongBlockClipping(t *testing.T) {
 	model := &conversationTUI{
-		textarea:       textarea.New(),
-		width:          80,
-		height:         24,
-		lineCountCache: make(map[string]int),
-		wrapCache:      make(map[string][]string),
+		textarea: textarea.New(),
+		width:    80,
+		height:   24,
 	}
 
 	// 100-line single assistant response
@@ -1109,12 +1156,12 @@ func TestConversationTUILongBlockClipping(t *testing.T) {
 	})
 
 	// At bottom (scrollOffset = 0)
-	model.scrollOffset = 0
+	model.transcript.ScrollOffset = 0
 	linesBottom := model.computeVisibleLines()
 	if len(linesBottom) >= 100 {
 		t.Fatalf("visible lines should be clipped to viewport height, got %d", len(linesBottom))
 	}
-	bottomText := strings.Join(linesBottom, "\n")
+	bottomText := ansi.Strip(strings.Join(linesBottom, "\n"))
 	if !strings.Contains(bottomText, "Response line 100") {
 		t.Fatalf("bottom view missing last response line: %s", bottomText)
 	}
@@ -1123,9 +1170,9 @@ func TestConversationTUILongBlockClipping(t *testing.T) {
 	}
 
 	// Scroll up
-	model.scrollOffset = 1000 // clamped to top
+	model.transcript.ScrollOffset = 1000 // clamped to top
 	linesTop := model.computeVisibleLines()
-	topText := strings.Join(linesTop, "\n")
+	topText := ansi.Strip(strings.Join(linesTop, "\n"))
 	if !strings.Contains(topText, "Response line 1") {
 		t.Fatalf("top view missing first response line: %s", topText)
 	}
@@ -1143,23 +1190,185 @@ func TestConversationTUIClippedTranscriptSkipsNestedChildRows(t *testing.T) {
 	}
 	m.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "latest response"})
 	lines := m.computeVisibleLines()
-	if len(lines) != m.viewportHeight() {
-		t.Fatalf("clipped transcript has %d rows, want %d", len(lines), m.viewportHeight())
+	if len(lines) > m.viewportHeight() {
+		t.Fatalf("clipped transcript has %d rows, viewport allows %d", len(lines), m.viewportHeight())
 	}
-	view := strings.Join(lines, "\n")
+	view := ansi.Strip(strings.Join(lines, "\n"))
 	if !strings.Contains(view, "subagent (10 steps completed)") || !strings.Contains(view, "latest response") {
 		t.Fatalf("clipped transcript lost visible activity: %q", view)
+	}
+}
+
+func TestConversationTUIScrollsRenderedMarkdownRows(t *testing.T) {
+	for _, width := range []int{48, 80} {
+		t.Run(fmt.Sprint(width), func(t *testing.T) {
+			m := &conversationTUI{textarea: textarea.New(), width: width, height: 16}
+			m.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: "Explain the result"})
+			m.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "# First heading\n\n" +
+				strings.Repeat("This paragraph wraps across several terminal lines. ", 4) + "\n\n## Code\n\n" +
+				"```go\nfunc example() {\n\tfmt.Println(\"hello\")\n}\n```"})
+			m.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "## Results\n\n" +
+				"| Name | Result |\n| --- | --- |\n| First | Passed |\n| Second | Skipped |\n\nA closing paragraph."})
+			m.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: "What comes next?"})
+
+			var transcript []string
+			for _, block := range m.transcript.Blocks {
+				rendered, _ := m.renderBlock(block, width)
+				transcript = append(transcript, tui.WrapLines(rendered, width)...)
+				transcript = append(transcript, "")
+			}
+			height := m.viewportHeight()
+			maxScroll := len(transcript) - height
+			for offset := 0; offset <= maxScroll+1; offset++ {
+				m.transcript.ScrollOffset = offset
+				bottom := len(transcript) - min(offset, maxScroll)
+				want := transcript[bottom-height : bottom]
+				if got := m.computeVisibleLines(); !slices.Equal(got, want) {
+					t.Fatalf("offset %d\n got: %q\nwant: %q", offset, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestConversationTUIMouseWheelScrollsTranscript(t *testing.T) {
+	model := &conversationTUI{width: 80, height: 24}
+	updated, _ := model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	model = updated.(*conversationTUI)
+	if model.transcript.ScrollOffset != 3 {
+		t.Fatalf("wheel up scroll offset = %d, want 3", model.transcript.ScrollOffset)
+	}
+	updated, _ = model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	model = updated.(*conversationTUI)
+	if model.transcript.ScrollOffset != 0 {
+		t.Fatalf("wheel down scroll offset = %d, want 0", model.transcript.ScrollOffset)
+	}
+}
+
+func TestConversationTUIKeepsHistoryAnchorWhileAppending(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	for i := range 20 {
+		model.appendBlock(TranscriptBlock{ID: fmt.Sprintf("message-%d", i), Kind: BlockAssistantMessage, Body: fmt.Sprintf("Message %d", i)})
+	}
+	model.transcript.ScrollOffset = 8
+	before := strings.Join(model.computeVisibleLines(), "\n")
+	model.appendBlock(TranscriptBlock{ID: "new-message", Kind: BlockAssistantMessage, Body: "New incoming response"})
+	after := strings.Join(model.computeVisibleLines(), "\n")
+	if after != before {
+		t.Fatalf("new transcript content moved the inspected history (offset %d)\nbefore: %q\nafter:  %q", model.transcript.ScrollOffset, before, after)
+	}
+	added := len(model.getWrappedLines(model.transcript.Blocks[len(model.transcript.Blocks)-1], model.width)) + 1
+	if model.transcript.ScrollOffset != 8+added {
+		t.Fatalf("scroll offset after adding %d rows = %d, want %d", added, model.transcript.ScrollOffset, 8+added)
+	}
+}
+
+func TestConversationTUIKeepsHistoryAnchorDuringSync(t *testing.T) {
+	m := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	snapshot := &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1"}
+	for i := range 10 {
+		turnID := fmt.Sprintf("turn-%d", i)
+		snapshot.Transcript = append(snapshot.Transcript,
+			protocol.ConversationTranscriptEntry{TurnID: turnID, Role: "user", Content: fmt.Sprintf("Prompt %d", i)},
+			protocol.ConversationTranscriptEntry{TurnID: turnID, Role: "assistant", Content: fmt.Sprintf("## Response %d\n\nAn explanation.", i)},
+		)
+	}
+	m.loadSync(snapshot)
+	m.transcript.ScrollOffset = 8
+	before := m.computeVisibleLines()
+	m.loadSync(snapshot)
+	after := m.computeVisibleLines()
+	if m.transcript.ScrollOffset != 8 || !slices.Equal(after, before) {
+		t.Fatalf("snapshot moved the viewport (offset %d, want 8)\nbefore: %q\n after: %q", m.transcript.ScrollOffset, before, after)
+	}
+}
+
+func TestConversationTUIKeepsHistoryAnchorWhileStreaming(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	for i := range 20 {
+		model.appendBlock(TranscriptBlock{ID: fmt.Sprintf("message-%d", i), Kind: BlockAssistantMessage, Body: fmt.Sprintf("Message %d", i), Streaming: i == 19})
+	}
+	model.activeBlockID = "message-19"
+	model.streamingText = "Message 19"
+	model.transcript.ScrollOffset = 8
+	before := strings.Join(model.computeVisibleLines(), "\n")
+	model.clearCache()
+	model.deltaBuffer.WriteString(strings.Repeat(" streaming content", 30))
+	model.Update(renderTickMsg{})
+	after := strings.Join(model.computeVisibleLines(), "\n")
+	if after != before {
+		t.Fatalf("stream growth moved the inspected history (offset %d)\nbefore: %q\nafter:  %q", model.transcript.ScrollOffset, before, after)
+	}
+}
+
+func TestConversationTUIFormatsVisibleTranscript(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	for i := range 100 {
+		model.appendBlock(TranscriptBlock{ID: fmt.Sprintf("message-%d", i), Kind: BlockAssistantMessage, Body: fmt.Sprintf("Message %d", i)})
+	}
+	lines := model.computeVisibleLines()
+	if len(lines) == 0 || strings.Contains(strings.Join(lines, "\n"), "Message 0") {
+		t.Fatalf("expected only the visible tail of the transcript, got %q", lines)
+	}
+}
+
+func TestConversationTUIDynamicComposerAndUnicodeWidth(t *testing.T) {
+	model := &conversationTUI{textarea: newConversationComposer(), width: 80, height: 24}
+	model.textarea.SetWidth(76)
+	model.resizeComposer()
+	if model.textarea.Height() != 1 {
+		t.Fatalf("empty standard composer height = %d, want 1", model.textarea.Height())
+	}
+	if !model.textarea.VirtualCursor() {
+		t.Fatal("empty standard composer should render a visible virtual cursor")
+	}
+	withCursor := model.textarea.View()
+	model.textarea.SetVirtualCursor(false)
+	if withoutCursor := model.textarea.View(); withCursor == withoutCursor {
+		t.Fatal("placeholder view did not change when its block cursor was disabled")
+	}
+	model.textarea.SetVirtualCursor(true)
+	model.textarea.SetWidth(30)
+	model.textarea.SetValue("first line\nsecond line\nthird line")
+	model.resizeComposer()
+	if model.textarea.Height() < 3 {
+		t.Fatalf("multiline composer height = %d, want at least 3", model.textarea.Height())
+	}
+	model.textarea.SetValue(strings.Repeat("x", 100))
+	model.resizeComposer()
+	if model.textarea.Height() < 3 {
+		t.Fatalf("wrapped pasted composer height = %d, want at least 3", model.textarea.Height())
+	}
+	model.width = 12
+	model.textarea.SetValue("界面 🐕 Buddy")
+	block := TranscriptBlock{ID: "unicode", Kind: BlockAssistantMessage, Role: "assistant", Header: "Buddy", Body: "界面 🐕 Buddy"}
+	rendered, _ := model.renderBlock(block, model.width)
+	for _, line := range tui.WrapLines(rendered, model.width) {
+		if width := ansi.StringWidth(line); width > model.width {
+			t.Fatalf("unicode render width = %d, max %d: %q", width, model.width, line)
+		}
+	}
+}
+
+func BenchmarkConversationTUIRender10k(b *testing.B) {
+	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 24}
+	for i := range 10000 {
+		model.appendBlock(TranscriptBlock{ID: fmt.Sprintf("message-%d", i), Kind: BlockAssistantMessage, Body: fmt.Sprintf("Message %d with a short readable response.", i)})
+	}
+	_ = model.computeVisibleLines()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = model.computeVisibleLines()
 	}
 }
 
 func TestConversationTUIQuitCommand(t *testing.T) {
 	for _, cmdStr := range []string{"/quit", "/exit"} {
 		model := &conversationTUI{
-			textarea:       textarea.New(),
-			width:          80,
-			height:         24,
-			lineCountCache: make(map[string]int),
-			wrapCache:      make(map[string][]string),
+			textarea: textarea.New(),
+			width:    80,
+			height:   24,
 		}
 		model.textarea.SetValue(cmdStr)
 		_, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -1175,12 +1384,10 @@ func TestConversationTUIQuitCommand(t *testing.T) {
 
 func TestConversationTUIClearCommand(t *testing.T) {
 	model := &conversationTUI{
-		textarea:       textarea.New(),
-		width:          80,
-		height:         24,
-		scrollOffset:   5,
-		lineCountCache: make(map[string]int),
-		wrapCache:      make(map[string][]string),
+		textarea:   textarea.New(),
+		width:      80,
+		height:     24,
+		transcript: tui.Transcript{ScrollOffset: 5},
 	}
 	model.appendBlock(TranscriptBlock{
 		ID:        "block-1",
@@ -1196,32 +1403,27 @@ func TestConversationTUIClearCommand(t *testing.T) {
 		t.Fatalf("expected nil cmd on /clear, got %v", cmd)
 	}
 	cleared := updated.(*conversationTUI)
-	if len(cleared.blocks) != 0 {
-		t.Fatalf("expected 0 blocks after /clear, got %d", len(cleared.blocks))
+	if len(cleared.transcript.Blocks) != 0 {
+		t.Fatalf("expected 0 blocks after /clear, got %d", len(cleared.transcript.Blocks))
 	}
-	if len(cleared.transcript) != 0 {
-		t.Fatalf("expected 0 transcript entries after /clear, got %d", len(cleared.transcript))
-	}
-	if cleared.scrollOffset != 0 {
-		t.Fatalf("expected scrollOffset 0 after /clear, got %d", cleared.scrollOffset)
+	if cleared.transcript.ScrollOffset != 0 {
+		t.Fatalf("expected scrollOffset 0 after /clear, got %d", cleared.transcript.ScrollOffset)
 	}
 }
 
 func TestConversationTUIClearKeepsStreamingBlock(t *testing.T) {
 	model := &conversationTUI{
-		textarea:       textarea.New(),
-		activeBlockID:  "active",
-		state:          "running",
-		lineCountCache: make(map[string]int),
-		wrapCache:      make(map[string][]string),
+		textarea:      textarea.New(),
+		activeBlockID: "active",
+		state:         "running",
 	}
 	model.appendBlock(TranscriptBlock{ID: "old", Body: "old"})
 	model.appendBlock(TranscriptBlock{ID: "active", Body: "partial", Streaming: true})
 	model.textarea.SetValue("/clear")
 	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	cleared := updated.(*conversationTUI)
-	if len(cleared.blocks) != 1 || cleared.blocks[0].ID != "active" || cleared.activeBlockID != "active" {
-		t.Fatalf("clear lost active streaming block: blocks=%+v active=%q", cleared.blocks, cleared.activeBlockID)
+	if len(cleared.transcript.Blocks) != 1 || cleared.transcript.Blocks[0].ID != "active" || cleared.activeBlockID != "active" {
+		t.Fatalf("clear lost active streaming block: blocks=%+v active=%q", cleared.transcript.Blocks, cleared.activeBlockID)
 	}
 }
 
@@ -1231,8 +1433,8 @@ func TestConversationTUIComposerCompletions(t *testing.T) {
 		t.Fatal(err)
 	}
 	model := &conversationTUI{textarea: textarea.New(), workspace: workspace, height: 30}
-	model.slashCommands.Register(SlashCommand{Name: "/clear", Description: "Clear transcript"})
-	model.slashCommands.Register(SlashCommand{Name: "/copy", Description: "Copy transcript"})
+	model.slashCommands.Register(tui.SlashCommand{Name: "/clear", Description: "Clear transcript"})
+	model.slashCommands.Register(tui.SlashCommand{Name: "/copy", Description: "Copy transcript"})
 	model.textarea.SetValue("/cl")
 	model.updateCompletion()
 	if model.completionKind != "command" || len(model.commandMatches) != 1 {
@@ -1277,12 +1479,27 @@ func TestConversationTUILoadSyncSkipsEmptyAssistantToolSteps(t *testing.T) {
 		{Role: "assistant", Content: " \n  "},
 		{Role: "assistant", Content: "Found one file."},
 	}})
-	if len(model.blocks) != 2 {
-		t.Fatalf("restored visible block count = %d, want 2: %+v", len(model.blocks), model.blocks)
+	if len(model.transcript.Blocks) != 2 {
+		t.Fatalf("restored visible block count = %d, want 2: %+v", len(model.transcript.Blocks), model.transcript.Blocks)
 	}
-	lines := strings.Join(model.computeVisibleLines(), "\n")
+	lines := ansi.Strip(strings.Join(model.computeVisibleLines(), "\n"))
 	if strings.Count(lines, "Buddy") != 1 || !strings.Contains(lines, "Found one file.") {
 		t.Fatalf("restored transcript contains empty assistant rows: %q", lines)
+	}
+}
+
+func TestConversationTUIEmptyAssistantRendering(t *testing.T) {
+	model := &conversationTUI{width: 80, height: 24}
+	if got, _ := model.renderBlock(TranscriptBlock{Kind: BlockAssistantMessage, Role: "assistant"}, 80); got != "" {
+		t.Fatalf("empty completed assistant rendered %q", got)
+	}
+	got, _ := model.renderBlock(TranscriptBlock{Kind: BlockAssistantMessage, Role: "assistant", Streaming: true}, 80)
+	if !strings.Contains(got, "Working…") {
+		t.Fatalf("empty streaming assistant rendered %q", got)
+	}
+	model.state = "running"
+	if got := strings.Join(model.conversationLines(10), "\n"); !strings.Contains(got, "Working…") {
+		t.Fatalf("empty running conversation rendered %q", got)
 	}
 }
 
@@ -1350,8 +1567,8 @@ func TestConversationTUIRoutesPasteToApprovalEditor(t *testing.T) {
 	model.textarea.SetValue("draft")
 	updated, _ := model.Update(tea.KeyPressMsg{Text: "4", Code: '4'})
 	model = updated.(*conversationTUI)
-	model.approvalModal.editor.CursorEnd()
-	for range len(model.approvalModal.editor.Value()) {
+	model.approvalModal.Editor.CursorEnd()
+	for range len(model.approvalModal.Editor.Value()) {
 		updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
 		model = updated.(*conversationTUI)
 	}
@@ -1360,8 +1577,8 @@ func TestConversationTUIRoutesPasteToApprovalEditor(t *testing.T) {
 	if model.textarea.Value() != "draft" {
 		t.Fatalf("paste changed main composer: %q", model.textarea.Value())
 	}
-	if model.approvalModal.editor.Value() != `{"path":"pasted.go"}` {
-		t.Fatalf("paste did not update approval editor: %q", model.approvalModal.editor.Value())
+	if model.approvalModal.Editor.Value() != `{"path":"pasted.go"}` {
+		t.Fatalf("paste did not update approval editor: %q", model.approvalModal.Editor.Value())
 	}
 	updated, _ = model.Update(conversationEventMsg{
 		ConversationID: "conversation-1", TurnID: "turn-1", Type: string(agent.EventTextDelta), Content: "stream continues",
@@ -1374,8 +1591,8 @@ func TestConversationTUIRoutesPasteToApprovalEditor(t *testing.T) {
 
 func TestConversationTUICompletionStateSurvivesNonEditingMessages(t *testing.T) {
 	model := &conversationTUI{textarea: textarea.New(), width: 80, height: 30}
-	model.slashCommands.Register(SlashCommand{Name: "/clear"})
-	model.slashCommands.Register(SlashCommand{Name: "/copy"})
+	model.slashCommands.Register(tui.SlashCommand{Name: "/clear"})
+	model.slashCommands.Register(tui.SlashCommand{Name: "/copy"})
 	model.textarea.SetValue("/c")
 	model.updateCompletion()
 	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
@@ -1398,7 +1615,7 @@ func TestConversationTUICompletionStateSurvivesNonEditingMessages(t *testing.T) 
 }
 
 func TestConversationTUIHistoryNavigationRestoresDraft(t *testing.T) {
-	history, err := NewInputHistoryRing(filepath.Join(t.TempDir(), "history.jsonl"))
+	history, err := tui.NewInputHistoryRing(filepath.Join(t.TempDir(), "history.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1408,7 +1625,7 @@ func TestConversationTUIHistoryNavigationRestoresDraft(t *testing.T) {
 	if err := history.Add("newer"); err != nil {
 		t.Fatal(err)
 	}
-	model := &conversationTUI{textarea: textarea.New(), history: history, lineCountCache: make(map[string]int), wrapCache: make(map[string][]string)}
+	model := &conversationTUI{textarea: textarea.New(), history: history}
 	model.textarea.SetValue("draft")
 	model.completionKind = "file"
 	model.fileMatches = []string{"stale"}
@@ -1431,7 +1648,7 @@ func TestConversationTUIHistoryNavigationRestoresDraft(t *testing.T) {
 }
 
 func TestConversationTUIHistoryNavigationRespectsSoftWrapRows(t *testing.T) {
-	history, err := NewInputHistoryRing(filepath.Join(t.TempDir(), "history.jsonl"))
+	history, err := tui.NewInputHistoryRing(filepath.Join(t.TempDir(), "history.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1448,14 +1665,14 @@ func TestConversationTUIHistoryNavigationRespectsSoftWrapRows(t *testing.T) {
 	}
 	updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	model = updated.(*conversationTUI)
-	if got := model.textarea.Value(); got != "a long wrapped draft" || history.index != len(history.entries) {
-		t.Fatalf("Down recalled history from a non-final visual row: draft=%q index=%d", got, history.index)
+	if got := model.textarea.Value(); got != "a long wrapped draft" || !history.AtEnd() {
+		t.Fatalf("Down recalled history from a non-final visual row: draft=%q", got)
 	}
 	model.textarea.CursorEnd()
 	updated, _ = model.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 	model = updated.(*conversationTUI)
-	if got := model.textarea.Value(); got != "a long wrapped draft" || history.index != len(history.entries) {
-		t.Fatalf("Up recalled history from a non-first visual row: draft=%q index=%d", got, history.index)
+	if got := model.textarea.Value(); got != "a long wrapped draft" || !history.AtEnd() {
+		t.Fatalf("Up recalled history from a non-first visual row: draft=%q", got)
 	}
 }
 
@@ -1494,8 +1711,8 @@ func TestConversationTUICompletionReservesViewportRows(t *testing.T) {
 		updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		model = updated.(*conversationTUI)
 	}
-	if got := model.completionRows(); got != 4 {
-		t.Fatalf("completion rows = %d, want 4", got)
+	if got := model.completionRows(); got != 7 {
+		t.Fatalf("completion rows = %d, want 7", got)
 	}
 	if got := model.viewportHeight(); got != 4 {
 		t.Fatalf("transcript viewport height = %d, want 4 after reserving completion rows", got)
@@ -1506,10 +1723,57 @@ func TestConversationTUICompletionReservesViewportRows(t *testing.T) {
 			visible++
 		}
 	}
-	if visible != 4 {
-		t.Fatalf("rendered %d completion rows, want 4", visible)
+	if visible != 7 {
+		t.Fatalf("rendered %d completion rows, want 7", visible)
 	}
 	if !strings.Contains(model.View().Content, "› "+model.fileMatches[model.completionCursor]) {
 		t.Fatal("selected completion is not visible in the constrained popup")
+	}
+}
+
+func TestConversationTUIResponsiveLayoutsStayWithinTerminal(t *testing.T) {
+	for _, size := range []struct{ width, height int }{{120, 40}, {80, 24}, {58, 18}, {40, 12}, {40, 1}} {
+		t.Run(fmt.Sprintf("%dx%d", size.width, size.height), func(t *testing.T) {
+			input := textarea.New()
+			input.ShowLineNumbers = false
+			model := &conversationTUI{textarea: input, workspace: "/workspace/buddy-agent", conversation: "conversation-12345678901234567890", state: "idle", width: size.width, height: size.height}
+			updated, _ := model.Update(tea.WindowSizeMsg{Width: size.width, Height: size.height})
+			view := updated.(*conversationTUI).View()
+			if !view.AltScreen {
+				t.Fatal("interactive view did not enable alternate screen")
+			}
+			if size.width == 80 && size.height == 24 && !strings.Contains(ansi.Strip(view.Content), "Tips for getting started") {
+				t.Fatal("empty conversation did not show its ready state")
+			}
+			lines := strings.Split(view.Content, "\n")
+			if len(lines) > size.height {
+				t.Fatalf("rendered %d rows into %d-row terminal", len(lines), size.height)
+			}
+			for _, line := range lines {
+				if width := ansi.StringWidth(line); width > size.width {
+					t.Fatalf("rendered %d columns into %d-column terminal: %q", width, size.width, line)
+				}
+			}
+		})
+	}
+}
+
+func TestConversationTUIOneRowPrioritizesComposerOrApproval(t *testing.T) {
+	model := &conversationTUI{textarea: textarea.New(), width: 40, height: 1}
+	model.textarea.Prompt = "› "
+	model.textarea.SetValue("keep this draft")
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 40, Height: 1})
+	view := updated.(*conversationTUI).View()
+	if got := ansi.Strip(view.Content); !strings.Contains(got, "›") || !strings.Contains(got, "keep this draft") || strings.Contains(got, "Buddy") || strings.Contains(got, "workspace") {
+		t.Fatalf("one-row conversation did not prioritize only the composer: %q", got)
+	}
+	model.pendingApproval = &protocol.PermissionRequestNotification{Tool: "bash", Arguments: map[string]any{"command": "go test ./..."}}
+	model.approvalModal = newApprovalModalState(model.pendingApproval.Arguments, 40, 1)
+	view = model.View()
+	if strings.TrimSpace(view.Content) != "1 2 3 4" {
+		t.Fatalf("one-row approval view = %q, want only actionable keys", view.Content)
+	}
+	if model.textarea.Value() != "keep this draft" {
+		t.Fatalf("approval layout changed the composer draft: %q", model.textarea.Value())
 	}
 }
