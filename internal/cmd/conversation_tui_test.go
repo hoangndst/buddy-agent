@@ -411,6 +411,32 @@ func TestConversationResumedMsgPreservesWorkspaceDuringEvictionRecovery(t *testi
 	}
 }
 
+func TestLocalCommandsDoNotInvalidateEvictionRecovery(t *testing.T) {
+	for _, command := range []string{"/help", "/clear", "/copy"} {
+		t.Run(command, func(t *testing.T) {
+			model := &conversationTUI{
+				client: &conversationAPITestDouble{}, conversation: "conversation-1", workerEpoch: "epoch-1",
+				resumeGeneration: 4, state: "restoring", ui: testTUIModel(80, 24),
+			}
+			model.handlePromptInput(command)
+			if model.resumeGeneration != 4 {
+				t.Fatalf("local command invalidated recovery: generation=%d", model.resumeGeneration)
+			}
+			updated, watch := model.Update(conversationResumedMsg{
+				resumeGeneration: 4, sourceConversationID: "conversation-1", sourceWorkerEpoch: "epoch-1",
+				result: &protocol.ConversationSyncResult{ConversationID: "conversation-1", WorkerEpoch: "epoch-1", State: "idle"},
+			})
+			model = updated.(*conversationTUI)
+			if model.state != "idle" {
+				t.Fatalf("eviction recovery response was discarded after %s: state=%q", command, model.state)
+			}
+			if watch == nil {
+				t.Fatalf("accepted recovery did not restart event watching after %s", command)
+			}
+		})
+	}
+}
+
 func TestConversationResumedMsgUsesWorkspaceSelectedInPicker(t *testing.T) {
 	model := &conversationTUI{workspace: "/work/current", selectedWorkspace: "/work/selected"}
 	updated, _ := model.Update(conversationResumedMsg{

@@ -577,7 +577,6 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.handlePromptInput(msg.Action.Prompt)
 			}
 			m.pickerGeneration++
-			m.resumeGeneration++
 			mode := persistence.SubmissionQueue
 			if msg.Action.Mode == string(persistence.SubmissionSteer) {
 				mode = persistence.SubmissionSteer
@@ -656,6 +655,7 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingStart = nil
 			return m, nil
 		}
+		m.nextResumeGeneration()
 		m.conversation = msg.result.ConversationID
 		m.state = "running"
 		cmds := []tea.Cmd{m.syncConversation(), m.watchPermission()}
@@ -890,11 +890,9 @@ func (m *conversationTUI) handlePromptInput(input string) tea.Cmd {
 		m.errorText = fmt.Sprintf("save prompt history: %v", err)
 	}
 	if text == "/resume" {
-		m.nextResumeGeneration()
 		return m.listWorkspaces(m.nextPickerGeneration())
 	}
 	m.pickerGeneration++
-	m.resumeGeneration++
 	if text == "/help" {
 		var help strings.Builder
 		for _, command := range m.ui.Composer.Commands.Commands() {
