@@ -897,8 +897,24 @@ func TestConversationTUICopyCommandInAlternateScreen(t *testing.T) {
 		t.Fatalf("expected copy status block, got %d transcript blocks", len(model.ui.Transcript.Blocks))
 	}
 	lastBlock := model.ui.Transcript.Blocks[len(model.ui.Transcript.Blocks)-1]
-	if lastBlock.Body != "Requested clipboard copy of full transcript." {
-		t.Fatalf("unexpected clipboard status: %q", lastBlock.Body)
+	if lastBlock.Kind != BlockSystemStatus || lastBlock.Body != "Requested clipboard copy of full transcript." {
+		t.Fatalf("unexpected clipboard status: %+v", lastBlock)
+	}
+}
+
+func TestConversationTUICopyLastAfterCopyingTranscript(t *testing.T) {
+	model := &conversationTUI{ui: testTUIModel(80, 24)}
+	model.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: "question"})
+	model.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "answer"})
+	if cmd := model.handlePromptInput("/copy"); cmd == nil || fmt.Sprint(cmd()) != "question\n\nanswer" {
+		t.Fatal("/copy did not include the full transcript")
+	}
+	if cmd := model.handlePromptInput("/copy-last"); cmd == nil || fmt.Sprint(cmd()) != "answer" {
+		t.Fatal("/copy-last did not copy the answer after /copy")
+	}
+	_, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModAlt})
+	if cmd == nil || fmt.Sprint(cmd()) != "answer" {
+		t.Fatal("Alt+C did not copy the answer after /copy")
 	}
 }
 
@@ -954,19 +970,22 @@ func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
 
 func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 	firstPrompt := protocol.ConversationTranscriptEntry{Role: "user", TurnID: "turn-1", Content: "first prompt"}
-	answer := protocol.ConversationTranscriptEntry{Role: "assistant", TurnID: "turn-1", StepNumber: 1, Content: "first answer"}
+	answer := protocol.ConversationTranscriptEntry{Role: "assistant", TurnID: "turn-1", StepNumber: 1, Content: "first answer",
+		Activities: []protocol.ConversationActivity{{ID: "call-1", Tool: "bash", Output: "saved preview"}}}
 	api := &conversationAPITestDouble{submissions: make(chan protocol.ConversationSubmitParams, 1)}
 	m := &conversationTUI{client: api, ui: testTUIModel(80, 24)}
 	m.loadSync(&protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", Transcript: []protocol.ConversationTranscriptEntry{firstPrompt}})
 	activity := map[string]any{"turn_id": "turn-1", "step": float64(1), "tool_call_id": "call-1"}
-	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 1, Type: string(agent.EventToolCall),
+	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 1, Type: string(agent.EventTextComplete), Content: answer.Content})
+	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 2, Type: string(agent.EventToolCall),
 		Data: map[string]any{"tool_name": "bash", "activity_id": activity}})
-	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 2, Type: string(agent.EventToolResult), Content: "preview",
+	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 3, Type: string(agent.EventToolResult), Content: "preview",
 		Data: map[string]any{"tool_name": "bash", "activity_id": activity, "output_ref": "out-1"}})
-	activityID := m.ui.Transcript.Blocks[2].ID
+	activityID := m.ui.Transcript.Blocks[3].ID
 	openOutput := func(stage string, wantBlocks int) {
 		t.Helper()
-		if len(m.ui.Transcript.Blocks) != wantBlocks || m.ui.Transcript.Blocks[2].ID != activityID || !m.ui.Transcript.Blocks[2].Completed || m.ui.Transcript.Blocks[3].Body != "first answer" {
+		if len(m.ui.Transcript.Blocks) != wantBlocks || m.ui.Transcript.Blocks[1].Body != answer.Content ||
+			m.ui.Transcript.Blocks[2].Kind != BlockActivityGroup || m.ui.Transcript.Blocks[3].ID != activityID || !m.ui.Transcript.Blocks[3].Completed {
 			t.Fatalf("%s sync did not reconcile the activity with its originating turn: %+v", stage, m.ui.Transcript.Blocks)
 		}
 		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
@@ -988,14 +1007,14 @@ func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 		m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
 	}
-	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 3,
+	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 4,
 		Transcript: []protocol.ConversationTranscriptEntry{firstPrompt, answer}}
-	_, sync := m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 3, Type: string(agent.EventFinished)})
+	_, sync := m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 4, Type: string(agent.EventFinished)})
 	m.Update(sync())
 	openOutput("completion", 4)
 
 	nextPrompt := protocol.ConversationTranscriptEntry{Role: "user", TurnID: "turn-2", Content: "second prompt"}
-	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 4,
+	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 5,
 		Transcript: []protocol.ConversationTranscriptEntry{firstPrompt, answer, nextPrompt}}
 	_, sync = m.Update(m.submit(nextPrompt.Content, persistence.SubmissionQueue)())
 	m.Update(sync())
@@ -1011,14 +1030,21 @@ func TestConversationTUIRestoresToolActivityFromHistory(t *testing.T) {
 	}
 	m := &conversationTUI{ui: testTUIModel(100, 30)}
 	m.loadSync(&protocol.ConversationSyncResult{
-		ConversationID: "conv-1", WorkerEpoch: "worker-2", Transcript: []protocol.ConversationTranscriptEntry{entry},
+		ConversationID: "conv-1", WorkerEpoch: "worker-2", Transcript: []protocol.ConversationTranscriptEntry{
+			entry,
+			{Role: "assistant", TurnID: "turn-1", StepNumber: 3, ActivitiesOmitted: 1},
+			{Role: "assistant", TurnID: "turn-1", StepNumber: 4, Content: "All done."},
+		},
 	})
-	if len(m.ui.Transcript.Blocks) != 3 {
-		t.Fatalf("expected activity group, call, and answer; got %+v", m.ui.Transcript.Blocks)
+	blocks := m.ui.Transcript.Blocks
+	if len(blocks) != 5 {
+		t.Fatalf("expected five transcript blocks, got %+v", blocks)
 	}
-	group, call, answer := m.ui.Transcript.Blocks[0], m.ui.Transcript.Blocks[1], m.ui.Transcript.Blocks[2]
-	if group.Kind != BlockActivityGroup || !group.Collapsed || call.Kind != BlockToolActivity || call.Activity == nil || call.Activity.Summary != "git status --short" || call.Body != "On branch main" || answer.Body != "Finished." {
-		t.Fatalf("history activity was not restored in transcript order: %+v", m.ui.Transcript.Blocks)
+	answer, group, call := blocks[0], blocks[1], blocks[2]
+	if answer.Body != entry.Content || group.Kind != BlockActivityGroup || !group.Collapsed || call.Kind != BlockToolActivity ||
+		call.Activity == nil || call.Activity.Summary != "git status --short" || call.Body != "On branch main" ||
+		blocks[3].Kind != BlockActivityGroup || blocks[3].OmittedActivities != 1 || blocks[4].Body != "All done." {
+		t.Fatalf("history activity was not restored in transcript order: %+v", blocks)
 	}
 }
 

@@ -987,7 +987,7 @@ func (m *conversationTUI) handlePromptInput(input string) tea.Cmd {
 			}
 			full.WriteString(block.Body)
 		}
-		m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockAssistantMessage, Role: "assistant", Header: "Buddy", Body: "Requested clipboard copy of full transcript.", CreatedAt: time.Now()})
+		m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockSystemStatus, Role: "system", Body: "Requested clipboard copy of full transcript.", CreatedAt: time.Now()})
 		return tea.SetClipboard(full.String())
 	}
 	if text == "/copy-last" {
@@ -1471,15 +1471,6 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	}
 	// Replace the canonical blocks together so recovery keeps the reading offset.
 	for _, entry := range result.Transcript {
-		if entry.Role == "assistant" {
-			key := transcriptActivityKey(entry.TurnID, entry.StepNumber)
-			if cached := activitiesByStep[key]; len(cached) > 0 {
-				restoredBlocks = append(restoredBlocks, cached...)
-				delete(activitiesByStep, key)
-			} else if len(entry.Activities) > 0 || entry.ActivitiesOmitted > 0 {
-				restoredBlocks = append(restoredBlocks, restoredActivityBlocks(entry)...)
-			}
-		}
 		if entry.Role == "user" {
 			restoredBlocks = append(restoredBlocks, TranscriptBlock{
 				ID:        newConversationID("block"),
@@ -1498,18 +1489,24 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			}
 		}
 		if entry.Role == "assistant" {
-			if strings.TrimSpace(entry.Content) == "" {
-				continue
+			if strings.TrimSpace(entry.Content) != "" {
+				restoredBlocks = append(restoredBlocks, TranscriptBlock{
+					ID:        newConversationID("block"),
+					TurnID:    entry.TurnID,
+					Kind:      BlockAssistantMessage,
+					Role:      "assistant",
+					Header:    "Buddy",
+					Body:      entry.Content,
+					CreatedAt: time.Now(),
+				})
 			}
-			restoredBlocks = append(restoredBlocks, TranscriptBlock{
-				ID:        newConversationID("block"),
-				TurnID:    entry.TurnID,
-				Kind:      BlockAssistantMessage,
-				Role:      "assistant",
-				Header:    "Buddy",
-				Body:      entry.Content,
-				CreatedAt: time.Now(),
-			})
+			key := transcriptActivityKey(entry.TurnID, entry.StepNumber)
+			if cached := activitiesByStep[key]; len(cached) > 0 {
+				restoredBlocks = append(restoredBlocks, cached...)
+				delete(activitiesByStep, key)
+			} else {
+				restoredBlocks = append(restoredBlocks, restoredActivityBlocks(entry)...)
+			}
 		}
 	}
 	for _, key := range activitySteps {
