@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -31,6 +32,35 @@ func TestTranscriptMouseSelectionCopiesRenderedUnicodeAcrossLines(t *testing.T) 
 	}
 	if view := ansi.Strip(m.View().Content); !strings.Contains(view, "alpha界beta") {
 		t.Fatalf("selection changed the rendered transcript: %q", view)
+	}
+}
+
+func TestTranscriptMouseSelectionPinsViewportWhileStreaming(t *testing.T) {
+	m := NewModel(Header{})
+	m.Width, m.Height = 40, 8
+	m.SetScreenContent(ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
+	m.Transcript.Append(TranscriptBlock{ID: "user", Kind: BlockUserMessage, Body: "history\nselect me"}, m.Width)
+	m.Update(Event{Kind: EventAssistantDelta, TurnID: "turn", Text: "First paragraph."})
+	m.Update(FlushMsg{})
+	before := ansi.Strip(m.View().Content)
+	row := slices.Index(strings.Split(before, "\n"), "select me")
+	if row < 0 || !m.BeginTranscriptSelection(row, 0) || !m.MoveTranscriptSelection(row, 8) {
+		t.Fatalf("could not start a drag on the visible transcript: %q", before)
+	}
+
+	m.Update(Event{Kind: EventAssistantDelta, TurnID: "turn", Text: "\n\nSecond paragraph.\n\nThird paragraph."})
+	m.Update(FlushMsg{})
+	if view := ansi.Strip(m.View().Content); view != before {
+		t.Errorf("streaming moved the viewport during selection: %q, want %q", view, before)
+	}
+	if got, dragged := m.EndTranscriptSelection(row, 8); !dragged || got != "select me" {
+		t.Fatalf("release copied %q, dragged=%v", got, dragged)
+	}
+	if view := m.View().Content; !strings.Contains(view, "Third paragraph.") {
+		t.Fatalf("viewport did not resume following the stream: %q", view)
+	}
+	if got := m.SelectedText(); got != "" {
+		t.Fatalf("selection remained attached to rows that moved: %q", got)
 	}
 }
 

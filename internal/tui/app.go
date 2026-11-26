@@ -267,14 +267,12 @@ func (m *Model) View() tea.View {
 					body = RenderWelcome(Welcome{Width: m.Width, Height: available, Model: m.Metadata.Model, Workspace: m.Metadata.Workspace, GitBranch: m.Metadata.GitBranch, Version: content.Version, Status: status})
 				}
 			} else {
-				body = m.Transcript.VisibleLines(available, m.Width)
+				body = m.renderTranscriptSelection(m.transcriptLines(available))
 			}
 		}
-		body = m.renderTranscriptSelection(body)
 		return RenderScreen(Screen{Width: m.Width, Height: m.Height, Header: content.Header, Body: body, Footer: footer})
 	}
-	body := m.Transcript.VisibleLines(max(0, m.Height-2), m.Width)
-	body = m.renderTranscriptSelection(body)
+	body := m.renderTranscriptSelection(m.transcriptLines(max(0, m.Height-2)))
 	return RenderScreen(Screen{
 		Width: m.Width, Height: m.Height,
 		Header: RenderHeader(Header{Width: m.Width, Model: m.Metadata.Model, Workspace: m.Metadata.Workspace, GitBranch: m.Metadata.GitBranch, State: m.State, Standard: m.Metadata.Standard}),

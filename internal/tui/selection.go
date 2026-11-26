@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -11,37 +12,39 @@ import (
 type transcriptPoint struct{ row, column int }
 
 type transcriptSelection struct {
-	start, end transcriptPoint
-	dragging   bool
-	active     bool
+	start, end  transcriptPoint
+	pinnedLines []string
+	active      bool
 }
 
 // ClearTranscriptSelection removes the visible selection and drag state.
 func (m *Model) ClearTranscriptSelection() { m.selection = transcriptSelection{} }
 
 func (m *Model) clearTranscriptSelectionIfIdle() {
-	if !m.selection.dragging {
+	if !m.TranscriptSelectionInProgress() {
 		m.ClearTranscriptSelection()
 	}
 }
 
 // TranscriptSelectionInProgress reports whether a left-button drag is active.
-func (m *Model) TranscriptSelectionInProgress() bool { return m.selection.dragging }
+func (m *Model) TranscriptSelectionInProgress() bool { return m.selection.pinnedLines != nil }
 
 // BeginTranscriptSelection starts a drag selection at a terminal screen cell.
 func (m *Model) BeginTranscriptSelection(screenRow, column int) bool {
-	row, ok := m.transcriptBodyRow(screenRow)
-	if !ok || column < 0 || column >= m.Width {
-		m.selection = transcriptSelection{}
+	headerRows, _, lines := m.transcriptBody()
+	row := screenRow - headerRows
+	if row < 0 || row >= len(lines) || column < 0 || column >= m.Width {
+		m.ClearTranscriptSelection()
 		return false
 	}
-	m.selection = transcriptSelection{start: transcriptPoint{row, column}, end: transcriptPoint{row, column}, dragging: true}
+	point := transcriptPoint{row, column}
+	m.selection = transcriptSelection{start: point, end: point, pinnedLines: lines}
 	return true
 }
 
 // MoveTranscriptSelection updates an in-progress drag.
 func (m *Model) MoveTranscriptSelection(screenRow, column int) bool {
-	if !m.selection.dragging {
+	if !m.TranscriptSelectionInProgress() {
 		return false
 	}
 	row, column := m.clampTranscriptPoint(screenRow, column)
@@ -49,19 +52,26 @@ func (m *Model) MoveTranscriptSelection(screenRow, column int) bool {
 	return true
 }
 
-// EndTranscriptSelection finishes a drag and returns selected rendered text.
+// EndTranscriptSelection returns the selected text and whether it handled the release.
 func (m *Model) EndTranscriptSelection(screenRow, column int) (string, bool) {
-	if !m.selection.dragging {
+	if !m.TranscriptSelectionInProgress() {
 		return "", false
 	}
 	row, column := m.clampTranscriptPoint(screenRow, column)
 	m.selection.end = transcriptPoint{row, column}
-	m.selection.dragging = false
 	m.selection.active = m.selection.start != m.selection.end
-	if !m.selection.active {
-		return "", false
+	selected := m.SelectedText()
+	pinned := m.selection.pinnedLines
+	m.selection.pinnedLines = nil
+
+	_, _, live := m.transcriptBody()
+	first, last := min(m.selection.start.row, row), max(m.selection.start.row, row)
+	if last >= len(live) || !slices.Equal(pinned[first:last+1], live[first:last+1]) {
+		// The old rows can no longer be highlighted or clicked.
+		m.ClearTranscriptSelection()
+		return selected, true
 	}
-	return m.SelectedText(), true
+	return selected, m.selection.active
 }
 
 // SelectedText returns plain text from the current rendered selection.
@@ -127,7 +137,14 @@ func (m *Model) transcriptBody() (int, int, []string) {
 		headerRows, footerRows = 1, 1
 	}
 	height := max(0, m.Height-headerRows-footerRows)
-	return headerRows, height, m.Transcript.VisibleLines(height, m.Width)
+	return headerRows, height, m.transcriptLines(height)
+}
+
+func (m *Model) transcriptLines(height int) []string {
+	if m.TranscriptSelectionInProgress() {
+		return m.selection.pinnedLines[:min(height, len(m.selection.pinnedLines))]
+	}
+	return m.Transcript.VisibleLines(height, m.Width)
 }
 
 func (m *Model) transcriptBodyHeight() int {
@@ -143,7 +160,7 @@ func (m *Model) clampTranscriptPoint(screenRow, column int) (int, int) {
 }
 
 func (m *Model) renderTranscriptSelection(lines []string) []string {
-	if !m.selection.active && !m.selection.dragging || len(lines) == 0 {
+	if !m.selection.active && !m.TranscriptSelectionInProgress() || len(lines) == 0 {
 		return lines
 	}
 	start, end := m.selection.start, m.selection.end
@@ -152,6 +169,9 @@ func (m *Model) renderTranscriptSelection(lines []string) []string {
 	}
 	if start.row < 0 || end.row >= len(lines) {
 		return lines
+	}
+	if m.TranscriptSelectionInProgress() {
+		lines = slices.Clone(lines)
 	}
 	selectedStyle := lipgloss.NewStyle().Reverse(true)
 	for row := start.row; row <= end.row; row++ {
