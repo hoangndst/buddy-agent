@@ -153,17 +153,21 @@ func TestModelReducesStreamingAndSnapshotEvents(t *testing.T) {
 
 func TestModelMatchesActivityStartAndResult(t *testing.T) {
 	m := NewModel(Header{Workspace: "/work"})
-	started := &Activity{Identity: "turn\x001\x00call", Tool: "read_file", Path: "main.go", Step: 1, StartedAt: time.Now()}
+	started := &Activity{Identity: "turn\x001\x00call", Tool: "read_file", Summary: "main.go", Path: "main.go", Step: 1, StartedAt: time.Now()}
 	updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: started})
 	if len(m.Transcript.Blocks) != 2 || m.Transcript.Blocks[0].Kind != BlockActivityGroup || m.Transcript.Blocks[1].Activity.Identity != started.Identity || m.Transcript.Blocks[1].GroupID != m.Transcript.Blocks[0].ID {
 		t.Fatalf("activity start was not recorded: %+v", m.Transcript.Blocks)
 	}
 	completed := *started
+	completed.Summary = ""
 	code := 0
 	completed.ExitCode, completed.Elapsed = &code, time.Second
 	updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: "turn", Activity: &completed, Text: "file contents"})
 	if len(m.Transcript.Blocks) != 2 || !m.Transcript.Blocks[1].Completed || !m.Transcript.Blocks[1].Collapsed || m.Transcript.Blocks[1].Body != "file contents" || !strings.Contains(m.Transcript.Blocks[1].Header, "Done read_file") {
 		t.Fatalf("activity result did not update its start block: %+v", m.Transcript.Blocks)
+	}
+	if got := m.Transcript.Blocks[1].Activity.Summary; got != started.Summary {
+		t.Fatalf("completed activity summary = %q, want %q", got, started.Summary)
 	}
 }
 

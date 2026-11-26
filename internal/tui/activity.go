@@ -106,10 +106,13 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 		content = toolStyle.Render(activityGroupSummary(block, children))
 		if !block.Collapsed {
 			for _, child := range children {
-				rendered, _ := RenderBlock(child, blocks, max(1, width-2), streamingText, selectedActivity, focused)
-				for _, line := range strings.Split(rendered, "\n") {
-					content += "\n  " + line
+				rendered, nestedOffset := RenderBlock(child, blocks, max(1, width-2), streamingText, selectedActivity, focused)
+				if child.ID == selectedActivity {
+					childOffset = len(content)
+				} else if nestedOffset >= 0 {
+					childOffset = len(content) + len("\n  ") + len(strings.ReplaceAll(rendered[:nestedOffset], "\n", "\n  "))
 				}
+				content += "\n  " + strings.ReplaceAll(rendered, "\n", "\n  ")
 			}
 		}
 	default:

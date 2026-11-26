@@ -780,6 +780,37 @@ func TestConversationTUIMouseDragCopiesTranscriptSelection(t *testing.T) {
 	}
 }
 
+func TestConversationTUICopyNoticeClearsSelectionWhenViewportShrinks(t *testing.T) {
+	m := &conversationTUI{ui: testTUIModel(80, 24)}
+	var lines []string
+	for i := 0; i < 40; i++ {
+		lines = append(lines, fmt.Sprintf("  line %02d", i))
+	}
+	m.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: strings.Join(lines, "\n")})
+	m.View()
+	m.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 2, Y: 2})
+	_, cmd := m.Update(tea.MouseReleaseMsg{Button: tea.MouseLeft, X: 8, Y: 2})
+	if cmd == nil {
+		t.Fatal("mouse release did not copy the selected text")
+	}
+	if got := fmt.Sprint(cmd()); !strings.HasPrefix(got, "line ") {
+		t.Fatalf("mouse release copied %q, want transcript text", got)
+	}
+	if view := m.View().Content; !strings.Contains(view, "Copied selection.") {
+		t.Fatalf("copy notice missing from view: %q", view)
+	}
+	if got := m.ui.SelectedText(); got != "" {
+		t.Fatalf("selection remained after copy notice changed the viewport: %q", got)
+	}
+	_, cmd = m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd == nil {
+		t.Fatal("Ctrl+C without a selection did not return a command")
+	}
+	if msg := cmd(); msg != (tea.QuitMsg{}) {
+		t.Fatalf("Ctrl+C without a selection returned %T (%v), want quit", msg, msg)
+	}
+}
+
 func TestConversationTUIClickExpandsActivityDisclosure(t *testing.T) {
 	model := &conversationTUI{ui: testTUIModel(80, 8)}
 	model.ui.SetScreenContent(tui.ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
@@ -1271,6 +1302,26 @@ func TestConversationTUISelectionKeepsExpandedChildVisible(t *testing.T) {
 	for i := 19; i >= 1; i-- {
 		m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 		assertVisible(i)
+	}
+}
+
+func TestConversationTUISelectionKeepsGroupedActivitiesVisible(t *testing.T) {
+	m := &conversationTUI{ui: testTUIModel(40, 12)}
+	m.appendBlock(TranscriptBlock{ID: "group", Kind: BlockActivityGroup})
+	var names []string
+	for i := 1; i <= 8; i++ {
+		call, child := fmt.Sprintf("call-%02d", i), fmt.Sprintf("child-%02d", i)
+		m.appendBlock(TranscriptBlock{ID: call, GroupID: "group", Kind: BlockToolActivity, Header: call, Activity: &tui.Activity{AgentName: call}})
+		m.appendBlock(TranscriptBlock{ID: child, ParentID: call, Kind: BlockSubagentActivity, Header: child, Body: strings.Repeat("wrapped output ", 10) + "\nsecond body line"})
+		names = append(names, call, child)
+	}
+	m.View()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	for _, want := range names {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		if view := m.View().Content; m.ui.SelectedActivity != want || !strings.Contains(view, want) {
+			t.Fatalf("selected activity %q should be visible, selected=%q view=%q", want, m.ui.SelectedActivity, view)
+		}
 	}
 }
 

@@ -283,7 +283,12 @@ func (m *Model) View() tea.View {
 }
 
 // SetScreenContent supplies rows the runtime adapter derives from daemon state.
-func (m *Model) SetScreenContent(content ScreenContent) { m.screenContent = &content }
+func (m *Model) SetScreenContent(content ScreenContent) {
+	if previous := m.screenContent; previous != nil && len(previous.Header)+len(previous.Footer) != len(content.Header)+len(content.Footer) {
+		m.clearTranscriptSelectionIfIdle()
+	}
+	m.screenContent = &content
+}
 
 // ActiveApproval returns the oldest pending approval shown by the modal.
 func (m *Model) ActiveApproval() *ApprovalRequest {
@@ -357,13 +362,10 @@ func (m *Model) selectActivity(delta int) {
 	if selected < 0 {
 		return
 	}
-	selectedParent := m.Transcript.Blocks[selected].ParentID
-	if selectedParent == "" {
-		selectedParent = m.Transcript.Blocks[selected].GroupID
-	}
+	container := m.activityContainerID(m.Transcript.Blocks[selected])
 	target := m.SelectedActivity
-	if selectedParent != "" {
-		target = selectedParent
+	if container != "" {
+		target = container
 	}
 	viewportHeight := max(1, m.Height-len(m.screenContentHeader())-len(m.screenContentFooter()))
 	rowsAfter := 0
@@ -372,7 +374,7 @@ func (m *Model) selectActivity(delta int) {
 		count := m.Transcript.LineCount(block, m.Width)
 		if block.ID == target {
 			row := count / 2
-			if selectedParent != "" {
+			if container != "" {
 				rendered, childOffset := RenderBlock(block, m.Transcript.Blocks, m.Width, m.streamingText, m.SelectedActivity, true)
 				if childOffset >= 0 {
 					row = len(WrapLines(rendered[:childOffset], m.Width))
@@ -404,19 +406,26 @@ func (m *Model) invalidateActivity(id string) {
 	}
 	if index := m.Transcript.Index(id); index >= 0 {
 		m.Transcript.Invalidate(id)
-		if parent := m.Transcript.Blocks[index].ParentID; parent != "" {
-			m.Transcript.Invalidate(parent)
-		}
-		if group := m.Transcript.Blocks[index].GroupID; group != "" {
-			m.Transcript.Invalidate(group)
+		if container := m.activityContainerID(m.Transcript.Blocks[index]); container != "" {
+			m.Transcript.Invalidate(container)
 		}
 	}
+}
+
+func (m *Model) activityContainerID(block TranscriptBlock) string {
+	if block.ParentID == "" {
+		return block.GroupID
+	}
+	if index := m.Transcript.Index(block.ParentID); index >= 0 && m.Transcript.Blocks[index].GroupID != "" {
+		return m.Transcript.Blocks[index].GroupID
+	}
+	return block.ParentID
 }
 
 func parentActivityIsExpanded(block TranscriptBlock, blocks []TranscriptBlock) bool {
 	for _, parent := range blocks {
 		if parent.ID == block.ParentID {
-			return !parent.Collapsed
+			return !parent.Collapsed && (parent.GroupID == "" || activityGroupIsExpanded(parent, blocks))
 		}
 	}
 	return false
@@ -793,8 +802,13 @@ func (m *Model) activityGroup(turnID string, step int, at time.Time) string {
 }
 
 func (m *Model) completeActivity(index int, output string, activity Activity) {
-	if activity.Identity == "" && m.Transcript.Blocks[index].Activity != nil {
-		activity.Identity = m.Transcript.Blocks[index].Activity.Identity
+	if started := m.Transcript.Blocks[index].Activity; started != nil {
+		if activity.Identity == "" {
+			activity.Identity = started.Identity
+		}
+		if activity.Summary == "" {
+			activity.Summary = started.Summary
+		}
 	}
 	if activity.Step == 0 {
 		activity.Step = m.Transcript.Blocks[index].Step
