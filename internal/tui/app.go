@@ -35,6 +35,7 @@ type Model struct {
 	screenContent     *ScreenContent
 	TranscriptFocused bool
 	SelectedActivity  string
+	selection         transcriptSelection
 }
 
 // NewModel creates conversation presentation state for one terminal session.
@@ -72,6 +73,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.Width, m.Height = msg.Width, msg.Height
+		m.selection = transcriptSelection{}
 		if m.Composer != nil {
 			m.Composer.Resize(msg.Width, msg.Height)
 		}
@@ -80,6 +82,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.Transcript.ClearCache()
 	case tea.MouseWheelMsg:
+		m.selection = transcriptSelection{}
 		if m.HasInspection() {
 			return m, m.updateInspectionWheel(msg)
 		}
@@ -90,9 +93,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.Transcript.ScrollOffset = max(0, m.Transcript.ScrollOffset-3)
 		}
 	case FlushMsg:
+		m.clearTranscriptSelectionIfIdle()
 		m.tickerActive = false
 		m.flushDelta()
 	case Event:
+		m.clearTranscriptSelectionIfIdle()
 		return m, m.reduce(msg)
 	case tea.KeyPressMsg:
 		if request := m.ActiveApproval(); request != nil && m.approvalModal != nil {
@@ -265,9 +270,11 @@ func (m *Model) View() tea.View {
 				body = m.Transcript.VisibleLines(available, m.Width)
 			}
 		}
+		body = m.renderTranscriptSelection(body)
 		return RenderScreen(Screen{Width: m.Width, Height: m.Height, Header: content.Header, Body: body, Footer: footer})
 	}
 	body := m.Transcript.VisibleLines(max(0, m.Height-2), m.Width)
+	body = m.renderTranscriptSelection(body)
 	return RenderScreen(Screen{
 		Width: m.Width, Height: m.Height,
 		Header: RenderHeader(Header{Width: m.Width, Model: m.Metadata.Model, Workspace: m.Metadata.Workspace, GitBranch: m.Metadata.GitBranch, State: m.State, Standard: m.Metadata.Standard}),

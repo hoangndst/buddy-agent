@@ -182,9 +182,9 @@ func activityGroupSummary(group TranscriptBlock, children []TranscriptBlock) str
 		label += " · " + elapsed.Round(100*time.Millisecond).String()
 	}
 	if group.Collapsed {
-		label += "  ·  Ctrl+O to expand"
+		label += "  ·  click or Ctrl+O to expand"
 	} else {
-		label += "  ·  Ctrl+O to collapse"
+		label += "  ·  click or Ctrl+O to collapse"
 	}
 	icon := "●"
 	if failed > 0 {

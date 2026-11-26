@@ -756,6 +756,57 @@ func TestConversationTUIToolEventHyperlink(t *testing.T) {
 	}
 }
 
+func TestConversationTUIMouseDragCopiesTranscriptSelection(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
+	model := &conversationTUI{ui: testTUIModel(80, 8)}
+	model.ui.SetScreenContent(tui.ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
+	model.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: "copy this text"})
+	if _, cmd := model.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 2, Y: 1}); cmd != nil {
+		t.Fatal("mouse press unexpectedly ran a command")
+	}
+	if _, cmd := model.Update(tea.MouseMotionMsg{Button: tea.MouseLeft, X: 5, Y: 1}); cmd != nil {
+		t.Fatal("mouse drag unexpectedly ran a command")
+	}
+	_, cmd := model.Update(tea.MouseReleaseMsg{Button: tea.MouseLeft, X: 5, Y: 1})
+	if cmd == nil || fmt.Sprint(cmd()) != "copy" {
+		t.Fatalf("mouse release clipboard command = %v", cmd)
+	}
+	for _, mod := range []tea.KeyMod{tea.ModCtrl, tea.ModSuper} {
+		_, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Mod: mod})
+		if cmd == nil || fmt.Sprint(cmd()) != "copy" {
+			t.Fatalf("copy shortcut with modifier %v did not copy the selection", mod)
+		}
+	}
+}
+
+func TestConversationTUIClickExpandsActivityDisclosure(t *testing.T) {
+	model := &conversationTUI{ui: testTUIModel(80, 8)}
+	model.ui.SetScreenContent(tui.ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
+	model.appendBlock(TranscriptBlock{ID: "group", Kind: BlockActivityGroup, Collapsed: true})
+	model.appendBlock(TranscriptBlock{ID: "call", GroupID: "group", Kind: BlockToolActivity, Header: "read_file", Collapsed: true})
+	model.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 4, Y: 1})
+	_, cmd := model.Update(tea.MouseReleaseMsg{Button: tea.MouseLeft, X: 4, Y: 1})
+	if cmd != nil || model.ui.Transcript.Blocks[0].Collapsed {
+		t.Fatalf("mouse click did not expand activity disclosure: cmd=%v group=%+v", cmd, model.ui.Transcript.Blocks[0])
+	}
+}
+
+func TestConversationTUIClickOpensRenderedMarkdownLinkOnRelease(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
+	model := &conversationTUI{ui: testTUIModel(80, 8)}
+	model.ui.SetScreenContent(tui.ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
+	model.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "[Open](https://example.com/path)"})
+	line := ansi.Strip(model.ui.Transcript.VisibleLines(6, 80)[0])
+	column := strings.Index(line, "Open")
+	model.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: column, Y: 1})
+	_, cmd := model.Update(tea.MouseReleaseMsg{Button: tea.MouseLeft, X: column, Y: 1})
+	if cmd == nil || model.ui.HyperlinkAt(1, column) != "https://example.com/path" {
+		t.Fatal("mouse release did not dispatch the rendered Markdown link")
+	}
+}
+
 type terminalOutputFunc func([]byte) (int, error)
 
 func (f terminalOutputFunc) Write(p []byte) (int, error) { return f(p) }

@@ -267,6 +267,23 @@ func (t *Transcript) VisibleLines(height, width int) []string {
 	return lines
 }
 
+// BlockAt returns the top-level block occupying a visible transcript row.
+func (t *Transcript) BlockAt(row, height, width int) string {
+	blocks, top, _ := t.VisibleWindow(height, width)
+	if row < 0 {
+		return ""
+	}
+	row += top
+	for _, block := range blocks {
+		count := t.LineCount(block, width)
+		if count > 0 && row < count {
+			return block.ID
+		}
+		row -= count
+	}
+	return ""
+}
+
 // HyperlinkAt returns a Markdown link at a row within the currently visible transcript.
 func (t *Transcript) HyperlinkAt(row, column, height, width int) string {
 	if row < 0 || column < 0 {

@@ -563,13 +563,33 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.MouseClickMsg:
-		if msg.Button == tea.MouseLeft {
-			if target := m.ui.HyperlinkAt(msg.Y, msg.X); target != "" {
-				return m, openExternalLink(target)
-			}
+		if msg.Button == tea.MouseLeft && m.ui.BeginTranscriptSelection(msg.Y, msg.X) {
+			return m, nil
 		}
 		_, cmd := m.ui.Update(msg)
 		return m, cmd
+	case tea.MouseMotionMsg:
+		m.ui.MoveTranscriptSelection(msg.Y, msg.X)
+		return m, nil
+	case tea.MouseReleaseMsg:
+		if !m.ui.TranscriptSelectionInProgress() {
+			return m, nil
+		}
+		selected, dragged := m.ui.EndTranscriptSelection(msg.Y, msg.X)
+		if dragged {
+			if selected != "" {
+				m.noticeText = "Copied selection."
+				return m, tea.SetClipboard(selected)
+			}
+			return m, nil
+		}
+		if target := m.ui.HyperlinkAt(msg.Y, msg.X); target != "" {
+			return m, openExternalLink(target)
+		}
+		if _, cmd := m.ui.ActivateTranscriptAt(msg.Y); cmd != nil {
+			return m, cmd
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		_, _ = m.ui.Update(msg)
 		m.clearCache()
@@ -881,8 +901,22 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		_, _ = m.ui.Update(tui.Event{Kind: tui.EventDiffResult, InspectionGeneration: msg.generation, DiffView: toTUIDiffView(msg.result)})
 		return m, nil
 	case tea.KeyPressMsg:
+		copySelection := msg.String() == "ctrl+c" || msg.Code == 'c' && msg.Mod&(tea.ModSuper|tea.ModMeta) != 0
+		if !copySelection {
+			m.ui.ClearTranscriptSelection()
+		}
 		if msg.String() == "ctrl+c" {
+			if selected := m.ui.SelectedText(); selected != "" {
+				m.noticeText = "Copied selection."
+				return m, tea.SetClipboard(selected)
+			}
 			return m, tea.Quit
+		}
+		if msg.Code == 'c' && msg.Mod&(tea.ModSuper|tea.ModMeta) != 0 {
+			if selected := m.ui.SelectedText(); selected != "" {
+				m.noticeText = "Copied selection."
+				return m, tea.SetClipboard(selected)
+			}
 		}
 		if msg.String() == "alt+c" {
 			return m, m.copyLatestResponse()
