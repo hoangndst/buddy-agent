@@ -56,7 +56,7 @@ func TestTranscriptMouseSelectionPinsViewportWhileStreaming(t *testing.T) {
 	if got, dragged := m.EndTranscriptSelection(row, 8); !dragged || got != "select me" {
 		t.Fatalf("release copied %q, dragged=%v", got, dragged)
 	}
-	if view := m.View().Content; !strings.Contains(view, "Third paragraph.") {
+	if view := ansi.Strip(m.View().Content); !strings.Contains(view, "Third paragraph.") {
 		t.Fatalf("viewport did not resume following the stream: %q", view)
 	}
 	if got := m.SelectedText(); got != "" {
