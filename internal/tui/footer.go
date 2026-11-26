@@ -16,6 +16,7 @@ type Footer struct {
 	ApprovalView, ApprovalKeys string
 	Queued, Steering           int
 	Error                      string
+	Notice                     string
 	HasError                   bool
 	Completion                 []string
 	Composer                   string
@@ -41,6 +42,9 @@ func RenderFooter(f Footer) []string {
 	}
 	if f.Error != "" {
 		rows = append(rows, f.Error)
+	}
+	if f.Notice != "" {
+		rows = append(rows, mutedStyle.Render(f.Notice))
 	}
 	rows = append(rows, f.Completion...)
 	if f.Height <= 0 {
@@ -68,7 +72,7 @@ func RenderFooter(f Footer) []string {
 		if f.State == "running" {
 			footer = lipgloss.NewStyle().Foreground(ThemeColor("#387E61", "#78B99A")).Render("● Connected") + "  " + lipgloss.NewStyle().Bold(true).Foreground(ThemeColor("#A94721", "#EFA276")).Render("Working…") + "  " + mutedStyle.Render("/interrupt · Ctrl+C detach")
 		} else if f.Standard {
-			extra := "Enter send · Shift+Enter newline · Ctrl+C detach"
+			extra := "Enter send · Shift+Enter newline · Alt+C copy last · drag select/copy · Ctrl+C detach"
 			if f.Standalone {
 				extra = strings.ReplaceAll(extra, "Ctrl+C detach", "Ctrl+C stop")
 			}

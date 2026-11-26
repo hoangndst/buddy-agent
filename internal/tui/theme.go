@@ -30,7 +30,6 @@ var (
 	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(ThemeColor("#A94721", "#EFA276"))
 	mutedStyle   = lipgloss.NewStyle().Foreground(ThemeColor("#62656D", "#9297A3"))
 	userStyle    = lipgloss.NewStyle().Bold(true).Foreground(ThemeColor("#27609B", "#78B9EF"))
-	buddyStyle   = lipgloss.NewStyle().Bold(true).Foreground(ThemeColor("#A94721", "#EFA276"))
 	toolStyle    = lipgloss.NewStyle().Foreground(ThemeColor("#555963", "#B8B8B8"))
 	thoughtStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#929292")).Italic(true)
 )

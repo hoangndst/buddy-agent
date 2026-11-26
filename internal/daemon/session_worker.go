@@ -215,6 +215,9 @@ func createEventNotification(sessionID string, eventID uint64, evt agent.Event, 
 			data["output_truncated"] = evt.OutputTruncated
 		}
 		if evt.ToolArgs != "" {
+			if summary := toolActivitySummary(evt.ToolName, evt.ToolArgs); summary != "" {
+				data["activity_summary"] = summary
+			}
 			var argsMap map[string]any
 			if err := json.Unmarshal([]byte(evt.ToolArgs), &argsMap); err == nil {
 				if evt.ToolName == "invoke_subagent" {

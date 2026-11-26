@@ -194,6 +194,18 @@ type ConversationTranscriptEntry struct {
 	Content          string `json:"content"`
 	ContentTruncated bool   `json:"content_truncated,omitempty"`
 	CreatedAt        string `json:"created_at,omitempty"`
+	Activities       []ConversationActivity `json:"activities,omitempty"`
+	ActivitiesOmitted int                    `json:"activities_omitted,omitempty"`
+}
+
+// ConversationActivity is a bounded, redacted presentation preview of one stored tool call.
+type ConversationActivity struct {
+	ID              string `json:"id"`
+	Tool            string `json:"tool"`
+	Summary         string `json:"summary,omitempty"`
+	Output          string `json:"output,omitempty"`
+	OutputTruncated bool   `json:"output_truncated,omitempty"`
+	ExitCode        int    `json:"exit_code,omitempty"`
 }
 
 // ConversationTurnState reports the persisted lifecycle of one conversation turn.

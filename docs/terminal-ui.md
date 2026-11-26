@@ -20,7 +20,7 @@ Please inspect the failing test.
 Buddy
 The failure comes from the updated renderer.
 
-✓ bash · 4.2s · Enter to expand
+✓ 1 tool call · shell · 4.2s  + Show details
 
 › Ask Buddy anything…
 ● Connected · ? shortcuts · / commands
@@ -28,7 +28,7 @@ The failure comes from the updated renderer.
 
 At compact sizes (40–79 columns or 12–23 rows), Buddy shortens the header and trims secondary hints. Below 40 columns or 12 rows, it hides optional metadata before the active interaction. If the terminal is only one row high, Buddy shows the composer or pending approval keys. Approval remains pending if the terminal is too narrow to show every available decision key; resize before responding.
 
-Workspace and conversation names may be shortened to fit. The transcript keeps its message order and scrolls independently from the composer; use the mouse wheel or PageUp/PageDown to inspect history. Tool calls and results appear in a single expandable activity row. Empty assistant messages do not create blank role labels. Activity status uses text and symbols as well as color, so state remains understandable without color. Context usage is shown only when the runtime provides it.
+Workspace and conversation names may be shortened to fit. The transcript keeps its message order and scrolls independently from the composer; use the mouse wheel or PageUp/PageDown to inspect history. Tool calls and results appear in a single expandable activity row; opening a group reveals its calls and available output previews. Reopened conversations restore bounded, redacted previews; full output inspection remains available while its worker is running. Empty assistant messages do not create blank role labels. Activity status uses text and symbols as well as color, so state remains understandable without color. Context usage is shown only when the runtime provides it.
 
 Workspace and conversation pickers, `/diff`, and output inspection use the same header and contextual controls. They temporarily replace the conversation and composer while keeping the prompt draft in memory. Non-TTY execution continues to use the existing line-oriented or standalone path without alternate-screen controls.
 
@@ -67,6 +67,7 @@ When a tool call requires confirmation, the TUI shows its arguments in an approv
 | `F6` | TUI | Switch keyboard focus between the composer and transcript activity. |
 | `Up` / `Down` | Transcript focus | Select an activity; inside an output pager, scroll the current page. |
 | `Enter` | Transcript focus | Open a selected output pager or expand/collapse activity details. |
+| `Ctrl+O` | TUI | Expand or collapse all tool activity groups. |
 | `PageUp` / `PageDown` | Transcript focus | Scroll transcript history; inside an output pager, move between output pages. |
 | `Up` / `Down` | `/diff` | Select a changed file; scroll within the open diff. |
 | `Enter` | `/diff` | Open the selected file diff. |

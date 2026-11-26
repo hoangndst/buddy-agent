@@ -375,6 +375,64 @@ func TestConversationWorkerSyncTranscriptPaginationAdvances(t *testing.T) {
 	}
 }
 
+func TestConversationWorkerSyncRestoresBoundedRedactedActivityWithoutReasoning(t *testing.T) {
+	ctx := context.Background()
+	store, err := persistence.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	fingerprint := persistence.SubmissionFingerprint("inspect", persistence.SubmissionQueue)
+	started, err := store.CreateConversation(ctx, &persistence.ConversationStartRequest{
+		Session: persistence.SessionRecord{ID: "activity-history-test", WorkingDir: t.TempDir(), Model: "test-model"},
+		StartID: "activity-history-start", PayloadFingerprint: fingerprint,
+		FirstSubmission: persistence.SubmissionRecord{SubmissionID: "activity-history-submission", Prompt: "inspect", Mode: persistence.SubmissionQueue, PayloadFingerprint: fingerprint, TurnID: ptrString("activity-history-turn")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitTurn(ctx, &persistence.TurnRecord{
+		SessionID: started.ConversationID, ConversationTurnID: "activity-history-turn", StepNumber: 1,
+		Role: "assistant", Content: "Finished.", ReasoningContent: "private reasoning must stay private",
+		ToolCalls: []persistence.ToolCallRecord{{
+			ID: "call-1", Name: "bash", Args: `{"command":"git status --short","api_key":"sk-test-secret"}`,
+			Result: "ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+		}},
+	}, 1, persistence.TokenUsage{}); err != nil {
+		t.Fatal(err)
+	}
+	worker := &ConversationWorker{conversationID: started.ConversationID, store: store, ring: NewEventRingBuffer(DefaultRingBufferCapacity), workerEpoch: "activity-history-epoch"}
+	result, _, err := worker.Sync(ctx, protocol.ConversationSyncParams{ConversationID: started.ConversationID}, nil)
+	if err != nil {
+		t.Fatalf("sync activity history: %v", err)
+	}
+	if len(result.Transcript) < 2 || len(result.Transcript[1].Activities) != 1 {
+		t.Fatalf("tool activity missing from durable transcript: %+v", result.Transcript)
+	}
+	activity := result.Transcript[1].Activities[0]
+	if activity.Summary != "git status --short" || strings.Contains(activity.Summary, "secret") || strings.Contains(activity.Output, "abcdefghijklmnopqrstuvwxyz") || !strings.Contains(activity.Output, "[REDACTED]") {
+		t.Fatalf("activity preview is missing or unredacted: %+v", activity)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "private reasoning") || strings.Contains(string(encoded), "sk-test-secret") {
+		t.Fatalf("sync exposed reasoning or unredacted tool arguments: %s", encoded)
+	}
+}
+
+func TestConversationActivitiesBoundBatchAndOutputPreview(t *testing.T) {
+	calls := make([]persistence.ToolCallRecord, conversationActivityLimit+3)
+	for i := range calls {
+		calls[i] = persistence.ToolCallRecord{ID: fmt.Sprintf("call-%d", i), Name: "read_file", Result: strings.Repeat("x", conversationActivityOutputSize+100)}
+	}
+	activities, omitted := conversationActivities(calls)
+	if len(activities) != conversationActivityLimit || omitted != 3 || !activities[0].OutputTruncated || len(activities[0].Output) > conversationActivityOutputSize+64 {
+		t.Fatalf("activity preview bounds = count %d omitted %d output %d truncated %v", len(activities), omitted, len(activities[0].Output), activities[0].OutputTruncated)
+	}
+}
+
 func TestConversationWorkerSyncBoundsTranscriptPagesByEncodedFrameSize(t *testing.T) {
 	ctx := context.Background()
 	store, err := persistence.NewSQLiteStore(":memory:")

@@ -63,6 +63,12 @@ func (m ptyProbeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		reportPTY(ptyReport{Type: "window", Width: msg.Width, Height: msg.Height, Raw: raw})
 	case tea.MouseWheelMsg:
 		reportPTY(ptyReport{Type: "mouse", Value: fmt.Sprint(msg.Button)})
+	case tea.MouseClickMsg:
+		reportPTY(ptyReport{Type: "mouse-click", Value: fmt.Sprint(msg.Button)})
+	case tea.MouseMotionMsg:
+		reportPTY(ptyReport{Type: "mouse-motion", Value: fmt.Sprint(msg.Button)})
+	case tea.MouseReleaseMsg:
+		reportPTY(ptyReport{Type: "mouse-release", Value: fmt.Sprint(msg.Button)})
 	case tea.KeyPressMsg:
 		reportPTY(ptyReport{Type: "key", Value: msg.String()})
 		if os.Getenv(ptyHelperEnv) == "panic" {
@@ -316,6 +322,10 @@ func TestTUIRunnerUsesAndRestoresRealPTY(t *testing.T) {
 	child.waitReport(t, "key", func(r ptyReport) bool { return r.Value == "x" })
 	child.writeInput(t, "\x1b[<64;1;1M")
 	child.waitReport(t, "mouse", nil)
+	child.writeInput(t, "\x1b[<0;2;2M\x1b[<32;5;2M\x1b[<0;5;2m")
+	child.waitReport(t, "mouse-click", nil)
+	child.waitReport(t, "mouse-motion", nil)
+	child.waitReport(t, "mouse-release", nil)
 	if err := pty.Setsize(child.master, &pty.Winsize{Cols: 40, Rows: 12}); err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestModelComposesPickerAndInspectionScreens(t *testing.T) {
@@ -43,6 +44,42 @@ func TestModelSubmitsComposerInputAsNeutralAction(t *testing.T) {
 	}
 	if m.Composer.Editor.Value() != "" {
 		t.Fatal("submitted prompt remained in the composer")
+	}
+}
+
+func TestCtrlOTogglesAllActivityGroupsWithoutChangingComposer(t *testing.T) {
+	m := NewModel(Header{})
+	m.Transcript.Append(TranscriptBlock{ID: "group-a", Kind: BlockActivityGroup, Collapsed: true}, 80)
+	m.Transcript.Append(TranscriptBlock{ID: "group-b", Kind: BlockActivityGroup, Collapsed: true}, 80)
+	m.Composer.Editor.SetValue("draft")
+	m.Update(tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl})
+	for _, block := range m.Transcript.Blocks {
+		if block.Kind == BlockActivityGroup && block.Collapsed {
+			t.Fatalf("Ctrl+O did not expand %q", block.ID)
+		}
+	}
+	if m.Composer.Editor.Value() != "draft" {
+		t.Fatal("Ctrl+O changed the composer draft")
+	}
+	m.Update(tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl})
+	for _, block := range m.Transcript.Blocks {
+		if block.Kind == BlockActivityGroup && !block.Collapsed {
+			t.Fatalf("second Ctrl+O did not collapse %q", block.ID)
+		}
+	}
+}
+
+func TestModelResolvesVisibleMarkdownLinkScreenCoordinates(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
+	m := NewModel(Header{})
+	m.Width, m.Height = 80, 12
+	m.SetScreenContent(ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
+	m.Transcript.Append(TranscriptBlock{ID: "answer", Kind: BlockAssistantMessage, Body: "[Open Buddy](https://example.com/docs)"}, m.Width)
+	plain := ansi.Strip(m.Transcript.WrappedLines(m.Transcript.Blocks[0], m.Width)[0])
+	column := strings.Index(plain, "Open Buddy") + 1
+	if got := m.HyperlinkAt(1, column); got != "https://example.com/docs" {
+		t.Fatalf("screen hyperlink = %q, want URL", got)
 	}
 }
 
@@ -116,17 +153,21 @@ func TestModelReducesStreamingAndSnapshotEvents(t *testing.T) {
 
 func TestModelMatchesActivityStartAndResult(t *testing.T) {
 	m := NewModel(Header{Workspace: "/work"})
-	started := &Activity{Identity: "turn\x001\x00call", Tool: "read_file", Path: "main.go", StartedAt: time.Now()}
+	started := &Activity{Identity: "turn\x001\x00call", Tool: "read_file", Summary: "main.go", Path: "main.go", Step: 1, StartedAt: time.Now()}
 	updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: started})
-	if len(m.Transcript.Blocks) != 1 || m.Transcript.Blocks[0].Activity.Identity != started.Identity {
+	if len(m.Transcript.Blocks) != 2 || m.Transcript.Blocks[0].Kind != BlockActivityGroup || m.Transcript.Blocks[1].Activity.Identity != started.Identity || m.Transcript.Blocks[1].GroupID != m.Transcript.Blocks[0].ID {
 		t.Fatalf("activity start was not recorded: %+v", m.Transcript.Blocks)
 	}
 	completed := *started
+	completed.Summary = ""
 	code := 0
 	completed.ExitCode, completed.Elapsed = &code, time.Second
 	updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: "turn", Activity: &completed, Text: "file contents"})
-	if len(m.Transcript.Blocks) != 1 || !m.Transcript.Blocks[0].Completed || !m.Transcript.Blocks[0].Collapsed || m.Transcript.Blocks[0].Body != "file contents" || !strings.Contains(m.Transcript.Blocks[0].Header, "Done read_file") {
+	if len(m.Transcript.Blocks) != 2 || !m.Transcript.Blocks[1].Completed || !m.Transcript.Blocks[1].Collapsed || m.Transcript.Blocks[1].Body != "file contents" || !strings.Contains(m.Transcript.Blocks[1].Header, "Done read_file") {
 		t.Fatalf("activity result did not update its start block: %+v", m.Transcript.Blocks)
+	}
+	if got := m.Transcript.Blocks[1].Activity.Summary; got != started.Summary {
+		t.Fatalf("completed activity summary = %q, want %q", got, started.Summary)
 	}
 }
 
@@ -141,10 +182,10 @@ func TestModelSanitizesActivityToolAndPathBeforeFormatting(t *testing.T) {
 		Line:     9,
 	}
 	updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: activity})
-	if len(m.Transcript.Blocks) != 1 {
+	if len(m.Transcript.Blocks) != 2 {
 		t.Fatalf("activity start was not recorded: %+v", m.Transcript.Blocks)
 	}
-	header := m.Transcript.Blocks[0].Header
+	header := m.Transcript.Blocks[1].Header
 	if got := StripHyperlinks(header); got != "Running bash safe.go:9" {
 		t.Fatalf("sanitized activity header = %q", got)
 	}
@@ -158,8 +199,135 @@ func TestModelSanitizesActivityToolAndPathBeforeFormatting(t *testing.T) {
 	completed := *activity
 	completed.ExitCode = new(int)
 	updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: "turn", Activity: &completed})
-	if got := StripHyperlinks(m.Transcript.Blocks[0].Header); got != "Done bash" {
+	if got := StripHyperlinks(m.Transcript.Blocks[1].Header); got != "Done bash" {
 		t.Fatalf("completed tool header was not sanitized: %q", got)
+	}
+}
+
+func TestModelGroupsActivitiesByTurnAndStep(t *testing.T) {
+	m := NewModel(Header{})
+	for _, activity := range []*Activity{
+		{Identity: "turn\x001\x00a", Tool: "read_file", Step: 1},
+		{Identity: "turn\x001\x00b", Tool: "list_directory", Step: 1},
+		{Identity: "turn\x002\x00c", Tool: "bash", Step: 2},
+	} {
+		updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: activity})
+	}
+	if len(m.Transcript.Blocks) != 5 {
+		t.Fatalf("want two groups and three activities, got %+v", m.Transcript.Blocks)
+	}
+	if m.Transcript.Blocks[1].GroupID != m.Transcript.Blocks[0].ID || m.Transcript.Blocks[2].GroupID != m.Transcript.Blocks[0].ID {
+		t.Fatalf("same-step calls were not grouped: %+v", m.Transcript.Blocks)
+	}
+	if m.Transcript.Blocks[3].Kind != BlockActivityGroup || m.Transcript.Blocks[3].Step != 2 || m.Transcript.Blocks[4].GroupID != m.Transcript.Blocks[3].ID {
+		t.Fatalf("different step reused the previous group: %+v", m.Transcript.Blocks)
+	}
+}
+
+func TestModelDoesNotGroupActivitiesWithoutStepMetadata(t *testing.T) {
+	m := NewModel(Header{})
+	for _, id := range []string{"call-1", "call-2"} {
+		updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: &Activity{Identity: id, Tool: "read_file"}})
+	}
+	if len(m.Transcript.Blocks) != 4 || m.Transcript.Blocks[0].ID == m.Transcript.Blocks[2].ID || m.Transcript.Blocks[1].GroupID == m.Transcript.Blocks[3].GroupID {
+		t.Fatalf("calls without step metadata were merged: %+v", m.Transcript.Blocks)
+	}
+}
+
+func TestModelPairsIdentitylessCompletionOnlyWhenUnambiguous(t *testing.T) {
+	t.Run("single candidate", func(t *testing.T) {
+		m := NewModel(Header{})
+		updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: &Activity{Identity: "call-1", Tool: "read_file", Step: 3}})
+		updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: "turn", Activity: &Activity{Tool: "read_file", Step: 3}, Text: "contents"})
+		if len(m.Transcript.Blocks) != 2 || !m.Transcript.Blocks[1].Completed || m.Transcript.Blocks[1].Body != "contents" || m.Transcript.Blocks[1].Activity.Identity != "call-1" {
+			t.Fatalf("identity-less result did not update its unique start: %+v", m.Transcript.Blocks)
+		}
+	})
+	t.Run("ambiguous candidates stay separate", func(t *testing.T) {
+		m := NewModel(Header{})
+		for _, id := range []string{"call-1", "call-2"} {
+			updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: &Activity{Identity: id, Tool: "read_file", Step: 3}})
+		}
+		updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: "turn", Activity: &Activity{Tool: "read_file", Step: 3, ExitCode: new(int)}, Text: "contents"})
+		if len(m.Transcript.Blocks) != 4 || m.Transcript.Blocks[1].Completed || m.Transcript.Blocks[2].Completed || !m.Transcript.Blocks[3].Completed || m.Transcript.Blocks[3].Header != "Done read_file" {
+			t.Fatalf("ambiguous result was incorrectly paired or unlabeled: %+v", m.Transcript.Blocks)
+		}
+	})
+}
+
+func TestModelDoesNotGuessMismatchedIdentityOrRenderReasoning(t *testing.T) {
+	m := NewModel(Header{})
+	updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: &Activity{Identity: "call-1", Tool: "read_file", Step: 1}})
+	updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: "turn", Activity: &Activity{Identity: "other-call", Tool: "read_file", Step: 1, ExitCode: new(int)}, Text: "result"})
+	updateEvent(m, Event{Kind: EventReasoning, TurnID: "turn", Text: "private reasoning text"})
+	if len(m.Transcript.Blocks) != 3 || m.Transcript.Blocks[1].Completed || m.Transcript.Blocks[2].Header != "Done read_file" {
+		t.Fatalf("mismatched identity was guessed or orphan result was not labeled: %+v", m.Transcript.Blocks)
+	}
+	if strings.Contains(m.View().Content, "private reasoning text") {
+		t.Fatal("raw reasoning content appeared in the TUI")
+	}
+}
+
+func TestModelDoesNotAppendBlankUnmatchedCompletion(t *testing.T) {
+	m := NewModel(Header{})
+	updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: &Activity{Identity: "call-1", Tool: "read_file", Step: 1}})
+	updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: "turn", Activity: &Activity{Identity: "other-call", Tool: "read_file", Step: 1}})
+	if len(m.Transcript.Blocks) != 2 || m.Transcript.Blocks[1].Completed {
+		t.Fatalf("empty unmatched completion created a blank activity row: %+v", m.Transcript.Blocks)
+	}
+}
+
+func TestModelIdentitylessCompletionRequiresMatchingTurnToolStepAndParent(t *testing.T) {
+	tests := []struct {
+		name     string
+		turn     string
+		activity Activity
+	}{
+		{name: "different turn", turn: "other", activity: Activity{Tool: "read_file", Step: 1}},
+		{name: "different tool", turn: "turn", activity: Activity{Tool: "bash", Step: 1}},
+		{name: "different step", turn: "turn", activity: Activity{Tool: "read_file", Step: 2}},
+		{name: "different parent", turn: "turn", activity: Activity{Tool: "read_file", Step: 1, ParentIdentity: "parent-b"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewModel(Header{})
+			updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: &Activity{Identity: "call-1", Tool: "read_file", Step: 1, ParentIdentity: "parent-a"}})
+			updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: tt.turn, Activity: &tt.activity, Text: "result"})
+			for _, block := range m.Transcript.Blocks {
+				if block.Activity != nil && block.Activity.Identity == "call-1" && block.Completed {
+					t.Fatalf("identity-less completion matched an unrelated call: %+v", m.Transcript.Blocks)
+				}
+			}
+		})
+	}
+}
+
+func TestModelActivityGroupCanBeExpandedFromTranscriptFocus(t *testing.T) {
+	m := NewModel(Header{})
+	activity := &Activity{Identity: "call-1", Tool: "bash", Step: 1}
+	updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: activity})
+	completed := *activity
+	updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: "turn", Activity: &completed, Text: "command output"})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if m.Transcript.Blocks[0].Collapsed || m.Transcript.Blocks[1].Collapsed || !strings.Contains(m.View().Content, "shell command") || !strings.Contains(m.View().Content, "command output") {
+		t.Fatalf("selected activity group did not expand: %+v", m.Transcript.Blocks)
+	}
+}
+
+func TestFlushStopsUntilNewDeltaArrives(t *testing.T) {
+	m := NewModel(Header{})
+	_, cmd := m.Update(Event{Kind: EventAssistantDelta, TurnID: "turn", Text: "first"})
+	if cmd == nil || !m.TickerActive() {
+		t.Fatal("first delta did not schedule a flush")
+	}
+	_, cmd = m.Update(FlushMsg{})
+	if cmd != nil || m.TickerActive() || m.HasBufferedDelta() {
+		t.Fatalf("flush left an idle timer running: cmd=%v model=%+v", cmd, m)
+	}
+	_, cmd = m.Update(Event{Kind: EventAssistantDelta, TurnID: "turn", Text: " second"})
+	if cmd == nil || !m.TickerActive() {
+		t.Fatal("a later delta did not schedule another flush")
 	}
 }
 

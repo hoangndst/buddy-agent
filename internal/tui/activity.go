@@ -19,16 +19,8 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 	childOffset := -1
 	switch block.Kind {
 	case BlockUserMessage:
-		header := block.Header
-		if header == "" {
-			header = "You"
-		}
-		content = userStyle.Render(cleanText(header)) + "\n" + cleanText(block.Body)
+		content = userStyle.Render("› " + cleanText(block.Body))
 	case BlockAssistantMessage:
-		header := block.Header
-		if header == "" {
-			header = "Buddy"
-		}
 		body := block.Body
 		if block.Streaming && streamingText != "" && len(streamingText) > len(body) {
 			body = streamingText
@@ -39,19 +31,22 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 			if !block.Streaming {
 				return "", -1
 			}
-			content = buddyStyle.Render(cleanText(header)) + "\n" + mutedStyle.Render("Working…")
+			content = mutedStyle.Render("Working…")
 		} else {
 			body = cleanText(body)
 			if rendered, err := RenderMarkdown(body, max(1, width-4)); err == nil {
-				body = rendered
+				body = strings.TrimLeft(rendered, "\n")
 			}
-			content = buddyStyle.Render(cleanText(header)) + "\n" + body
+			content = body
 		}
 	case BlockToolActivity:
 		icon, elapsed := activityPresentation(block)
 		header := activitySummary(block.Header)
+		if block.Activity != nil && block.Activity.Summary != "" {
+			header += " · " + cleanText(block.Activity.Summary)
+		}
 		if block.Collapsed {
-			content = toolStyle.Render(icon + " " + header + elapsed + "  ·  Enter to expand")
+			content = toolStyle.Render(icon + " " + header + elapsed)
 		} else if block.Body == "" {
 			content = toolStyle.Render(icon + " " + header + elapsed)
 		} else {
@@ -106,6 +101,20 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 		}
 	case BlockSystemStatus:
 		content = mutedStyle.Render(cleanText(block.Body))
+	case BlockActivityGroup:
+		children := activityGroupChildren(block.ID, blocks)
+		content = toolStyle.Render(activityGroupSummary(block, children))
+		if !block.Collapsed {
+			for _, child := range children {
+				rendered, nestedOffset := RenderBlock(child, blocks, max(1, width-2), streamingText, selectedActivity, focused)
+				if child.ID == selectedActivity {
+					childOffset = len(content)
+				} else if nestedOffset >= 0 {
+					childOffset = len(content) + len("\n  ") + len(strings.ReplaceAll(rendered[:nestedOffset], "\n", "\n  "))
+				}
+				content += "\n  " + strings.ReplaceAll(rendered, "\n", "\n  ")
+			}
+		}
 	default:
 		content = cleanText(block.Body)
 	}
@@ -113,6 +122,94 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 		content = lipgloss.NewStyle().Background(lipgloss.Color("#30343b")).Width(max(1, width)).Render("› " + content)
 	}
 	return content, childOffset
+}
+
+func activityGroupChildren(groupID string, blocks []TranscriptBlock) []TranscriptBlock {
+	var children []TranscriptBlock
+	for _, block := range blocks {
+		if block.GroupID == groupID {
+			children = append(children, block)
+		}
+	}
+	return children
+}
+
+func activityGroupSummary(group TranscriptBlock, children []TranscriptBlock) string {
+	count, running, done, failed := len(children)+group.OmittedActivities, 0, 0, 0
+	var elapsed time.Duration
+	tools := make([]string, 0, 3)
+	seenTools := make(map[string]struct{})
+	for _, child := range children {
+		if !child.Completed {
+			running++
+		} else if child.Activity != nil && child.Activity.ExitCode != nil && *child.Activity.ExitCode != 0 {
+			failed++
+		} else {
+			done++
+		}
+		if child.Activity != nil {
+			elapsed += child.Activity.Elapsed
+			tool := activityToolLabel(child.Activity.Tool)
+			if tool != "" {
+				if _, exists := seenTools[tool]; !exists {
+					seenTools[tool] = struct{}{}
+					tools = append(tools, tool)
+				}
+			}
+		}
+	}
+	label := fmt.Sprintf("%d tool calls", count)
+	if count == 1 {
+		label = "1 tool call"
+	}
+	if len(tools) > 0 {
+		shown := tools
+		if len(shown) > 2 {
+			shown = shown[:2]
+		}
+		label += " · " + strings.Join(shown, ", ")
+		if len(tools) > len(shown) {
+			label += fmt.Sprintf(" +%d", len(tools)-len(shown))
+		}
+	}
+	if running > 0 {
+		label += fmt.Sprintf(" · %d running", running)
+	}
+	if done > 0 {
+		label += fmt.Sprintf(" · %d done", done)
+	}
+	if failed > 0 {
+		label += fmt.Sprintf(" · %d failed", failed)
+	}
+	if group.OmittedActivities > 0 {
+		label += fmt.Sprintf(" · %d more omitted", group.OmittedActivities)
+	}
+	if running > 0 && !group.CreatedAt.IsZero() {
+		elapsed = time.Since(group.CreatedAt)
+	}
+	if elapsed > 0 {
+		label += " · " + elapsed.Round(100*time.Millisecond).String()
+	}
+	if group.Collapsed {
+		label += "  + Show details"
+	} else {
+		label += "  − Hide details"
+	}
+	icon := "●"
+	if failed > 0 {
+		icon = "!"
+	} else if running == 0 && count > 0 {
+		icon = "✓"
+	}
+	return icon + " " + label
+}
+
+func activityToolLabel(tool string) string {
+	tool = strings.ReplaceAll(cleanText(tool), "_", " ")
+	if tool == "bash" {
+		return "shell"
+	}
+	return tool
 }
 
 func activityPresentation(block TranscriptBlock) (string, string) {
@@ -135,6 +232,9 @@ func activityPresentation(block TranscriptBlock) (string, string) {
 func activitySummary(header string) string {
 	for _, prefix := range []string{"Running ", "Done ", "Failed "} {
 		header = strings.TrimPrefix(header, prefix)
+	}
+	if header == "bash" {
+		return "shell command"
 	}
 	return header
 }

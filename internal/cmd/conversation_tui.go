@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -53,6 +55,7 @@ type conversationTUI struct {
 	queued                 []string
 	steers                 []string
 	errorText              string
+	noticeText             string
 	workspaces             []protocol.ConversationWorkspace
 	conversations          []protocol.ConversationSummary
 	selectedWorkspace      string
@@ -61,6 +64,11 @@ type conversationTUI struct {
 	outputPageIndex        int
 	inspectionGeneration   uint64
 	outputLoading          bool
+}
+
+type linkOpenedMsg struct {
+	url string
+	err error
 }
 
 type pendingApprovalRequest struct {
@@ -80,6 +88,8 @@ const (
 	BlockToolActivity = tui.BlockToolActivity
 	// BlockSubagentActivity identifies delegated tool activity.
 	BlockSubagentActivity = tui.BlockSubagentActivity
+	// BlockActivityGroup summarizes tool calls from one model step.
+	BlockActivityGroup = tui.BlockActivityGroup
 	// BlockSystemStatus identifies a system notice.
 	BlockSystemStatus = tui.BlockSystemStatus
 )
@@ -238,6 +248,7 @@ func runConversationTUIWithAPI(ctx context.Context, f *cmdutil.Factory, api conv
 		{Name: "/interrupt", Description: "Stop the active turn"},
 		{Name: "/queue", Description: "Queue a prompt", ArgsHint: "<prompt>"},
 		{Name: "/copy", Description: "Copy the transcript"},
+		{Name: "/copy-last", Description: "Copy the latest response"},
 		{Name: "/diff", Description: "Review working-tree changes"},
 	} {
 		m.ui.Composer.Commands.Register(command)
@@ -544,6 +555,41 @@ func (m *conversationTUI) Init() tea.Cmd {
 func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.ensureUIModel()
 	switch msg := msg.(type) {
+	case linkOpenedMsg:
+		if msg.err != nil {
+			m.errorText = "Could not open link: " + msg.err.Error()
+		} else {
+			m.noticeText = "Opened link in browser."
+		}
+		return m, nil
+	case tea.MouseClickMsg:
+		if msg.Button == tea.MouseLeft && m.ui.BeginTranscriptSelection(msg.Y, msg.X) {
+			return m, nil
+		}
+		_, cmd := m.ui.Update(msg)
+		return m, cmd
+	case tea.MouseMotionMsg:
+		m.ui.MoveTranscriptSelection(msg.Y, msg.X)
+		return m, nil
+	case tea.MouseReleaseMsg:
+		if !m.ui.TranscriptSelectionInProgress() {
+			return m, nil
+		}
+		selected, dragged := m.ui.EndTranscriptSelection(msg.Y, msg.X)
+		if dragged {
+			if selected != "" {
+				m.noticeText = "Copied selection."
+				return m, tea.SetClipboard(selected)
+			}
+			return m, nil
+		}
+		if target := m.ui.HyperlinkAt(msg.Y, msg.X); target != "" {
+			return m, openExternalLink(target)
+		}
+		if _, cmd := m.ui.ActivateTranscriptAt(msg.Y); cmd != nil {
+			return m, cmd
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		_, _ = m.ui.Update(msg)
 		m.clearCache()
@@ -855,8 +901,25 @@ func (m *conversationTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		_, _ = m.ui.Update(tui.Event{Kind: tui.EventDiffResult, InspectionGeneration: msg.generation, DiffView: toTUIDiffView(msg.result)})
 		return m, nil
 	case tea.KeyPressMsg:
+		copySelection := msg.String() == "ctrl+c" || msg.Code == 'c' && msg.Mod&(tea.ModSuper|tea.ModMeta) != 0
+		if !copySelection {
+			m.ui.ClearTranscriptSelection()
+		}
 		if msg.String() == "ctrl+c" {
+			if selected := m.ui.SelectedText(); selected != "" {
+				m.noticeText = "Copied selection."
+				return m, tea.SetClipboard(selected)
+			}
 			return m, tea.Quit
+		}
+		if msg.Code == 'c' && msg.Mod&(tea.ModSuper|tea.ModMeta) != 0 {
+			if selected := m.ui.SelectedText(); selected != "" {
+				m.noticeText = "Copied selection."
+				return m, tea.SetClipboard(selected)
+			}
+		}
+		if msg.String() == "alt+c" {
+			return m, m.copyLatestResponse()
 		}
 		if m.hasPendingApproval() {
 			_, cmd := m.ui.Update(msg)
@@ -886,6 +949,7 @@ func (m *conversationTUI) handlePromptInput(input string) tea.Cmd {
 		return nil
 	}
 	m.errorText = ""
+	m.noticeText = ""
 	if err := m.ui.Composer.AddHistory(text); err != nil {
 		m.errorText = fmt.Sprintf("save prompt history: %v", err)
 	}
@@ -923,8 +987,11 @@ func (m *conversationTUI) handlePromptInput(input string) tea.Cmd {
 			}
 			full.WriteString(block.Body)
 		}
-		m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockAssistantMessage, Role: "assistant", Header: "Buddy", Body: "Requested clipboard copy of full transcript.", CreatedAt: time.Now()})
+		m.appendBlock(TranscriptBlock{ID: newConversationID("block"), Kind: BlockSystemStatus, Role: "system", Body: "Requested clipboard copy of full transcript.", CreatedAt: time.Now()})
 		return tea.SetClipboard(full.String())
+	}
+	if text == "/copy-last" {
+		return m.copyLatestResponse()
 	}
 	if text == "/quit" || text == "/exit" {
 		return tea.Quit
@@ -953,6 +1020,49 @@ func (m *conversationTUI) handlePromptInput(input string) tea.Cmd {
 		return tui.EmitAction(tui.Action{Kind: tui.ActionSubmitPrompt, Prompt: strings.TrimSpace(strings.TrimPrefix(text, "/queue ")), Mode: string(persistence.SubmissionQueue)})
 	}
 	return tui.EmitAction(tui.Action{Kind: tui.ActionSubmitPrompt, Prompt: text, Mode: string(persistence.SubmissionQueue)})
+}
+
+func (m *conversationTUI) copyLatestResponse() tea.Cmd {
+	for i := len(m.ui.Transcript.Blocks) - 1; i >= 0; i-- {
+		block := m.ui.Transcript.Blocks[i]
+		if block.Kind == BlockAssistantMessage && block.Role != "reasoning" && !block.Streaming && strings.TrimSpace(block.Body) != "" {
+			m.noticeText = "Requested clipboard copy of latest response."
+			return tea.SetClipboard(block.Body)
+		}
+	}
+	m.noticeText = "No completed response to copy yet."
+	return nil
+}
+
+func openExternalLink(raw string) tea.Cmd {
+	parsed, err := url.Parse(raw)
+	scheme := ""
+	if parsed != nil {
+		scheme = strings.ToLower(parsed.Scheme)
+	}
+	if err != nil || parsed.User != nil || (scheme != "http" && scheme != "https" && scheme != "file") ||
+		((scheme == "http" || scheme == "https") && parsed.Hostname() == "") ||
+		(scheme == "file" && parsed.Host != "" && parsed.Host != "localhost") {
+		return func() tea.Msg { return linkOpenedMsg{url: raw, err: fmt.Errorf("unsupported link")} }
+	}
+	var command string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		command, args = "open", []string{"--", raw}
+	case "windows":
+		command, args = "rundll32", []string{"url.dll,FileProtocolHandler", raw}
+	default:
+		command, args = "xdg-open", []string{raw}
+	}
+	return func() tea.Msg {
+		cmd := exec.Command(command, args...)
+		if err := cmd.Start(); err != nil {
+			return linkOpenedMsg{url: raw, err: err}
+		}
+		go func() { _ = cmd.Wait() }()
+		return linkOpenedMsg{url: raw}
+	}
 }
 
 func (m *conversationTUI) View() tea.View {
@@ -1008,7 +1118,7 @@ func (m *conversationTUI) renderBottom(emergency, standard bool) []string {
 	return tui.RenderFooter(tui.Footer{
 		Width: m.ui.Width, Height: m.ui.Height, Emergency: emergency, Standard: standard,
 		PendingApproval: m.hasPendingApproval(), ApprovalView: approvalView, ApprovalKeys: approvalKeys,
-		Queued: queued, Steering: steering, Error: renderedError,
+		Queued: queued, Steering: steering, Error: renderedError, Notice: terminalText(m.noticeText),
 		HasError: m.errorText != "", Completion: m.completionLines(), Composer: composer,
 		State: m.state, Standalone: m.standalone, TranscriptFocused: m.ui.TranscriptFocused,
 	})
@@ -1324,17 +1434,18 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 		m.setPendingApprovals(nil)
 		return
 	}
-	activitiesByTurn := make(map[string][]TranscriptBlock)
-	var activityTurns []string
+	activitiesByStep := make(map[string][]TranscriptBlock)
+	var activitySteps []string
 	if m.conversation == result.ConversationID && m.workerEpoch == result.WorkerEpoch {
 		for _, block := range m.ui.Transcript.Blocks {
-			if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity {
+			if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity && block.Kind != BlockActivityGroup {
 				continue
 			}
-			if len(activitiesByTurn[block.TurnID]) == 0 {
-				activityTurns = append(activityTurns, block.TurnID)
+			key := transcriptActivityKey(block.TurnID, block.Step)
+			if len(activitiesByStep[key]) == 0 {
+				activitySteps = append(activitySteps, key)
 			}
-			activitiesByTurn[block.TurnID] = append(activitiesByTurn[block.TurnID], block)
+			activitiesByStep[key] = append(activitiesByStep[key], block)
 		}
 	} else {
 		m.ui.SelectedActivity = ""
@@ -1354,21 +1465,12 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	restoredBlocks := make([]TranscriptBlock, 0, len(result.Transcript))
 	m.queued, m.steers = nil, nil
 	if result.OutputIncomplete {
-		m.errorText = "Some transient output is unavailable; restored from durable conversation history."
-	}
-	// Keep transient activity groups next to their turn's last durable entry.
-	lastEntry := make(map[string]int, len(activitiesByTurn))
-	for i, entry := range result.Transcript {
-		if entry.TurnID != "" && len(activitiesByTurn[entry.TurnID]) > 0 {
-			lastEntry[entry.TurnID] = i
-		}
+		m.noticeText = "Restored saved history; some live activity details may be missing."
+	} else {
+		m.noticeText = ""
 	}
 	// Replace the canonical blocks together so recovery keeps the reading offset.
-	for i, entry := range result.Transcript {
-		last, hasActivities := lastEntry[entry.TurnID]
-		if hasActivities && last == i && entry.Role == "assistant" {
-			restoredBlocks = append(restoredBlocks, activitiesByTurn[entry.TurnID]...)
-		}
+	for _, entry := range result.Transcript {
 		if entry.Role == "user" {
 			restoredBlocks = append(restoredBlocks, TranscriptBlock{
 				ID:        newConversationID("block"),
@@ -1387,30 +1489,78 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 			}
 		}
 		if entry.Role == "assistant" {
-			if strings.TrimSpace(entry.Content) == "" {
-				continue
+			if strings.TrimSpace(entry.Content) != "" {
+				restoredBlocks = append(restoredBlocks, TranscriptBlock{
+					ID:        newConversationID("block"),
+					TurnID:    entry.TurnID,
+					Kind:      BlockAssistantMessage,
+					Role:      "assistant",
+					Header:    "Buddy",
+					Body:      entry.Content,
+					CreatedAt: time.Now(),
+				})
 			}
-			restoredBlocks = append(restoredBlocks, TranscriptBlock{
-				ID:        newConversationID("block"),
-				TurnID:    entry.TurnID,
-				Kind:      BlockAssistantMessage,
-				Role:      "assistant",
-				Header:    "Buddy",
-				Body:      entry.Content,
-				CreatedAt: time.Now(),
-			})
-		}
-		if hasActivities && last == i && entry.Role != "assistant" {
-			restoredBlocks = append(restoredBlocks, activitiesByTurn[entry.TurnID]...)
+			key := transcriptActivityKey(entry.TurnID, entry.StepNumber)
+			if cached := activitiesByStep[key]; len(cached) > 0 {
+				restoredBlocks = append(restoredBlocks, cached...)
+				delete(activitiesByStep, key)
+			} else {
+				restoredBlocks = append(restoredBlocks, restoredActivityBlocks(entry)...)
+			}
 		}
 	}
-	for _, turnID := range activityTurns {
-		if _, found := lastEntry[turnID]; !found {
-			restoredBlocks = append(restoredBlocks, activitiesByTurn[turnID]...)
+	for _, key := range activitySteps {
+		if blocks := activitiesByStep[key]; len(blocks) > 0 {
+			restoredBlocks = append(restoredBlocks, blocks...)
 		}
 	}
 	_, _ = m.ui.Update(tui.Event{Kind: tui.EventSnapshot, Blocks: restoredBlocks})
 	m.syncUIRenderState()
+}
+
+func transcriptActivityKey(turnID string, step int) string {
+	return turnID + "\x00" + strconv.Itoa(step)
+}
+
+func restoredActivityBlocks(entry protocol.ConversationTranscriptEntry) []TranscriptBlock {
+	if len(entry.Activities) == 0 && entry.ActivitiesOmitted == 0 {
+		return nil
+	}
+	createdAt, _ := time.Parse(time.RFC3339Nano, entry.CreatedAt)
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	groupID := newConversationID("activity")
+	blocks := []TranscriptBlock{{
+		ID: groupID, TurnID: entry.TurnID, Step: entry.StepNumber,
+		Kind: BlockActivityGroup, Header: "Tool activity", Collapsed: true,
+		OmittedActivities: entry.ActivitiesOmitted, CreatedAt: createdAt,
+	}}
+	for _, item := range entry.Activities {
+		identity := entry.TurnID + "\x00" + strconv.Itoa(entry.StepNumber) + "\x00" + item.ID
+		if item.ID == "" {
+			identity = newConversationID("activity-call")
+		}
+		activity := &tui.Activity{
+			Identity: identity, Step: entry.StepNumber, Tool: item.Tool,
+			Summary: item.Summary, OutputTruncated: item.OutputTruncated,
+		}
+		if item.ExitCode != 0 {
+			code := item.ExitCode
+			activity.ExitCode = &code
+		}
+		mark := "Done"
+		if item.ExitCode != 0 {
+			mark = "Failed"
+		}
+		blocks = append(blocks, TranscriptBlock{
+			ID: newConversationID("activity-call"), TurnID: entry.TurnID, GroupID: groupID,
+			Step: entry.StepNumber, Kind: BlockToolActivity, Role: "tool",
+			Header: mark + " " + item.Tool, Body: item.Output, Collapsed: true,
+			Completed: true, CreatedAt: createdAt, Activity: activity,
+		})
+	}
+	return blocks
 }
 
 func (m *conversationTUI) renderTextarea() string {
@@ -1580,11 +1730,18 @@ func activityDataKey(data map[string]any) string {
 }
 
 func activityFromEvent(data map[string]any, _ string) *tui.Activity {
-	activity := &tui.Activity{Identity: activityDataKey(data), StartedAt: time.Now()}
+	step := eventInt(data["step"])
+	if step <= 0 {
+		if id, ok := data["activity_id"].(map[string]any); ok {
+			step = eventInt(id["step"])
+		}
+	}
+	activity := &tui.Activity{Identity: activityDataKey(data), Step: step, StartedAt: time.Now()}
 	if data == nil {
 		return activity
 	}
 	activity.Tool, _ = data["tool_name"].(string)
+	activity.Summary, _ = data["activity_summary"].(string)
 	activity.AgentName, _ = data["agent_name"].(string)
 	activity.Path, _ = data["path"].(string)
 	if activity.Path == "" {
@@ -1625,12 +1782,12 @@ func activityIdentityKey(id map[string]any) string {
 		return ""
 	}
 	turn, _ := id["turn_id"].(string)
-	step, _ := id["step"].(float64)
+	step := eventInt(id["step"])
 	call, _ := id["tool_call_id"].(string)
 	if turn == "" || call == "" {
 		return ""
 	}
-	return turn + "\x00" + strconv.Itoa(int(step)) + "\x00" + call
+	return turn + "\x00" + strconv.Itoa(step) + "\x00" + call
 }
 
 func (m *conversationTUI) computeVisibleBlocks() []TranscriptBlock {

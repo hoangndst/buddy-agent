@@ -69,15 +69,31 @@ func (t *Transcript) Append(block TranscriptBlock, width int) {
 	if block.CreatedAt.IsZero() {
 		block.CreatedAt = time.Now()
 	}
-	parentIndex, before := -1, 0
+	parentIndex, groupIndex, before := -1, -1, 0
 	if block.ParentID != "" {
 		parentIndex = t.Index(block.ParentID)
-		if parentIndex >= 0 && t.ScrollOffset > 0 {
+	}
+	groupID := block.GroupID
+	if groupID == "" && parentIndex >= 0 {
+		groupID = t.Blocks[parentIndex].GroupID
+	}
+	if groupID != "" {
+		groupIndex = t.Index(groupID)
+	}
+	if t.ScrollOffset > 0 {
+		if groupIndex >= 0 {
+			before = t.LineCount(t.Blocks[groupIndex], width)
+		} else if parentIndex >= 0 {
 			before = t.LineCount(t.Blocks[parentIndex], width)
 		}
 	}
 	t.Blocks = append(t.Blocks, block)
-	if parentIndex >= 0 {
+	if groupIndex >= 0 {
+		t.Invalidate(t.Blocks[groupIndex].ID)
+		if t.ScrollOffset > 0 {
+			t.ScrollOffset += t.LineCount(t.Blocks[groupIndex], width) - before
+		}
+	} else if parentIndex >= 0 {
 		t.Invalidate(block.ParentID)
 		if t.ScrollOffset > 0 {
 			t.ScrollOffset += t.LineCount(t.Blocks[parentIndex], width) - before
@@ -91,11 +107,19 @@ func (t *Transcript) Append(block TranscriptBlock, width int) {
 func (t *Transcript) Update(index int, update func(*TranscriptBlock), width int) {
 	block := t.Blocks[index]
 	parentIndex := t.Index(block.ParentID)
-	before, parentBefore := 0, 0
+	groupID := block.GroupID
+	if groupID == "" && parentIndex >= 0 {
+		groupID = t.Blocks[parentIndex].GroupID
+	}
+	groupIndex := t.Index(groupID)
+	before, parentBefore, groupBefore := 0, 0, 0
 	if t.ScrollOffset > 0 {
 		before = t.LineCount(block, width)
 		if parentIndex >= 0 {
 			parentBefore = t.LineCount(t.Blocks[parentIndex], width)
+		}
+		if groupIndex >= 0 {
+			groupBefore = t.LineCount(t.Blocks[groupIndex], width)
 		}
 	}
 	update(&t.Blocks[index])
@@ -103,17 +127,23 @@ func (t *Transcript) Update(index int, update func(*TranscriptBlock), width int)
 	if parentIndex >= 0 {
 		t.Invalidate(block.ParentID)
 	}
+	if groupIndex >= 0 {
+		t.Invalidate(t.Blocks[groupIndex].ID)
+	}
 	if t.ScrollOffset > 0 {
 		t.ScrollOffset += t.LineCount(t.Blocks[index], width) - before
 		if parentIndex >= 0 {
 			t.ScrollOffset += t.LineCount(t.Blocks[parentIndex], width) - parentBefore
+		}
+		if groupIndex >= 0 {
+			t.ScrollOffset += t.LineCount(t.Blocks[groupIndex], width) - groupBefore
 		}
 	}
 }
 
 // LineCount returns the rendered row count for a top-level block.
 func (t *Transcript) LineCount(block TranscriptBlock, width int) int {
-	if block.ParentID != "" || block.Kind == BlockAssistantMessage && !block.Streaming && strings.TrimSpace(block.Body) == "" {
+	if block.ParentID != "" || block.GroupID != "" || block.Kind == BlockAssistantMessage && !block.Streaming && strings.TrimSpace(block.Body) == "" {
 		return 0
 	}
 	if width <= 0 {
@@ -139,7 +169,7 @@ func (t *Transcript) WrappedLines(block TranscriptBlock, width int) []string {
 	if width <= 0 {
 		width = 80
 	}
-	if block.ParentID != "" || block.Kind == BlockAssistantMessage && !block.Streaming && strings.TrimSpace(block.Body) == "" {
+	if block.ParentID != "" || block.GroupID != "" || block.Kind == BlockAssistantMessage && !block.Streaming && strings.TrimSpace(block.Body) == "" {
 		return nil
 	}
 	key := fmt.Sprintf("%s:%d", block.ID, width)
@@ -235,4 +265,33 @@ func (t *Transcript) VisibleLines(height, width int) []string {
 		}
 	}
 	return lines
+}
+
+// BlockAt returns the top-level block occupying a visible transcript row.
+func (t *Transcript) BlockAt(row, height, width int) string {
+	blocks, top, _ := t.VisibleWindow(height, width)
+	if row < 0 {
+		return ""
+	}
+	row += top
+	for _, block := range blocks {
+		count := t.LineCount(block, width)
+		if count > 0 && row < count {
+			return block.ID
+		}
+		row -= count
+	}
+	return ""
+}
+
+// HyperlinkAt returns a Markdown link at a row within the currently visible transcript.
+func (t *Transcript) HyperlinkAt(row, column, height, width int) string {
+	if row < 0 || column < 0 {
+		return ""
+	}
+	lines := t.VisibleLines(height, width)
+	if row >= len(lines) {
+		return ""
+	}
+	return hyperlinkAt(lines[row], column)
 }

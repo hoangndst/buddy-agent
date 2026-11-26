@@ -21,6 +21,8 @@ const (
 	BlockSubagentActivity
 	// BlockSystemStatus is a system notice.
 	BlockSystemStatus
+	// BlockActivityGroup summarizes tool calls from one model step.
+	BlockActivityGroup
 )
 
 // TranscriptBlock is the canonical UI transcript entry. Body keeps source text
@@ -29,6 +31,8 @@ type TranscriptBlock struct {
 	ID        string
 	TurnID    string
 	ParentID  string
+	GroupID   string
+	Step      int
 	Kind      BlockKind
 	Role      string
 	Header    string
@@ -36,6 +40,7 @@ type TranscriptBlock struct {
 	Streaming bool
 	Collapsed bool
 	Completed bool
+	OmittedActivities int
 	Depth     int
 	CreatedAt time.Time
 	Activity  *Activity
@@ -45,7 +50,9 @@ type TranscriptBlock struct {
 type Activity struct {
 	Identity        string
 	ParentIdentity  string
+	Step            int
 	Tool            string
+	Summary         string
 	AgentName       string
 	Path            string
 	Line            int

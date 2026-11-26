@@ -756,6 +756,88 @@ func TestConversationTUIToolEventHyperlink(t *testing.T) {
 	}
 }
 
+func TestConversationTUIMouseDragCopiesTranscriptSelection(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
+	model := &conversationTUI{ui: testTUIModel(80, 8)}
+	model.ui.SetScreenContent(tui.ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
+	model.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: "copy this text"})
+	if _, cmd := model.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 2, Y: 1}); cmd != nil {
+		t.Fatal("mouse press unexpectedly ran a command")
+	}
+	if _, cmd := model.Update(tea.MouseMotionMsg{Button: tea.MouseLeft, X: 5, Y: 1}); cmd != nil {
+		t.Fatal("mouse drag unexpectedly ran a command")
+	}
+	_, cmd := model.Update(tea.MouseReleaseMsg{Button: tea.MouseLeft, X: 5, Y: 1})
+	if cmd == nil || fmt.Sprint(cmd()) != "copy" {
+		t.Fatalf("mouse release clipboard command = %v", cmd)
+	}
+	for _, mod := range []tea.KeyMod{tea.ModCtrl, tea.ModSuper} {
+		_, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Mod: mod})
+		if cmd == nil || fmt.Sprint(cmd()) != "copy" {
+			t.Fatalf("copy shortcut with modifier %v did not copy the selection", mod)
+		}
+	}
+}
+
+func TestConversationTUICopyNoticeClearsSelectionWhenViewportShrinks(t *testing.T) {
+	m := &conversationTUI{ui: testTUIModel(80, 24)}
+	var lines []string
+	for i := 0; i < 40; i++ {
+		lines = append(lines, fmt.Sprintf("  line %02d", i))
+	}
+	m.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: strings.Join(lines, "\n")})
+	m.View()
+	m.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 2, Y: 2})
+	_, cmd := m.Update(tea.MouseReleaseMsg{Button: tea.MouseLeft, X: 8, Y: 2})
+	if cmd == nil {
+		t.Fatal("mouse release did not copy the selected text")
+	}
+	if got := fmt.Sprint(cmd()); !strings.HasPrefix(got, "line ") {
+		t.Fatalf("mouse release copied %q, want transcript text", got)
+	}
+	if view := m.View().Content; !strings.Contains(view, "Copied selection.") {
+		t.Fatalf("copy notice missing from view: %q", view)
+	}
+	if got := m.ui.SelectedText(); got != "" {
+		t.Fatalf("selection remained after copy notice changed the viewport: %q", got)
+	}
+	_, cmd = m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd == nil {
+		t.Fatal("Ctrl+C without a selection did not return a command")
+	}
+	if msg := cmd(); msg != (tea.QuitMsg{}) {
+		t.Fatalf("Ctrl+C without a selection returned %T (%v), want quit", msg, msg)
+	}
+}
+
+func TestConversationTUIClickExpandsActivityDisclosure(t *testing.T) {
+	model := &conversationTUI{ui: testTUIModel(80, 8)}
+	model.ui.SetScreenContent(tui.ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
+	model.appendBlock(TranscriptBlock{ID: "group", Kind: BlockActivityGroup, Collapsed: true})
+	model.appendBlock(TranscriptBlock{ID: "call", GroupID: "group", Kind: BlockToolActivity, Header: "read_file", Collapsed: true})
+	model.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: 4, Y: 1})
+	_, cmd := model.Update(tea.MouseReleaseMsg{Button: tea.MouseLeft, X: 4, Y: 1})
+	if cmd != nil || model.ui.Transcript.Blocks[0].Collapsed {
+		t.Fatalf("mouse click did not expand activity disclosure: cmd=%v group=%+v", cmd, model.ui.Transcript.Blocks[0])
+	}
+}
+
+func TestConversationTUIClickOpensRenderedMarkdownLinkOnRelease(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
+	model := &conversationTUI{ui: testTUIModel(80, 8)}
+	model.ui.SetScreenContent(tui.ScreenContent{Header: []string{"header"}, Footer: []string{"footer"}})
+	model.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "[Open](https://example.com/path)"})
+	line := ansi.Strip(model.ui.Transcript.VisibleLines(6, 80)[0])
+	column := strings.Index(line, "Open")
+	model.Update(tea.MouseClickMsg{Button: tea.MouseLeft, X: column, Y: 1})
+	_, cmd := model.Update(tea.MouseReleaseMsg{Button: tea.MouseLeft, X: column, Y: 1})
+	if cmd == nil || model.ui.HyperlinkAt(1, column) != "https://example.com/path" {
+		t.Fatal("mouse release did not dispatch the rendered Markdown link")
+	}
+}
+
 type terminalOutputFunc func([]byte) (int, error)
 
 func (f terminalOutputFunc) Write(p []byte) (int, error) { return f(p) }
@@ -815,8 +897,38 @@ func TestConversationTUICopyCommandInAlternateScreen(t *testing.T) {
 		t.Fatalf("expected copy status block, got %d transcript blocks", len(model.ui.Transcript.Blocks))
 	}
 	lastBlock := model.ui.Transcript.Blocks[len(model.ui.Transcript.Blocks)-1]
-	if lastBlock.Body != "Requested clipboard copy of full transcript." {
-		t.Fatalf("unexpected clipboard status: %q", lastBlock.Body)
+	if lastBlock.Kind != BlockSystemStatus || lastBlock.Body != "Requested clipboard copy of full transcript." {
+		t.Fatalf("unexpected clipboard status: %+v", lastBlock)
+	}
+}
+
+func TestConversationTUICopyLastAfterCopyingTranscript(t *testing.T) {
+	model := &conversationTUI{ui: testTUIModel(80, 24)}
+	model.appendBlock(TranscriptBlock{Kind: BlockUserMessage, Body: "question"})
+	model.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "answer"})
+	if cmd := model.handlePromptInput("/copy"); cmd == nil || fmt.Sprint(cmd()) != "question\n\nanswer" {
+		t.Fatal("/copy did not include the full transcript")
+	}
+	if cmd := model.handlePromptInput("/copy-last"); cmd == nil || fmt.Sprint(cmd()) != "answer" {
+		t.Fatal("/copy-last did not copy the answer after /copy")
+	}
+	_, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModAlt})
+	if cmd == nil || fmt.Sprint(cmd()) != "answer" {
+		t.Fatal("Alt+C did not copy the answer after /copy")
+	}
+}
+
+func TestCopyLatestResponseAndRejectUnsafeLinkSchemes(t *testing.T) {
+	model := &conversationTUI{ui: testTUIModel(80, 24)}
+	model.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "older answer"})
+	model.appendBlock(TranscriptBlock{Kind: BlockAssistantMessage, Body: "latest answer"})
+	_, cmd := model.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModAlt})
+	if cmd == nil || fmt.Sprint(cmd()) != "latest answer" {
+		t.Fatal("Alt+C did not copy the latest assistant answer")
+	}
+	msg, ok := openExternalLink("javascript:alert(1)")().(linkOpenedMsg)
+	if !ok || msg.err == nil {
+		t.Fatal("unsafe link scheme was not rejected")
 	}
 }
 
@@ -858,22 +970,27 @@ func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
 
 func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 	firstPrompt := protocol.ConversationTranscriptEntry{Role: "user", TurnID: "turn-1", Content: "first prompt"}
-	answer := protocol.ConversationTranscriptEntry{Role: "assistant", TurnID: "turn-1", Content: "first answer"}
+	answer := protocol.ConversationTranscriptEntry{Role: "assistant", TurnID: "turn-1", StepNumber: 1, Content: "first answer",
+		Activities: []protocol.ConversationActivity{{ID: "call-1", Tool: "bash", Output: "saved preview"}}}
 	api := &conversationAPITestDouble{submissions: make(chan protocol.ConversationSubmitParams, 1)}
 	m := &conversationTUI{client: api, ui: testTUIModel(80, 24)}
 	m.loadSync(&protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", Transcript: []protocol.ConversationTranscriptEntry{firstPrompt}})
 	activity := map[string]any{"turn_id": "turn-1", "step": float64(1), "tool_call_id": "call-1"}
-	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 1, Type: string(agent.EventToolCall),
+	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 1, Type: string(agent.EventTextComplete), Content: answer.Content})
+	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 2, Type: string(agent.EventToolCall),
 		Data: map[string]any{"tool_name": "bash", "activity_id": activity}})
-	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 2, Type: string(agent.EventToolResult), Content: "preview",
+	m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 3, Type: string(agent.EventToolResult), Content: "preview",
 		Data: map[string]any{"tool_name": "bash", "activity_id": activity, "output_ref": "out-1"}})
-	activityID := m.ui.Transcript.Blocks[1].ID
+	activityID := m.ui.Transcript.Blocks[3].ID
 	openOutput := func(stage string, wantBlocks int) {
 		t.Helper()
-		if len(m.ui.Transcript.Blocks) != wantBlocks || m.ui.Transcript.Blocks[1].ID != activityID || !m.ui.Transcript.Blocks[1].Completed || m.ui.Transcript.Blocks[2].Body != "first answer" {
+		if len(m.ui.Transcript.Blocks) != wantBlocks || m.ui.Transcript.Blocks[1].Body != answer.Content ||
+			m.ui.Transcript.Blocks[2].Kind != BlockActivityGroup || m.ui.Transcript.Blocks[3].ID != activityID || !m.ui.Transcript.Blocks[3].Completed {
 			t.Fatalf("%s sync did not reconcile the activity with its originating turn: %+v", stage, m.ui.Transcript.Blocks)
 		}
 		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+		m.Update(tea.KeyPressMsg{Code: tea.KeyEnter}) // Expand the tool group.
+		m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		_, open := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 		if m.ui.SelectedActivity != activityID || open == nil {
 			t.Fatalf("%s sync lost the selectable output activity", stage)
@@ -890,18 +1007,45 @@ func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 		m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 		m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
 	}
-	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 3,
+	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 4,
 		Transcript: []protocol.ConversationTranscriptEntry{firstPrompt, answer}}
-	_, sync := m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 3, Type: string(agent.EventFinished)})
+	_, sync := m.Update(conversationEventMsg{ConversationID: "conv-1", TurnID: "turn-1", Sequence: 4, Type: string(agent.EventFinished)})
 	m.Update(sync())
-	openOutput("completion", 3)
+	openOutput("completion", 4)
 
 	nextPrompt := protocol.ConversationTranscriptEntry{Role: "user", TurnID: "turn-2", Content: "second prompt"}
-	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 4,
+	api.syncResult = &protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", EventWatermark: 5,
 		Transcript: []protocol.ConversationTranscriptEntry{firstPrompt, answer, nextPrompt}}
 	_, sync = m.Update(m.submit(nextPrompt.Content, persistence.SubmissionQueue)())
 	m.Update(sync())
-	openOutput("next prompt", 4)
+	openOutput("next prompt", 5)
+}
+
+func TestConversationTUIRestoresToolActivityFromHistory(t *testing.T) {
+	entry := protocol.ConversationTranscriptEntry{
+		Role: "assistant", TurnID: "turn-1", StepNumber: 2, Content: "Finished.",
+		Activities: []protocol.ConversationActivity{{
+			ID: "call-1", Tool: "bash", Summary: "git status --short", Output: "On branch main", ExitCode: 0,
+		}},
+	}
+	m := &conversationTUI{ui: testTUIModel(100, 30)}
+	m.loadSync(&protocol.ConversationSyncResult{
+		ConversationID: "conv-1", WorkerEpoch: "worker-2", Transcript: []protocol.ConversationTranscriptEntry{
+			entry,
+			{Role: "assistant", TurnID: "turn-1", StepNumber: 3, ActivitiesOmitted: 1},
+			{Role: "assistant", TurnID: "turn-1", StepNumber: 4, Content: "All done."},
+		},
+	})
+	blocks := m.ui.Transcript.Blocks
+	if len(blocks) != 5 {
+		t.Fatalf("expected five transcript blocks, got %+v", blocks)
+	}
+	answer, group, call := blocks[0], blocks[1], blocks[2]
+	if answer.Body != entry.Content || group.Kind != BlockActivityGroup || !group.Collapsed || call.Kind != BlockToolActivity ||
+		call.Activity == nil || call.Activity.Summary != "git status --short" || call.Body != "On branch main" ||
+		blocks[3].Kind != BlockActivityGroup || blocks[3].OmittedActivities != 1 || blocks[4].Body != "All done." {
+		t.Fatalf("history activity was not restored in transcript order: %+v", blocks)
+	}
 }
 
 func TestConversationTUIDropsOutputWhenConversationOrWorkerChanges(t *testing.T) {
@@ -1187,6 +1331,26 @@ func TestConversationTUISelectionKeepsExpandedChildVisible(t *testing.T) {
 	}
 }
 
+func TestConversationTUISelectionKeepsGroupedActivitiesVisible(t *testing.T) {
+	m := &conversationTUI{ui: testTUIModel(40, 12)}
+	m.appendBlock(TranscriptBlock{ID: "group", Kind: BlockActivityGroup})
+	var names []string
+	for i := 1; i <= 8; i++ {
+		call, child := fmt.Sprintf("call-%02d", i), fmt.Sprintf("child-%02d", i)
+		m.appendBlock(TranscriptBlock{ID: call, GroupID: "group", Kind: BlockToolActivity, Header: call, Activity: &tui.Activity{AgentName: call}})
+		m.appendBlock(TranscriptBlock{ID: child, ParentID: call, Kind: BlockSubagentActivity, Header: child, Body: strings.Repeat("wrapped output ", 10) + "\nsecond body line"})
+		names = append(names, call, child)
+	}
+	m.View()
+	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
+	for _, want := range names {
+		m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		if view := m.View().Content; m.ui.SelectedActivity != want || !strings.Contains(view, want) {
+			t.Fatalf("selected activity %q should be visible, selected=%q view=%q", want, m.ui.SelectedActivity, view)
+		}
+	}
+}
+
 func TestConversationTUIResultOnlyChildIsDetached(t *testing.T) {
 	model := &conversationTUI{conversation: "conv-1"}
 	updated, _ := model.Update(conversationEventMsg(protocol.SessionEventNotification{
@@ -1222,6 +1386,7 @@ func TestConversationTUINestedActivityRefreshesCachedParent(t *testing.T) {
 		}))
 	}
 	emit(agent.EventToolCall, "invoke_subagent", "parent", "", nil)
+	m.ui.Transcript.Update(0, func(block *TranscriptBlock) { block.Collapsed = false }, m.ui.Width)
 	_ = m.View()
 	emit(agent.EventToolCall, "read_file", "child", "", identity("parent"))
 	if view := m.View().Content; !strings.Contains(view, "worker (1 step)") {
@@ -1563,7 +1728,7 @@ func TestConversationTUILoadSyncSkipsEmptyAssistantToolSteps(t *testing.T) {
 		t.Fatalf("restored visible block count = %d, want 2: %+v", len(model.ui.Transcript.Blocks), model.ui.Transcript.Blocks)
 	}
 	lines := ansi.Strip(strings.Join(model.computeVisibleLines(), "\n"))
-	if strings.Count(lines, "Buddy") != 1 || !strings.Contains(lines, "Found one file.") {
+	if strings.Contains(lines, "Buddy") || !strings.Contains(lines, "› inspect files") || !strings.Contains(lines, "Found one file.") {
 		t.Fatalf("restored transcript contains empty assistant rows: %q", lines)
 	}
 }

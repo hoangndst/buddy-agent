@@ -33,3 +33,11 @@ func TestRenderEmergencyApprovalKeepsDecisionRow(t *testing.T) {
 		t.Fatalf("emergency approval rows = %q", rows)
 	}
 }
+
+func TestRecoveryNoticeDoesNotMarkConnectionAsNeedingAttention(t *testing.T) {
+	rows := RenderFooter(Footer{Width: 80, Height: 5, Composer: "› Ask Buddy anything…", Notice: "Restored saved history; some live activity details may be missing."})
+	plain := ansi.Strip(strings.Join(rows, "\n"))
+	if !strings.Contains(plain, "Restored saved history") || strings.Contains(plain, "Needs attention") {
+		t.Fatalf("recovery notice was presented as an error: %q", plain)
+	}
+}
