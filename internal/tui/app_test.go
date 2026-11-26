@@ -300,10 +300,13 @@ func TestModelIdentitylessCompletionRequiresMatchingTurnToolStepAndParent(t *tes
 
 func TestModelActivityGroupCanBeExpandedFromTranscriptFocus(t *testing.T) {
 	m := NewModel(Header{})
-	updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: &Activity{Identity: "call-1", Tool: "read_file", Step: 1}})
+	activity := &Activity{Identity: "call-1", Tool: "bash", Step: 1}
+	updateEvent(m, Event{Kind: EventActivityStarted, TurnID: "turn", Activity: activity})
+	completed := *activity
+	updateEvent(m, Event{Kind: EventActivityCompleted, TurnID: "turn", Activity: &completed, Text: "command output"})
 	m.Update(tea.KeyPressMsg{Code: tea.KeyF6})
 	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if m.Transcript.Blocks[0].Collapsed || !strings.Contains(m.View().Content, "read_file") {
+	if m.Transcript.Blocks[0].Collapsed || m.Transcript.Blocks[1].Collapsed || !strings.Contains(m.View().Content, "shell command") || !strings.Contains(m.View().Content, "command output") {
 		t.Fatalf("selected activity group did not expand: %+v", m.Transcript.Blocks)
 	}
 }

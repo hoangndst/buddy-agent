@@ -438,7 +438,7 @@ func (m *Model) activateSelectedActivity() tea.Cmd {
 			continue
 		}
 		if block.Kind == BlockActivityGroup {
-			m.Transcript.Update(index, func(current *TranscriptBlock) { current.Collapsed = !current.Collapsed }, m.Width)
+			m.setActivityGroupCollapsed(index, !block.Collapsed)
 			return nil
 		}
 		if block.Activity != nil && block.Activity.OutputRef != "" {
@@ -460,8 +460,17 @@ func (m *Model) toggleActivityGroups() {
 	}
 	for index := range m.Transcript.Blocks {
 		if m.Transcript.Blocks[index].Kind == BlockActivityGroup {
-			collapsed := allExpanded
-			m.Transcript.Update(index, func(block *TranscriptBlock) { block.Collapsed = collapsed }, m.Width)
+			m.setActivityGroupCollapsed(index, allExpanded)
+		}
+	}
+}
+
+func (m *Model) setActivityGroupCollapsed(index int, collapsed bool) {
+	groupID := m.Transcript.Blocks[index].ID
+	m.Transcript.Update(index, func(block *TranscriptBlock) { block.Collapsed = collapsed }, m.Width)
+	for i := range m.Transcript.Blocks {
+		if m.Transcript.Blocks[i].GroupID == groupID {
+			m.Transcript.Update(i, func(block *TranscriptBlock) { block.Collapsed = collapsed }, m.Width)
 		}
 	}
 }
@@ -619,6 +628,7 @@ func (m *Model) reduce(event Event) tea.Cmd {
 		}
 		a := *event.Activity
 		a.Tool = cleanText(a.Tool)
+		a.Summary = cleanText(a.Summary)
 		a.Path = cleanText(a.Path)
 		kind := BlockToolActivity
 		if a.ParentIdentity != "" {
@@ -652,6 +662,7 @@ func (m *Model) reduce(event Event) tea.Cmd {
 		}
 		activity := *event.Activity
 		activity.Tool = cleanText(activity.Tool)
+		activity.Summary = cleanText(activity.Summary)
 		activity.Path = cleanText(activity.Path)
 		matched := false
 		for i := len(m.Transcript.Blocks) - 1; i >= 0; i-- {

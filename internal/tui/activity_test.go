@@ -56,12 +56,12 @@ func TestRenderActivityGroupSummaryAndExpansion(t *testing.T) {
 	}
 	blocks := append([]TranscriptBlock{group}, children...)
 	collapsed, _ := RenderBlock(group, blocks, 80, "", "", false)
-	if !strings.Contains(collapsed, "2 tool calls") || !strings.Contains(collapsed, "read_file, bash") || !strings.Contains(collapsed, "1 running") || !strings.Contains(collapsed, "1 failed") || !strings.Contains(collapsed, "Ctrl+O to expand") || strings.Contains(collapsed, "Enter to expand") || strings.Contains(collapsed, "permission denied") {
+	if !strings.Contains(collapsed, "2 tool calls") || !strings.Contains(collapsed, "read file, shell") || !strings.Contains(collapsed, "1 running") || !strings.Contains(collapsed, "1 failed") || !strings.Contains(collapsed, "+ Show details") || strings.Contains(collapsed, "click or Ctrl+O") || strings.Contains(collapsed, "permission denied") {
 		t.Fatalf("collapsed activity group summary = %q", collapsed)
 	}
 	group.Collapsed = false
 	expanded, _ := RenderBlock(group, append([]TranscriptBlock{group}, children...), 80, "", "", false)
-	if !strings.Contains(expanded, "read_file") || !strings.Contains(expanded, "bash") || !strings.Contains(expanded, "permission denied") {
+	if !strings.Contains(expanded, "read file") || !strings.Contains(expanded, "shell command") || !strings.Contains(expanded, "permission denied") {
 		t.Fatalf("expanded activity group omitted child details: %q", expanded)
 	}
 }

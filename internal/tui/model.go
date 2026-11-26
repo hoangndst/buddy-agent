@@ -40,6 +40,7 @@ type TranscriptBlock struct {
 	Streaming bool
 	Collapsed bool
 	Completed bool
+	OmittedActivities int
 	Depth     int
 	CreatedAt time.Time
 	Activity  *Activity
@@ -51,6 +52,7 @@ type Activity struct {
 	ParentIdentity  string
 	Step            int
 	Tool            string
+	Summary         string
 	AgentName       string
 	Path            string
 	Line            int

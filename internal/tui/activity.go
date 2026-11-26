@@ -42,6 +42,9 @@ func RenderBlock(block TranscriptBlock, blocks []TranscriptBlock, width int, str
 	case BlockToolActivity:
 		icon, elapsed := activityPresentation(block)
 		header := activitySummary(block.Header)
+		if block.Activity != nil && block.Activity.Summary != "" {
+			header += " · " + cleanText(block.Activity.Summary)
+		}
 		if block.Collapsed {
 			content = toolStyle.Render(icon + " " + header + elapsed)
 		} else if block.Body == "" {
@@ -129,7 +132,7 @@ func activityGroupChildren(groupID string, blocks []TranscriptBlock) []Transcrip
 }
 
 func activityGroupSummary(group TranscriptBlock, children []TranscriptBlock) string {
-	count, running, done, failed := len(children), 0, 0, 0
+	count, running, done, failed := len(children)+group.OmittedActivities, 0, 0, 0
 	var elapsed time.Duration
 	tools := make([]string, 0, 3)
 	seenTools := make(map[string]struct{})
@@ -143,7 +146,7 @@ func activityGroupSummary(group TranscriptBlock, children []TranscriptBlock) str
 		}
 		if child.Activity != nil {
 			elapsed += child.Activity.Elapsed
-			tool := cleanText(child.Activity.Tool)
+			tool := activityToolLabel(child.Activity.Tool)
 			if tool != "" {
 				if _, exists := seenTools[tool]; !exists {
 					seenTools[tool] = struct{}{}
@@ -175,6 +178,9 @@ func activityGroupSummary(group TranscriptBlock, children []TranscriptBlock) str
 	if failed > 0 {
 		label += fmt.Sprintf(" · %d failed", failed)
 	}
+	if group.OmittedActivities > 0 {
+		label += fmt.Sprintf(" · %d more omitted", group.OmittedActivities)
+	}
 	if running > 0 && !group.CreatedAt.IsZero() {
 		elapsed = time.Since(group.CreatedAt)
 	}
@@ -182,9 +188,9 @@ func activityGroupSummary(group TranscriptBlock, children []TranscriptBlock) str
 		label += " · " + elapsed.Round(100*time.Millisecond).String()
 	}
 	if group.Collapsed {
-		label += "  ·  click or Ctrl+O to expand"
+		label += "  + Show details"
 	} else {
-		label += "  ·  click or Ctrl+O to collapse"
+		label += "  − Hide details"
 	}
 	icon := "●"
 	if failed > 0 {
@@ -193,6 +199,14 @@ func activityGroupSummary(group TranscriptBlock, children []TranscriptBlock) str
 		icon = "✓"
 	}
 	return icon + " " + label
+}
+
+func activityToolLabel(tool string) string {
+	tool = strings.ReplaceAll(cleanText(tool), "_", " ")
+	if tool == "bash" {
+		return "shell"
+	}
+	return tool
 }
 
 func activityPresentation(block TranscriptBlock) (string, string) {
@@ -215,6 +229,9 @@ func activityPresentation(block TranscriptBlock) (string, string) {
 func activitySummary(header string) string {
 	for _, prefix := range []string{"Running ", "Done ", "Failed "} {
 		header = strings.TrimPrefix(header, prefix)
+	}
+	if header == "bash" {
+		return "shell command"
 	}
 	return header
 }

@@ -633,8 +633,10 @@ func (w *ConversationWorker) Sync(ctx context.Context, params protocol.Conversat
 		}})
 	}
 	for _, turn := range turns {
+		activities, omitted := conversationActivities(turn.ToolCalls)
 		entries = append(entries, orderedEntry{revision: turn.HistoryRevision, step: turn.StepNumber, entry: protocol.ConversationTranscriptEntry{
 			TurnID: turn.ConversationTurnID, StepNumber: turn.StepNumber, Role: turn.Role, Content: turn.Content, CreatedAt: turn.CreatedAt.UTC().Format(time.RFC3339Nano),
+			Activities: activities, ActivitiesOmitted: omitted,
 		}})
 	}
 	sort.SliceStable(entries, func(i, j int) bool {
@@ -726,6 +728,67 @@ func (w *ConversationWorker) Sync(ctx context.Context, params protocol.Conversat
 		return nil, "", errors.New("conversation sync metadata exceeds maximum JSON-RPC frame size")
 	}
 	return result, role, nil
+}
+
+const (
+	conversationActivityLimit       = 32
+	conversationActivityIDSize      = 128
+	conversationActivityToolSize    = 64
+	conversationActivitySummarySize = 160
+	conversationActivityOutputSize  = 1024
+)
+
+func conversationActivities(calls []persistence.ToolCallRecord) ([]protocol.ConversationActivity, int) {
+	activities := make([]protocol.ConversationActivity, 0, min(len(calls), conversationActivityLimit))
+	for _, call := range calls[:min(len(calls), conversationActivityLimit)] {
+		output := persistence.SanitizeToolOutput(call.Result)
+		truncated := len(output) > conversationActivityOutputSize
+		if truncated {
+			output = output[:utf8SafePrefix(output, conversationActivityOutputSize)] + " …[preview truncated]"
+		}
+		id := call.ID
+		if len(id) > conversationActivityIDSize {
+			id = ""
+		}
+		activities = append(activities, protocol.ConversationActivity{
+			ID: id, Tool: boundedActivityText(call.Name, conversationActivityToolSize), Summary: toolActivitySummary(call.Name, call.Args),
+			Output: output, OutputTruncated: truncated, ExitCode: call.ExitCode,
+		})
+	}
+	return activities, max(0, len(calls)-len(activities))
+}
+
+func boundedActivityText(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:utf8SafePrefix(value, limit)]
+}
+
+func toolActivitySummary(tool, rawArgs string) string {
+	var args map[string]any
+	if json.Unmarshal([]byte(persistence.RedactJSON(rawArgs)), &args) != nil {
+		return ""
+	}
+	var summary string
+	if tool == "bash" {
+		summary, _ = args["command"].(string)
+		if line, _, found := strings.Cut(summary, "\n"); found && line != "" {
+			summary = line + " …"
+		}
+	} else {
+		for _, key := range []string{"path", "file_path", "directory", "query"} {
+			if value, ok := args[key].(string); ok && value != "" {
+				summary = value
+				break
+			}
+		}
+	}
+	summary = strings.TrimSpace(persistence.RedactSecrets(summary))
+	if len(summary) > conversationActivitySummarySize {
+		summary = summary[:utf8SafePrefix(summary, conversationActivitySummarySize)] + "…"
+	}
+	return summary
 }
 
 func conversationSyncFrameSize(result *protocol.ConversationSyncResult) int {

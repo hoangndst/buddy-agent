@@ -1434,17 +1434,18 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 		m.setPendingApprovals(nil)
 		return
 	}
-	activitiesByTurn := make(map[string][]TranscriptBlock)
-	var activityTurns []string
+	activitiesByStep := make(map[string][]TranscriptBlock)
+	var activitySteps []string
 	if m.conversation == result.ConversationID && m.workerEpoch == result.WorkerEpoch {
 		for _, block := range m.ui.Transcript.Blocks {
 			if block.Kind != BlockToolActivity && block.Kind != BlockSubagentActivity && block.Kind != BlockActivityGroup {
 				continue
 			}
-			if len(activitiesByTurn[block.TurnID]) == 0 {
-				activityTurns = append(activityTurns, block.TurnID)
+			key := transcriptActivityKey(block.TurnID, block.Step)
+			if len(activitiesByStep[key]) == 0 {
+				activitySteps = append(activitySteps, key)
 			}
-			activitiesByTurn[block.TurnID] = append(activitiesByTurn[block.TurnID], block)
+			activitiesByStep[key] = append(activitiesByStep[key], block)
 		}
 	} else {
 		m.ui.SelectedActivity = ""
@@ -1468,18 +1469,16 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 	} else {
 		m.noticeText = ""
 	}
-	// Keep transient activity groups next to their turn's last durable entry.
-	lastEntry := make(map[string]int, len(activitiesByTurn))
-	for i, entry := range result.Transcript {
-		if entry.TurnID != "" && len(activitiesByTurn[entry.TurnID]) > 0 {
-			lastEntry[entry.TurnID] = i
-		}
-	}
 	// Replace the canonical blocks together so recovery keeps the reading offset.
-	for i, entry := range result.Transcript {
-		last, hasActivities := lastEntry[entry.TurnID]
-		if hasActivities && last == i && entry.Role == "assistant" {
-			restoredBlocks = append(restoredBlocks, activitiesByTurn[entry.TurnID]...)
+	for _, entry := range result.Transcript {
+		if entry.Role == "assistant" {
+			key := transcriptActivityKey(entry.TurnID, entry.StepNumber)
+			if cached := activitiesByStep[key]; len(cached) > 0 {
+				restoredBlocks = append(restoredBlocks, cached...)
+				delete(activitiesByStep, key)
+			} else if len(entry.Activities) > 0 || entry.ActivitiesOmitted > 0 {
+				restoredBlocks = append(restoredBlocks, restoredActivityBlocks(entry)...)
+			}
 		}
 		if entry.Role == "user" {
 			restoredBlocks = append(restoredBlocks, TranscriptBlock{
@@ -1512,17 +1511,59 @@ func (m *conversationTUI) loadSync(result *protocol.ConversationSyncResult) {
 				CreatedAt: time.Now(),
 			})
 		}
-		if hasActivities && last == i && entry.Role != "assistant" {
-			restoredBlocks = append(restoredBlocks, activitiesByTurn[entry.TurnID]...)
-		}
 	}
-	for _, turnID := range activityTurns {
-		if _, found := lastEntry[turnID]; !found {
-			restoredBlocks = append(restoredBlocks, activitiesByTurn[turnID]...)
+	for _, key := range activitySteps {
+		if blocks := activitiesByStep[key]; len(blocks) > 0 {
+			restoredBlocks = append(restoredBlocks, blocks...)
 		}
 	}
 	_, _ = m.ui.Update(tui.Event{Kind: tui.EventSnapshot, Blocks: restoredBlocks})
 	m.syncUIRenderState()
+}
+
+func transcriptActivityKey(turnID string, step int) string {
+	return turnID + "\x00" + strconv.Itoa(step)
+}
+
+func restoredActivityBlocks(entry protocol.ConversationTranscriptEntry) []TranscriptBlock {
+	if len(entry.Activities) == 0 && entry.ActivitiesOmitted == 0 {
+		return nil
+	}
+	createdAt, _ := time.Parse(time.RFC3339Nano, entry.CreatedAt)
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	groupID := newConversationID("activity")
+	blocks := []TranscriptBlock{{
+		ID: groupID, TurnID: entry.TurnID, Step: entry.StepNumber,
+		Kind: BlockActivityGroup, Header: "Tool activity", Collapsed: true,
+		OmittedActivities: entry.ActivitiesOmitted, CreatedAt: createdAt,
+	}}
+	for _, item := range entry.Activities {
+		identity := entry.TurnID + "\x00" + strconv.Itoa(entry.StepNumber) + "\x00" + item.ID
+		if item.ID == "" {
+			identity = newConversationID("activity-call")
+		}
+		activity := &tui.Activity{
+			Identity: identity, Step: entry.StepNumber, Tool: item.Tool,
+			Summary: item.Summary, OutputTruncated: item.OutputTruncated,
+		}
+		if item.ExitCode != 0 {
+			code := item.ExitCode
+			activity.ExitCode = &code
+		}
+		mark := "Done"
+		if item.ExitCode != 0 {
+			mark = "Failed"
+		}
+		blocks = append(blocks, TranscriptBlock{
+			ID: newConversationID("activity-call"), TurnID: entry.TurnID, GroupID: groupID,
+			Step: entry.StepNumber, Kind: BlockToolActivity, Role: "tool",
+			Header: mark + " " + item.Tool, Body: item.Output, Collapsed: true,
+			Completed: true, CreatedAt: createdAt, Activity: activity,
+		})
+	}
+	return blocks
 }
 
 func (m *conversationTUI) renderTextarea() string {
@@ -1703,6 +1744,7 @@ func activityFromEvent(data map[string]any, _ string) *tui.Activity {
 		return activity
 	}
 	activity.Tool, _ = data["tool_name"].(string)
+	activity.Summary, _ = data["activity_summary"].(string)
 	activity.AgentName, _ = data["agent_name"].(string)
 	activity.Path, _ = data["path"].(string)
 	if activity.Path == "" {

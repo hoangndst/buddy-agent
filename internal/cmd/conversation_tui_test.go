@@ -923,7 +923,7 @@ func TestConversationTUIActivityFocusAndOutputPager(t *testing.T) {
 
 func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 	firstPrompt := protocol.ConversationTranscriptEntry{Role: "user", TurnID: "turn-1", Content: "first prompt"}
-	answer := protocol.ConversationTranscriptEntry{Role: "assistant", TurnID: "turn-1", Content: "first answer"}
+	answer := protocol.ConversationTranscriptEntry{Role: "assistant", TurnID: "turn-1", StepNumber: 1, Content: "first answer"}
 	api := &conversationAPITestDouble{submissions: make(chan protocol.ConversationSubmitParams, 1)}
 	m := &conversationTUI{client: api, ui: testTUIModel(80, 24)}
 	m.loadSync(&protocol.ConversationSyncResult{ConversationID: "conv-1", WorkerEpoch: "worker-1", Transcript: []protocol.ConversationTranscriptEntry{firstPrompt}})
@@ -969,6 +969,26 @@ func TestConversationTUIKeepsCompletedOutputAcrossSyncs(t *testing.T) {
 	_, sync = m.Update(m.submit(nextPrompt.Content, persistence.SubmissionQueue)())
 	m.Update(sync())
 	openOutput("next prompt", 5)
+}
+
+func TestConversationTUIRestoresToolActivityFromHistory(t *testing.T) {
+	entry := protocol.ConversationTranscriptEntry{
+		Role: "assistant", TurnID: "turn-1", StepNumber: 2, Content: "Finished.",
+		Activities: []protocol.ConversationActivity{{
+			ID: "call-1", Tool: "bash", Summary: "git status --short", Output: "On branch main", ExitCode: 0,
+		}},
+	}
+	m := &conversationTUI{ui: testTUIModel(100, 30)}
+	m.loadSync(&protocol.ConversationSyncResult{
+		ConversationID: "conv-1", WorkerEpoch: "worker-2", Transcript: []protocol.ConversationTranscriptEntry{entry},
+	})
+	if len(m.ui.Transcript.Blocks) != 3 {
+		t.Fatalf("expected activity group, call, and answer; got %+v", m.ui.Transcript.Blocks)
+	}
+	group, call, answer := m.ui.Transcript.Blocks[0], m.ui.Transcript.Blocks[1], m.ui.Transcript.Blocks[2]
+	if group.Kind != BlockActivityGroup || !group.Collapsed || call.Kind != BlockToolActivity || call.Activity == nil || call.Activity.Summary != "git status --short" || call.Body != "On branch main" || answer.Body != "Finished." {
+		t.Fatalf("history activity was not restored in transcript order: %+v", m.ui.Transcript.Blocks)
+	}
 }
 
 func TestConversationTUIDropsOutputWhenConversationOrWorkerChanges(t *testing.T) {
